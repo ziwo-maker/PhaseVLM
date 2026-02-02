@@ -6,6 +6,7 @@ from layers.TimeSeries_To_Image import time_series_to_simple_image
 from layers.Learnable_TimeSeries_To_Image import LearnableTimeSeriesToImage
 import vllm
 import os
+import fcntl
 import time
 import numpy as np
 import wandb
@@ -25,6 +26,7 @@ import copy
 import random
 from collections import deque
 from datetime import datetime, timedelta
+from contextlib import contextmanager
 from types import SimpleNamespace
 from PIL import Image
 from transformers import Qwen3VLForConditionalGeneration, AutoProcessor
@@ -37,6 +39,1936 @@ def _str2bool(value):
     if isinstance(value, bool):
         return value
     return str(value).lower() in ("1", "true", "yes", "y")
+
+def _json_safe(value):
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, (np.integer, np.floating)):
+        return value.item()
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, dict):
+        return {str(k): _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_json_safe(v) for v in value]
+    if isinstance(value, os.PathLike):
+        return os.fspath(value)
+    return str(value)
+
+
+@contextmanager
+def _locked_file(path, mode="a+", encoding="utf-8"):
+    handle = open(path, mode, encoding=encoding)
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+    except Exception:
+        handle.close()
+        raise
+    try:
+        yield handle
+    finally:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        except Exception:
+            pass
+        handle.close()
+
+
+def _validate_jsonl_handle(handle, path):
+    handle.seek(0)
+    for line_no, line in enumerate(handle, 1):
+        if not line.strip():
+            raise SystemExit(f"JSONL integrity check failed for {path}: empty line at {line_no}.")
+        try:
+            json.loads(line)
+        except Exception as exc:
+            raise SystemExit(
+                f"JSONL integrity check failed for {path} at line {line_no}: {exc}"
+            )
+
+
+def _append_jsonl_records(path, records):
+    if not path or not records:
+        return
+    output_dir = os.path.dirname(path)
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
+    with _locked_file(path, "a+", encoding="utf-8") as handle:
+        for record in records:
+            handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+        _validate_jsonl_handle(handle, path)
+
+
+def _prepare_jsonl_file(path):
+    if not path:
+        return
+    output_dir = os.path.dirname(path)
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
+    with _locked_file(path, "a+", encoding="utf-8") as handle:
+        _validate_jsonl_handle(handle, path)
+
+
+def _shared_token_in_vocab(tokenizer, token):
+    if not token or tokenizer is None:
+        return False
+    convert_fn = getattr(tokenizer, "convert_tokens_to_ids", None)
+    if convert_fn is None:
+        return False
+    try:
+        token_id = convert_fn(token)
+    except Exception:
+        return False
+    if token_id is None:
+        return False
+    unk_id = getattr(tokenizer, "unk_token_id", None)
+    if unk_id is not None and token_id == unk_id:
+        return False
+    try:
+        vocab = tokenizer.get_vocab()
+    except Exception:
+        vocab = None
+    if vocab is not None and token not in vocab:
+        return False
+    return True
+
+
+def _shared_extract_image_token_candidates(llm_path, tokenizer):
+    candidates = []
+
+    if llm_path:
+        for filename in ("processor_config.json", "preprocessor_config.json", "tokenizer_config.json", "config.json"):
+            path = os.path.join(llm_path, filename)
+            if not os.path.exists(path):
+                continue
+            try:
+                with open(path, "r", encoding="utf-8") as handle:
+                    data = json.load(handle)
+            except Exception:
+                continue
+            if not isinstance(data, dict):
+                continue
+            for key in (
+                "image_token",
+                "image_placeholder",
+                "image_token_str",
+                "image_token_string",
+                "image_special_token",
+            ):
+                value = data.get(key)
+                if isinstance(value, str) and value:
+                    candidates.append(value)
+            for nested_key in ("image_processor", "processor", "multimodal_config", "mm_config"):
+                nested = data.get(nested_key)
+                if isinstance(nested, dict):
+                    for key in (
+                        "image_token",
+                        "image_placeholder",
+                        "image_token_str",
+                        "image_token_string",
+                        "image_special_token",
+                    ):
+                        value = nested.get(key)
+                        if isinstance(value, str) and value:
+                            candidates.append(value)
+
+    if tokenizer is not None:
+        for attr in ("image_token", "image_placeholder", "image_token_str", "image_token_string"):
+            value = getattr(tokenizer, attr, None)
+            if isinstance(value, str) and value:
+                candidates.append(value)
+        extra = getattr(tokenizer, "additional_special_tokens", None) or []
+        for token in extra:
+            if isinstance(token, str) and token:
+                candidates.append(token)
+
+    return candidates
+
+
+def _shared_resolve_image_token(instance):
+    cached = getattr(instance, "_resolved_image_token", None)
+    if cached:
+        return cached
+
+    config_token = str(getattr(instance, "ts_image_token", "") or "").strip()
+    tokenizer = getattr(instance, "tokenizer", None)
+    if config_token and _shared_token_in_vocab(tokenizer, config_token):
+        instance._resolved_image_token = config_token
+        instance.ts_image_token = config_token
+        return config_token
+
+    dic_agent_conf = getattr(instance, "dic_agent_conf", None)
+    llm_path = ""
+    if isinstance(dic_agent_conf, dict):
+        llm_path = str(dic_agent_conf.get("LLM_PATH", "")).strip()
+    candidates = []
+    candidates.extend(_shared_extract_image_token_candidates(llm_path, tokenizer))
+    candidates.extend(
+        [
+            "<start_of_image>",
+            "<image>",
+            "<image_placeholder>",
+            "<image_start>",
+            "<im_start>",
+            "<img>",
+        ]
+    )
+    if config_token:
+        candidates.insert(0, config_token)
+
+    seen = set()
+    for token in candidates:
+        token = token.strip()
+        if not token or token in seen:
+            continue
+        seen.add(token)
+        if _shared_token_in_vocab(tokenizer, token):
+            instance._resolved_image_token = token
+            instance.ts_image_token = token
+            return token
+
+    resolved = config_token or (candidates[0] if candidates else "<image>")
+    instance._resolved_image_token = resolved
+    instance.ts_image_token = resolved
+    return resolved
+
+
+def _shared_maybe_take_snapshot(instance, current_time_s):
+    snapshot_path = None
+    interval = int(getattr(instance, "traffic_series_interval_s", 2) or 2)
+    if interval <= 0:
+        interval = 2
+    current_bin = int(current_time_s) // interval
+    last_written = getattr(instance, "_traffic_series_last_written_bin", -1)
+    if current_bin > last_written:
+        try:
+            ensure = getattr(instance, "_ensure_traffic_series_config", None)
+            if callable(ensure):
+                ensure()
+            output_path = getattr(instance, "_traffic_series_output_path", "") or ""
+            output_dir = os.path.dirname(output_path)
+            if not output_dir:
+                dic_path = getattr(instance, "dic_path", {}) or {}
+                output_dir = dic_path.get("PATH_TO_WORK_DIRECTORY", "") or "."
+            snapshot_dir = os.path.join(output_dir, "snapshots")
+            os.makedirs(snapshot_dir, exist_ok=True)
+            snapshot_name = f"snapshot_t{int(current_time_s)}_b{current_bin}.json"
+            snapshot_path = os.path.join(snapshot_dir, snapshot_name)
+            env = getattr(instance, "env", None)
+            if env is None or not hasattr(env, "eng"):
+                raise RuntimeError("CityFlow env is not initialized.")
+            archive = env.eng.snapshot()
+            archive.dump(snapshot_path)
+            env.eng.load_from_file(snapshot_path)
+        except Exception as exc:
+            print(f"Snapshot failed at t={current_time_s}: {exc}")
+            snapshot_path = None
+    return snapshot_path
+
+
+class LLM_Inference_VLLM:
+    def __init__(self, dic_agent_conf, dic_traffic_env_conf, dic_path, roadnet, trafficflow, ts_image_adapter=None):
+        self.dic_agent_conf = dic_agent_conf
+        self.dic_traffic_env_conf = dic_traffic_env_conf
+        self.dic_path = dic_path
+        self.agents = []
+        self.env = None
+        self.roadnet = roadnet
+        self.trafficflow = trafficflow
+        self.models = []
+        self.generation_kwargs = {}
+        self.epoch_num = 0
+        self.tokenizer = None
+        self.llm_model = None
+        self.llm_ref_model = None
+        self.dic_critic_agent_conf = None
+        self.training_args = None
+        self.trainer_built = False
+        self.trainer = None
+        self.device = None
+        self._resolved_image_token = None
+        self.ts_image_client = None
+        self.ts_image_adapter = ts_image_adapter
+        self.ts_history = None
+        self.ts_feature_dim = None
+        self.ts_cells_len = None
+        self._cityflow_env_args_dir = None
+  
+        try:
+            self.ts_image_seq_len = int(self.dic_agent_conf.get("TS_IMAGE_SEQ_LEN", 0) or 0)
+        except (TypeError, ValueError):
+            self.ts_image_seq_len = 0
+        if self.ts_image_adapter is not None and self.ts_image_seq_len <= 0:
+            adapter_seq_len = getattr(self.ts_image_adapter, "seq_len", None)
+            if adapter_seq_len is not None:
+                self.ts_image_seq_len = int(adapter_seq_len)
+        self.ts_image_token = str(self.dic_agent_conf.get("TS_IMAGE_TOKEN", "<image>"))
+        self.ts_image_prompt_prefix = str(self.dic_agent_conf.get("TS_IMAGE_PROMPT_PREFIX", ""))
+        self.ts_feature_mode = str(self.dic_agent_conf.get("TS_FEATURE_MODE", "movement_total")).strip().lower()
+        try:
+            self.ts_image_timeout = float(self.dic_agent_conf.get("TS_IMAGE_TIMEOUT", 5.0))
+        except (TypeError, ValueError):
+            self.ts_image_timeout = 5.0
+        try:
+            self.ts_image_size = int(self.dic_agent_conf.get("TS_IMAGE_SIZE", 56) or 56)
+        except (TypeError, ValueError):
+            self.ts_image_size = 56
+        try:
+            self.ts_image_periodicity = int(self.dic_agent_conf.get("TS_IMAGE_PERIODICITY", 24) or 24)
+        except (TypeError, ValueError):
+            self.ts_image_periodicity = 24
+        self.ts_image_norm_const = float(self.dic_agent_conf.get("TS_IMAGE_NORM_CONST", 0.4) or 0.4)
+
+        self.ts_image_norm_const = 0.4
+        self.ts_image_learnable = _str2bool(self.dic_agent_conf.get("TS_IMAGE_LEARNABLE", False))
+        self.ts_image_three_channel = _str2bool(self.dic_agent_conf.get("TS_IMAGE_THREE_CHANNEL", True))
+        self._resolved_image_token = None
+        self.save_cityflow_env_args = _str2bool(
+            self.dic_agent_conf.get("SAVE_CITYFLOW_ENV_ARGS", True)
+        )
+
+        self._traffic_history_interval = None
+        self._traffic_history_intersection_ids = None
+        self._traffic_history_intersection_index = None
+        self._traffic_history_movement_keys = None
+        self._traffic_history_output_path = None
+        self._traffic_history_last_written_bin = -1
+        self._traffic_history_base_dt = None
+
+        try:
+            self.traffic_series_interval_s = int(self.dic_agent_conf.get("TRAFFIC_SERIES_INTERVAL", 2) or 2)
+        except (TypeError, ValueError):
+            self.traffic_series_interval_s = 2
+        try:
+            self.traffic_series_window_s = int(self.dic_agent_conf.get("TRAFFIC_SERIES_WINDOW", 30) or 30)
+        except (TypeError, ValueError):
+            self.traffic_series_window_s = 30
+        self.traffic_series_output_dir = str(
+            self.dic_agent_conf.get("TRAFFIC_SERIES_OUTPUT_DIR", "")
+        ).strip()
+        if not self.traffic_series_output_dir:
+            self.traffic_series_output_dir = os.path.join("data", "recorded")
+        self.traffic_series_basename = str(
+            self.dic_agent_conf.get("TRAFFIC_SERIES_BASENAME", "traffic_prompt_series")
+        ).strip() or "traffic_prompt_series"
+        self._traffic_series_output_path = None
+        self._traffic_series_initialized = False
+        self._traffic_series_intersection_index = None
+        self._traffic_series_movement_keys = None
+        self._traffic_series_last_written_bin = -1
+        self._traffic_series_base_dt = None
+ 
+        if not os.path.exists("./fails"):
+            os.mkdir("./fails")
+        self.fail_log_file = f"./fails/{self.dic_agent_conf['LLM_MODEL']}-{self.dic_traffic_env_conf['TRAFFIC_FILE']}-{self.dic_traffic_env_conf['ROADNET_FILE']}.json"
+        self.fail_logs = []
+        
+        if self.ts_image_adapter is None:
+            self._init_ts_image_adapter()
+        self._ensure_traffic_series_config()
+        self.initialize()
+
+    def _infer_tensor_parallel_size(self):
+        visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+        if visible:
+            ids = [x.strip() for x in visible.split(",") if x.strip() != ""]
+            if len(ids) == 1 and "-" in ids[0]:
+                parts = ids[0].split("-")
+                if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit():
+                    start = int(parts[0])
+                    end = int(parts[1])
+                    if end >= start:
+                        return end - start + 1
+            if ids:
+                return len(ids)
+
+        count = torch.cuda.device_count()
+        return count if count > 0 else 1
+
+
+
+    def _init_ts_image_adapter(self):
+        if self.ts_image_seq_len <= 0:
+            return
+        try:
+            input_dim = self.ts_feature_dim or len(location_direction_dict)
+            self.ts_image_adapter = TimeSeriesImageAdapter(
+                image_size=self.ts_image_size,
+                seq_len=self.ts_image_seq_len,
+                periodicity=self.ts_image_periodicity,
+                norm_const=self.ts_image_norm_const,
+                learnable_image=self.ts_image_learnable,
+                three_channel_image=self.ts_image_three_channel,
+                input_dim=input_dim,
+            )
+        except Exception as exc:
+            print(f"TS image adapter init error: {exc}")
+            self.ts_image_adapter = None
+    def initialize_llm(self):
+        device_map = "auto"
+
+        # init LLM
+        llm_path = self.dic_agent_conf["LLM_PATH"]
+        llm_path_lower = llm_path.lower()
+        if "qwen" in llm_path_lower and "vl" in llm_path_lower:
+            # vllm may not support Qwen-VL; fallback to transformers loader
+            
+            self.qwen=True
+            print("Warning: detected Qwen-VL model in LLM_Inference_VLLM.initialize_llm — falling back to transformers loader")
+            self.llm_model = Qwen3VLForConditionalGeneration.from_pretrained(
+                llm_path,
+                dtype="auto",
+                device_map=device_map,
+            )
+            self.processor = AutoProcessor.from_pretrained(llm_path, padding_side="left")
+            # processor as tokenizer for text-only usage
+            self.tokenizer = AutoProcessor.from_pretrained(llm_path)
+            try:
+                self.tokenizer.pad_token_id = 0
+            except Exception:
+                pass
+
+            # set generation kwargs for transformer usage (note: calling code expects vllm usage)
+            self.generation_kwargs = {
+                "top_k": 50,
+                "top_p": 1.0,
+                "temperature": 0.1,
+                "max_new_tokens": self.dic_agent_conf["NEW_MAX_TOKENS"]
+            }
+            self.test_generation_kwargs = {
+                "min_length": -1,
+                "top_k": 50,
+                "top_p": 1.0,
+                "temperature": 0.1,
+                "do_sample": True,
+                "max_new_tokens": self.dic_agent_conf["NEW_MAX_TOKENS"],
+                "pad_token_id": getattr(self.tokenizer, "pad_token_id", None),
+                "eos_token_id": getattr(self.tokenizer, "eos_token_id", None),
+            }
+        else:
+            tensor_parallel_size = self.dic_agent_conf.get("TENSOR_PARALLEL_SIZE", 0)
+            try:
+                tensor_parallel_size = int(tensor_parallel_size)
+            except (TypeError, ValueError):
+                tensor_parallel_size = 0
+            if tensor_parallel_size < 1:
+                tensor_parallel_size = self._infer_tensor_parallel_size()
+
+            available_gpus = torch.cuda.device_count()
+            if available_gpus > 0 and tensor_parallel_size > available_gpus:
+                print(f"Warning: TENSOR_PARALLEL_SIZE={tensor_parallel_size} > visible GPUs={available_gpus}; "
+                      f"clamping to {available_gpus}.")
+                tensor_parallel_size = available_gpus
+            self.llm_model = vllm.LLM(
+                model=llm_path,
+                tokenizer=llm_path,
+                dtype=torch.bfloat16,            # 先排除 bf16 兼容性
+                tensor_parallel_size=4,         # 先排除 TP/NCCL
+                max_model_len=2048,             # 先降低上下文
+                max_num_seqs=4,                 # 先降低并发
+                max_num_batched_tokens=2048,
+                gpu_memory_utilization=0.9,    # 给 KV cache 足够空间
+                swap_space=16,                   # 先排除 CPU offload 相关变量
+            )
+            self.processor = AutoProcessor.from_pretrained(llm_path, padding_side="left")
+
+            # init tokenizer
+            self.tokenizer = AutoTokenizer.from_pretrained(
+                llm_path,
+                padding_side="left",
+                padding=True
+            )
+            self.tokenizer.pad_token_id = 0
+
+            test_generation_kwargs = {
+                "top_k": 50,
+                "top_p": 1.0,
+                "temperature": 0.1,
+                "max_tokens": 2048 + self.dic_agent_conf["NEW_MAX_TOKENS"]
+            }
+            self.generation_kwargs = vllm.SamplingParams(**test_generation_kwargs)
+            self.test_generation_kwargs = {}
+            # Align image placeholder token with the loaded model, if possible.
+            self._resolve_image_token()
+
+    def initialize(self):
+        path_check(self.dic_path)
+        copy_conf_file(self.dic_path, self.dic_agent_conf, self.dic_traffic_env_conf)
+        copy_cityflow_file(self.dic_path, self.dic_traffic_env_conf)
+        if self.save_cityflow_env_args:
+            self._dump_cityflow_env_args()
+
+        self.env = CityFlowEnv(
+            path_to_log=self.dic_path["PATH_TO_WORK_DIRECTORY"],
+            path_to_work_directory=self.dic_path["PATH_TO_WORK_DIRECTORY"],
+            dic_traffic_env_conf=self.dic_traffic_env_conf,
+            dic_path=self.dic_path
+        )
+        self.env.reset()
+        self.initialize_llm()
+
+    def _dump_cityflow_env_args(self):
+        run_dir = str(self.dic_path.get("PATH_TO_WORK_DIRECTORY", "")).strip()
+        if not run_dir:
+            return
+        base_name = "cityflow_env_init"
+        output_dir = os.path.join(run_dir, base_name)
+        if os.path.exists(output_dir):
+            suffix = datetime.now().strftime("%Y%m%d_%H%M%S")
+            output_dir = os.path.join(run_dir, f"{base_name}_{suffix}")
+        os.makedirs(output_dir, exist_ok=True)
+
+        env_args = {
+            "path_to_log": self.dic_path.get("PATH_TO_WORK_DIRECTORY"),
+            "path_to_work_directory": self.dic_path.get("PATH_TO_WORK_DIRECTORY"),
+            "dic_traffic_env_conf": self.dic_traffic_env_conf,
+            "dic_path": self.dic_path,
+        }
+        payload = {
+            "saved_at": datetime.now().isoformat(),
+            "cityflow_env_args": env_args,
+        }
+        dump_json(_json_safe(payload), os.path.join(output_dir, "cityflow_env_args.json"), indent=2)
+        self._cityflow_env_args_dir = output_dir
+
+    def _traffic_count_suffix(self, interval_seconds):
+        if interval_seconds == 60:
+            return "minute"
+        if interval_seconds == 3600:
+            return "hour"
+        return f"{interval_seconds}s"
+
+    def _resolve_traffic_history_output_path(self, interval_seconds):
+        path = str(self.dic_traffic_env_conf.get("TRAFFIC_COUNT_HISTORY_PATH", "")).strip()
+        if path:
+            return path
+        output_dir = self.dic_traffic_env_conf.get(
+            "TRAFFIC_COUNT_OUTPUT_DIR", self.dic_path["PATH_TO_WORK_DIRECTORY"]
+        )
+        base_name = self.dic_traffic_env_conf.get("TRAFFIC_COUNT_BASENAME", "traffic_counts")
+        suffix = self._traffic_count_suffix(interval_seconds)
+        return os.path.join(output_dir, f"{base_name}_{suffix}.jsonl")
+
+    def _load_traffic_history(self):
+        if self._traffic_history_interval is not None:
+            return
+        if self.env is None:
+            return
+        interval = int(self.dic_traffic_env_conf.get("MIN_ACTION_TIME", 1) or 1)
+        current_time = self.env.get_current_time()
+        needs_reinit = (
+            not getattr(self.env, "traffic_count_enabled", False)
+            or getattr(self.env, "traffic_count_mode", "") != "intersection_movement"
+            or interval not in getattr(self.env, "traffic_count_intervals", [])
+        )
+        if needs_reinit and current_time in (None, 0, 0.0):
+            self.dic_traffic_env_conf["ENABLE_TRAFFIC_COUNT"] = True
+            self.dic_traffic_env_conf["TRAFFIC_COUNT_MODE"] = "intersection_movement"
+            self.dic_traffic_env_conf["TRAFFIC_COUNT_OUTPUT_FORMAT"] = "jsonl"
+            intervals = self.dic_traffic_env_conf.get("TRAFFIC_COUNT_INTERVALS", None)
+            if intervals is None:
+                intervals = [interval]
+            elif isinstance(intervals, int):
+                intervals = [intervals]
+            intervals = [int(x) for x in intervals if int(x) > 0]
+            if interval not in intervals:
+                intervals.append(interval)
+            self.dic_traffic_env_conf["TRAFFIC_COUNT_INTERVALS"] = sorted(set(intervals))
+            try:
+                self.env._init_traffic_counter()
+            except Exception as exc:
+                print(f"Traffic counter init failed: {exc}")
+        elif needs_reinit:
+            print("Traffic counter not configured for MIN_ACTION_TIME; history may be empty.")
+
+        if not getattr(self.env, "traffic_count_enabled", False):
+            return
+        if getattr(self.env, "traffic_count_mode", "") != "intersection_movement":
+            return
+
+        intervals = getattr(self.env, "traffic_count_intervals", [])
+        if interval in intervals:
+            self._traffic_history_interval = interval
+        elif intervals:
+            self._traffic_history_interval = min(intervals)
+            print(
+                f"Using traffic interval {self._traffic_history_interval} "
+                f"(MIN_ACTION_TIME={interval} not available)."
+            )
+        else:
+            self._traffic_history_interval = interval
+
+        self._traffic_history_intersection_ids = list(getattr(self.env, "traffic_intersection_ids", []) or [])
+        self._traffic_history_intersection_index = {
+            inter_id: idx for idx, inter_id in enumerate(self._traffic_history_intersection_ids)
+        }
+        self._traffic_history_movement_keys = list(
+            getattr(self.env, "traffic_movement_keys", []) or ["NT", "NL", "ST", "SL", "ET", "EL", "WT", "WL"]
+        )
+        self._traffic_history_last_written_bin = -1
+        self._traffic_history_base_dt = getattr(self.env, "traffic_base_dt", None) or datetime(1970, 1, 1)
+        output_path = self._resolve_traffic_history_output_path(self._traffic_history_interval)
+        self._traffic_history_output_path = output_path
+        if output_path:
+            _prepare_jsonl_file(output_path)
+
+    def _get_traffic_history_until(self, intersection_id, current_time_s):
+        self._load_traffic_history()
+        interval = self._traffic_history_interval
+        if interval is None:
+            return []
+        counts = self.env.traffic_counts_by_interval.get(interval)
+        if counts is None or counts.size == 0:
+            return []
+        inter_idx = self._traffic_history_intersection_index.get(intersection_id)
+        if inter_idx is None:
+            return []
+        num_mv = len(self._traffic_history_movement_keys)
+        current_bin = int(current_time_s) // interval
+        if current_bin < 0:
+            return []
+        if current_bin >= counts.shape[0]:
+            current_bin = counts.shape[0] - 1
+        offset = inter_idx * num_mv
+        slice_rows = counts[: current_bin + 1, offset : offset + num_mv]
+        history = []
+        for row in slice_rows:
+            movement_counts = {
+                key: int(row[idx]) for idx, key in enumerate(self._traffic_history_movement_keys)
+            }
+            history.append(movement_counts)
+        return history
+
+    def _append_traffic_history_jsonl(self, current_time_s):
+        self._load_traffic_history()
+        interval = self._traffic_history_interval
+        if interval is None or not self._traffic_history_output_path:
+            return
+        counts = self.env.traffic_counts_by_interval.get(interval)
+        if counts is None or counts.size == 0:
+            return
+        current_bin = int(current_time_s) // interval
+        if current_bin < 0:
+            return
+        if current_bin >= counts.shape[0]:
+            current_bin = counts.shape[0] - 1
+        if current_bin <= self._traffic_history_last_written_bin:
+            return
+        base_dt = self._traffic_history_base_dt or datetime(1970, 1, 1)
+        num_mv = len(self._traffic_history_movement_keys)
+        records = []
+        for bin_idx in range(self._traffic_history_last_written_bin + 1, current_bin + 1):
+            date_str = (base_dt + timedelta(seconds=bin_idx * interval)).strftime("%Y-%m-%d %H:%M:%S")
+            row = counts[bin_idx, :]
+            for inter_idx, inter_id in enumerate(self._traffic_history_intersection_ids or []):
+                offset = inter_idx * num_mv
+                movement_counts = {
+                    key: int(row[offset + mv_i]) for mv_i, key in enumerate(self._traffic_history_movement_keys)
+                }
+                record = {
+                    "date": date_str,
+                    "interval_s": int(interval),
+                    "intersection_id": inter_id,
+                    "movement_counts": movement_counts,
+                }
+                records.append(record)
+        _append_jsonl_records(self._traffic_history_output_path, records)
+        self._traffic_history_last_written_bin = current_bin
+
+    def _traffic_series_run_tag(self):
+        run_dir = str(self.dic_path.get("PATH_TO_WORK_DIRECTORY", "")).strip()
+        run_tag = os.path.basename(run_dir) if run_dir else ""
+        if not run_tag:
+            run_tag = time.strftime("%m_%d_%H_%M_%S", time.localtime(time.time()))
+        return run_tag
+
+    def _ensure_traffic_series_config(self):
+        if self._traffic_series_initialized:
+            return
+        base_dir = self.traffic_series_output_dir or os.path.join("data", "recorded")
+        run_tag = self._traffic_series_run_tag()
+        output_dir = os.path.join(base_dir, run_tag)
+        os.makedirs(output_dir, exist_ok=True)
+        suffix = self._traffic_count_suffix(self.traffic_series_interval_s)
+        filename = f"{self.traffic_series_basename}_{suffix}.jsonl"
+        self._traffic_series_output_path = os.path.join(output_dir, filename)
+        _prepare_jsonl_file(self._traffic_series_output_path)
+        self._traffic_series_initialized = True
+
+    def _resolve_series_movement_keys(self):
+        default_keys = ["NT", "NL", "ST", "SL", "ET", "EL", "WT", "WL"]
+        series_keys = list(self._traffic_series_movement_keys or [])
+        if not series_keys:
+            return default_keys, default_keys
+        output_keys = list(series_keys)
+        for key in default_keys:
+            if key not in output_keys:
+                output_keys.append(key)
+        return series_keys, output_keys
+
+    def _load_traffic_series(self):
+        if self._traffic_series_movement_keys is not None:
+            return
+        if self.env is None:
+            return
+        self._ensure_traffic_series_config()
+        interval = int(self.traffic_series_interval_s or 2)
+        if interval <= 0:
+            interval = 2
+
+        if not getattr(self.env, "traffic_count_enabled", False):
+            current_time = self.env.get_current_time()
+            if current_time in (None, 0, 0.0):
+                self.dic_traffic_env_conf["ENABLE_TRAFFIC_COUNT"] = True
+                self.dic_traffic_env_conf["TRAFFIC_COUNT_MODE"] = "intersection_movement"
+                self.dic_traffic_env_conf["TRAFFIC_COUNT_OUTPUT_FORMAT"] = "jsonl"
+
+        intervals = list(getattr(self.env, "traffic_count_intervals", []) or [])
+        if interval not in intervals:
+            intervals.append(interval)
+            self.dic_traffic_env_conf["TRAFFIC_COUNT_INTERVALS"] = sorted(set(intervals))
+            current_time = self.env.get_current_time()
+            if current_time in (None, 0, 0.0):
+                try:
+                    self.env._init_traffic_counter()
+                except Exception as exc:
+                    print(f"Traffic series counter init failed: {exc}")
+
+        self._traffic_series_intersection_index = {
+            inter_id: idx for idx, inter_id in enumerate(getattr(self.env, "traffic_intersection_ids", []) or [])
+        }
+        self._traffic_series_movement_keys = list(
+            getattr(self.env, "traffic_movement_keys", []) or ["NT", "NL", "ST", "SL", "ET", "EL", "WT", "WL"]
+        )
+        self._traffic_series_base_dt = getattr(self.env, "traffic_base_dt", None) or datetime(1970, 1, 1)
+
+    def _build_traffic_series_history(self, intersection_id, current_time_s):
+        self._load_traffic_series()
+        interval = int(self.traffic_series_interval_s or 2)
+        if interval <= 0:
+            interval = 2
+        series_keys, output_keys = self._resolve_series_movement_keys()
+        num_series_keys = len(series_keys)
+        counts = getattr(self.env, "traffic_counts_by_interval", {}).get(interval)
+        inter_idx = (self._traffic_series_intersection_index or {}).get(intersection_id)
+
+        current_bin = int(current_time_s) // interval
+        if counts is not None and counts.size > 0:
+            if current_bin >= counts.shape[0]:
+                current_bin = counts.shape[0] - 1
+        if current_bin < 0:
+            current_bin = 0
+
+        window_bins = int(self.traffic_series_window_s // interval) if interval > 0 else 0
+        start_bin = max(0, current_bin - window_bins)
+        base_dt = self._traffic_series_base_dt or datetime(1970, 1, 1)
+        history = []
+        for bin_idx in range(start_bin, current_bin + 1):
+            date_str = (base_dt + timedelta(seconds=bin_idx * interval)).strftime("%Y-%m-%d %H:%M:%S")
+            movement_counts = {key: 0 for key in output_keys}
+            if counts is not None and counts.size > 0 and inter_idx is not None and bin_idx >= 0:
+                if bin_idx < counts.shape[0]:
+                    offset = inter_idx * num_series_keys
+                    row = counts[bin_idx, offset : offset + num_series_keys]
+                    for mv_i, key in enumerate(series_keys):
+                        if mv_i < len(row):
+                            movement_counts[key] = int(row[mv_i])
+            history.append({"date": date_str, "movement_counts": movement_counts})
+        return history
+
+    def _record_traffic_prompt_series(self, current_time_s, prompts):
+        if not prompts:
+            return
+        self._load_traffic_series()
+        if not self._traffic_series_output_path:
+            return
+        interval = int(self.traffic_series_interval_s or 2)
+        if interval <= 0:
+            interval = 2
+        current_bin = int(current_time_s) // interval
+        if current_bin <= self._traffic_series_last_written_bin:
+            return
+        records = []
+        for idx, prompt in enumerate(prompts):
+            intersection_id = self.env.list_intersection[idx].inter_name
+            history = self._build_traffic_series_history(intersection_id, current_time_s)
+            for hist_idx, entry in enumerate(history):
+                record = {
+                    "date": entry.get("date"),
+                    "interval_s": int(interval),
+                    "intersection_id": intersection_id,
+                    "movement_counts": entry.get("movement_counts", {}),
+                    "prompt": prompt if hist_idx == len(history) - 1 else "",
+                }
+                records.append(record)
+        _append_jsonl_records(self._traffic_series_output_path, records)
+        self._traffic_series_last_written_bin = current_bin
+
+    def _token_in_vocab(self, token):
+        return _shared_token_in_vocab(self.tokenizer, token)
+
+    def _extract_image_token_candidates(self, llm_path):
+        return _shared_extract_image_token_candidates(llm_path, self.tokenizer)
+
+    def _resolve_image_token(self):
+        return _shared_resolve_image_token(self)
+
+    def _inject_image_token(self, prompt_text):
+        prefix = self.ts_image_prompt_prefix or ""
+        token = self._resolve_image_token() if (self.ts_image_token or self.tokenizer) else (self.ts_image_token or "")
+        if not token and not prefix:
+            return prompt_text
+        if token and token in prompt_text:
+            return prompt_text
+        return f"{prefix}{token}\n{prompt_text}"
+
+    def test(self, logger, test_round):
+        print("================ Start Test ================")
+        total_run_cnt = self.dic_traffic_env_conf["RUN_COUNTS"]
+        # initialize output streams
+        done = False
+        state = self.env.reset()
+        total_reward = 0.0
+        queue_length_episode = []
+        waiting_time_episode = []
+        print("end reset")
+        current_time = self.env.get_current_time()  # in seconds
+
+        start_time = time.time()
+        state_action_log = [[] for _ in range(len(state))]
+        self._load_traffic_history()
+
+        # self.llm_model.eval()
+        for step_num in tqdm(range(int(total_run_cnt / self.dic_traffic_env_conf['MIN_ACTION_TIME']))):
+            if done or current_time >= total_run_cnt:
+                break
+            action_list = []
+            current_states = []
+
+            for i in range(len(state)):
+                # log statistic state
+                intersection = self.env.intersection_dict[self.env.list_intersection[i].inter_name]
+                roads = deepcopy(intersection["roads"])
+                statistic_state, statistic_state_incoming, mean_speed = get_state_detail(roads, self.env)
+
+                state_action_log[i].append(
+                    {
+                        "state": statistic_state,
+                        "state_incoming": statistic_state_incoming,
+                        "approaching_speed": mean_speed,
+                    }
+                )
+                current_states.append(statistic_state)
+
+            prompts = []
+            ts_images = []
+
+            self._append_traffic_history_jsonl(current_time)
+
+
+            snapshot_path = _shared_maybe_take_snapshot(self, current_time)
+
+            movement_keys = self._traffic_history_movement_keys or ["NT", "NL", "ST", "SL", "ET", "EL", "WT", "WL"]
+            ts_adapter = self.ts_image_adapter
+            if ts_adapter is None:
+                raise RuntimeError(
+                    "ts_image_adapter is not initialized; create it in run_open_LLM_with_vllm.py "
+                    "and pass it to LLM_Inference_VLLM."
+                )
+
+            inferred_dim = None
+            for idx, s in enumerate(current_states):
+                state_action_log[idx].append({"state": s})
+                intersection_id = self.env.list_intersection[idx].inter_name
+                traffic_history = self._get_traffic_history_until(intersection_id, current_time)
+
+                if not traffic_history:
+                    raise ValueError(f"No traffic history for intersection {intersection_id} at t={current_time}.")
+
+                ts_seq = [[float(step.get(key, 0.0)) for key in movement_keys] for step in traffic_history]
+
+                try:
+                    current_dim = len(ts_seq[0])
+                except (TypeError, IndexError):
+                    current_dim = self.ts_feature_dim or 3
+
+                if inferred_dim is None:
+                    inferred_dim = current_dim
+                    if self.ts_feature_dim is None:
+                        self.ts_feature_dim = inferred_dim
+
+                    if getattr(ts_adapter, "learnable_image", False):
+                        adapter_dim = getattr(ts_adapter, "input_dim", None)
+                        if adapter_dim is not None and adapter_dim != inferred_dim:
+                            raise ValueError(
+                                "TS image adapter input_dim mismatch; reinitialize in main with input_dim="
+                                f"{inferred_dim}."
+                            )
+                elif current_dim != inferred_dim:
+                    raise ValueError(
+                        f"Traffic history feature dim mismatch for {intersection_id}: "
+                        f"expected {inferred_dim}, got {current_dim}."
+                    )
+
+                ts_images_local = ts_adapter.generate_images(ts_seq)
+                if not ts_images_local:
+                    raise RuntimeError(f"TS image adapter returned no images for intersection {intersection_id}.")
+
+                ts_image = ts_images_local[0]
+                ts_images.append(ts_image)
+
+                prompt = getPrompt(state2text(s))
+                prompt = prompt[0]['content'] + "\n\n### Instruction:\n" + prompt[1]['content'] + "\n\n### Response:\n"
+                prompt += f"\n\nsnapshot_path: {snapshot_path or ''}"
+                prompts.append(prompt)
+
+            self._record_traffic_prompt_series(current_time, prompts)
+
+            inputs_text = [
+                    self.tokenizer.apply_chat_template(
+                        [{"role": "user", "content": f"<start_of_image> {p}"}],  # 这里 content 直接用字符串 p
+                        tokenize=False,
+                        add_generation_prompt=True,
+                    )
+                    for p in prompts
+                ]
+            
+
+
+
+            # 2) vLLM 多模态输入：每条是一个 dict（prompt + multi_modal_data）
+            #    ts_images: List[PIL.Image.Image]
+            vllm_prompts = [
+                {
+                    "prompt": txt,
+                    "multi_modal_data": {"image": img},  # 单图直接放 PIL.Image
+                }
+                for txt, img in zip(inputs_text, ts_images)
+            ]
+
+            # 3) SamplingParams：vLLM 用这个，不是 HF 的 generate kwargs
+            sampling_params = self.generation_kwargs # 你的 generation_kwargs 需要是 vLLM 支持的字段
+
+            responses = []
+            bs = 16
+            for start in range(0, len(inputs_text), bs):
+                # batch = inputs_text[start:start + bs]
+                batch = vllm_prompts[start:start + bs]
+
+                # vLLM.generate 返回的是 RequestOutput 列表，不是 token ids
+                outputs = self.llm_model.generate(prompts=batch, sampling_params=sampling_params)
+
+                # 取每条的第一条 beam/候选文本
+                for out in outputs:
+                    responses.append(out.outputs[0].text)
+
+                    
+
+            fail_num = 0
+            vehicle_nums = self.get_vehicle_num(current_states)
+            for i, res in enumerate(responses):
+                res = res[len(prompts[i]):]
+                signal_answer_pattern = r'<signal>(.*?)</signal>'
+                signals = re.findall(signal_answer_pattern, res)
+                signal_text = signals[-1] if len(signals) > 0 else "ETWT"
+                action_list.append(action2code(signal_text) if signal_text in four_phase_list else 0)
+                if len(signals) == 0 or signal_text not in four_phase_list:
+                    signal_text = "ETWT"
+                    if vehicle_nums[i] != 0:
+                        self.fail_logs.append({"state": current_states[i], "response": res})
+                        dump_json(self.fail_logs, self.fail_log_file)
+                        fail_num += 1
+
+                state_action_log[i][-1]["response"] = res
+                state_action_log[i][-1]["action"] = eight_phase_list[action_list[i]]
+
+            next_state, _, done, _ = self.env.step(action_list)
+            rewards = self.get_norm_reward(next_state)  # my reward
+
+            current_time = self.env.get_current_time()  # in seconds
+            state = next_state
+
+            # calculate logger results
+            total_reward += sum(rewards)
+            queue_length_inter = []
+            for inter in self.env.list_intersection:
+                queue_length_inter.append(sum(inter.dic_feature['lane_num_waiting_vehicle_in']))
+            queue_length_episode.append(sum(queue_length_inter))
+            print("Fail Num:", fail_num, "Queuing Vehicles:", sum(queue_length_episode))
+
+            # waiting time
+            waiting_times = []
+            for veh in self.env.waiting_vehicle_list:
+                waiting_times.append(self.env.waiting_vehicle_list[veh]['time'])
+            waiting_time_episode.append(np.mean(waiting_times) if len(waiting_times) > 0 else 0.0)
+
+        # wandb logger
+        vehicle_travel_times = {}
+        for inter in self.env.list_intersection:
+            arrive_left_times = inter.dic_vehicle_arrive_leave_time
+            for veh in arrive_left_times:
+                if "shadow" in veh:
+                    continue
+                enter_time = arrive_left_times[veh]["enter_time"]
+                leave_time = arrive_left_times[veh]["leave_time"]
+                if not np.isnan(enter_time):
+                    leave_time = leave_time if not np.isnan(leave_time) else self.dic_traffic_env_conf["RUN_COUNTS"]
+                    if veh not in vehicle_travel_times:
+                        vehicle_travel_times[veh] = [leave_time - enter_time]
+                    else:
+                        vehicle_travel_times[veh].append(leave_time - enter_time)
+
+        total_travel_time = np.mean([sum(vehicle_travel_times[veh]) for veh in vehicle_travel_times])
+
+        results = {
+            "test_reward_over": total_reward,
+            "test_avg_queue_len_over": np.mean(queue_length_episode) if len(queue_length_episode) > 0 else 0,
+            "test_queuing_vehicle_num_over": np.sum(queue_length_episode) if len(queue_length_episode) > 0 else 0,
+            "test_avg_waiting_time_over": np.mean(waiting_time_episode) if len(queue_length_episode) > 0 else 0,
+            "test_avg_travel_time_over": total_travel_time}
+        logger.log(results)
+        print("Test Round:", test_round, results)
+        f_state_action = os.path.join(self.dic_path["PATH_TO_WORK_DIRECTORY"], "state_action.json")
+        dump_json(state_action_log, f_state_action)
+        print("Testing time: ", time.time() - start_time)
+
+        self.env.batch_log_2()
+
+        return results
+
+    def train_test(self):
+        all_config = merge(merge(self.dic_agent_conf, self.dic_path), self.dic_traffic_env_conf)
+        logger = wandb.init(
+            project=self.dic_traffic_env_conf['PROJECT_NAME'],
+            group=f"{self.dic_traffic_env_conf['MODEL_NAME']}-{self.roadnet}-{self.trafficflow}-{len(self.dic_traffic_env_conf['PHASE'])}_Phases",
+            name=f"{self.dic_traffic_env_conf['TRAFFIC_FILE'].replace('.json', '')}",
+            config=all_config,
+        )
+
+        self.test(logger, 0)
+        wandb.finish()
+
+    '''
+    ======================= Class Utils =======================
+    '''
+    def get_vehicle_num(self, states):
+        veh_nums = []
+
+        for i in range(len(states)):
+            vehicle_num = 0
+
+            for lane in states[i]:
+                vehicle_num += states[i][lane]['queue_len']
+                for cell in range(len(states[i][lane]['cells'])):
+                    vehicle_num += states[i][lane]['cells'][cell]
+
+            veh_nums.append(vehicle_num)
+
+        return veh_nums
+
+    def get_norm_reward(self, state):
+        rewards = []
+
+        for i in range(len(state)):
+            vehicle_num = 0
+            queue_length = 0
+
+            intersection = self.env.intersection_dict[self.env.list_intersection[i].inter_name]
+            roads = deepcopy(intersection["roads"])
+            statistic_state, _, _ = get_state_detail(roads, self.env)
+            for lane in statistic_state:
+                queue_length += statistic_state[lane]['queue_len']
+
+                vehicle_num += statistic_state[lane]['queue_len']
+                for cell in range(len(statistic_state[lane]['cells'])):
+                    vehicle_num += statistic_state[lane]['cells'][cell]
+
+            reward = -(queue_length / vehicle_num) if vehicle_num > 0.0 else -0.0
+            rewards.append(reward)
+
+        return rewards
+
+
+
+def path_check(dic_path):
+    if os.path.exists(dic_path["PATH_TO_WORK_DIRECTORY"]):
+        if dic_path["PATH_TO_WORK_DIRECTORY"] != "records/default":
+            raise FileExistsError
+        else:
+            pass
+    else:
+        os.makedirs(dic_path["PATH_TO_WORK_DIRECTORY"])
+    if os.path.exists(dic_path["PATH_TO_MODEL"]):
+        if dic_path["PATH_TO_MODEL"] != "model/default":
+            raise FileExistsError
+        else:
+            pass
+    else:
+        os.makedirs(dic_path["PATH_TO_MODEL"])
+
+
+def copy_conf_file(dic_path, dic_agent_conf, dic_traffic_env_conf, path=None):
+    if path is None:
+        path = dic_path["PATH_TO_WORK_DIRECTORY"]
+    json.dump(dic_agent_conf, open(os.path.join(path, "agent.conf"), "w"), indent=4)
+    json.dump(dic_traffic_env_conf, open(os.path.join(path, "traffic_env.conf"), "w"), indent=4)
+
+
+def copy_cityflow_file(dic_path, dic_traffic_env_conf, path=None):
+    if path is None:
+        path = dic_path["PATH_TO_WORK_DIRECTORY"]
+    shutil.copy(os.path.join(dic_path["PATH_TO_DATA"], dic_traffic_env_conf["TRAFFIC_FILE"]),
+                os.path.join(path, dic_traffic_env_conf["TRAFFIC_FILE"]))
+    shutil.copy(os.path.join(dic_path["PATH_TO_DATA"], dic_traffic_env_conf["ROADNET_FILE"]),
+                os.path.join(path, dic_traffic_env_conf["ROADNET_FILE"]))
+
+
+class LLM_Inference:
+    def __init__(self, dic_agent_conf, dic_traffic_env_conf, dic_path, roadnet, trafficflow, ts_image_adapter=None):
+        self.dic_agent_conf = dic_agent_conf
+        self.dic_traffic_env_conf = dic_traffic_env_conf
+        self.dic_path = dic_path
+        self.agents = []
+        self.env = None
+        self.roadnet = roadnet
+        self.trafficflow = trafficflow
+        self.models = []
+        self.generation_kwargs = {}
+        self.epoch_num = 0
+        self.tokenizer = None
+        self.llm_model = None
+        self.llm_ref_model = None
+        self.dic_critic_agent_conf = None
+        self.training_args = None
+        self.trainer_built = False
+        self.trainer = None
+        self.device = None
+
+        self.ts_image_adapter = ts_image_adapter
+        self.ts_history = None
+        self.ts_feature_dim = None
+        self.ts_cells_len = None
+        self.ts_image_service_url = str(self.dic_agent_conf.get("TS_IMAGE_SERVICE_URL", "")).strip()
+        try:
+            self.ts_image_seq_len = int(self.dic_agent_conf.get("TS_IMAGE_SEQ_LEN", 0) or 0)
+        except (TypeError, ValueError):
+            self.ts_image_seq_len = 0
+        if self.ts_image_adapter is not None and self.ts_image_seq_len <= 0:
+            adapter_seq_len = getattr(self.ts_image_adapter, "seq_len", None)
+            if adapter_seq_len is not None:
+                self.ts_image_seq_len = int(adapter_seq_len)
+        self.ts_image_token = str(self.dic_agent_conf.get("TS_IMAGE_TOKEN", "<image>"))
+        self.ts_image_prompt_prefix = str(self.dic_agent_conf.get("TS_IMAGE_PROMPT_PREFIX", ""))
+        self.ts_feature_mode = str(self.dic_agent_conf.get("TS_FEATURE_MODE", "movement_total")).strip().lower()
+        try:
+            self.ts_image_timeout = float(self.dic_agent_conf.get("TS_IMAGE_TIMEOUT", 5.0))
+        except (TypeError, ValueError):
+            self.ts_image_timeout = 5.0
+        try:
+            self.ts_image_size = int(self.dic_agent_conf.get("TS_IMAGE_SIZE", 56) or 56)
+        except (TypeError, ValueError):
+            self.ts_image_size = 56 
+        try:
+            self.ts_image_periodicity = int(self.dic_agent_conf.get("TS_IMAGE_PERIODICITY", 24) or 24)
+        except (TypeError, ValueError):
+            self.ts_image_periodicity = 24
+        try:
+            self.ts_image_norm_const = float(self.dic_agent_conf.get("TS_IMAGE_NORM_CONST", 0.4) or 0.4)
+        except (TypeError, ValueError):
+            return
+        self.ts_image_norm_const = 0.4
+        self.ts_image_learnable = _str2bool(self.dic_agent_conf.get("TS_IMAGE_LEARNABLE", False))
+        self.ts_image_three_channel = _str2bool(self.dic_agent_conf.get("TS_IMAGE_THREE_CHANNEL", True))
+
+        self._traffic_history_interval = None
+        self._traffic_history_intersection_ids = None
+        self._traffic_history_intersection_index = None
+        self._traffic_history_movement_keys = None
+        self._traffic_history_output_path = None
+        self._traffic_history_last_written_bin = -1
+        self._traffic_history_base_dt = None
+
+        try:
+            self.traffic_series_interval_s = int(self.dic_agent_conf.get("TRAFFIC_SERIES_INTERVAL", 2) or 2)
+        except (TypeError, ValueError):
+            self.traffic_series_interval_s = 2
+        try:
+            self.traffic_series_window_s = int(self.dic_agent_conf.get("TRAFFIC_SERIES_WINDOW", 30) or 30)
+        except (TypeError, ValueError):
+            self.traffic_series_window_s = 30
+        self.traffic_series_output_dir = str(
+            self.dic_agent_conf.get("TRAFFIC_SERIES_OUTPUT_DIR", "")
+        ).strip()
+        if not self.traffic_series_output_dir:
+            self.traffic_series_output_dir = os.path.join("data", "recorded")
+        self.traffic_series_basename = str(
+            self.dic_agent_conf.get("TRAFFIC_SERIES_BASENAME", "traffic_prompt_series")
+        ).strip() or "traffic_prompt_series"
+        self._traffic_series_output_path = None
+        self._traffic_series_initialized = False
+        self._traffic_series_intersection_index = None
+        self._traffic_series_movement_keys = None
+        self._traffic_series_last_written_bin = -1
+        self._traffic_series_base_dt = None
+
+        if not os.path.exists("./fails"):
+            os.mkdir("./fails")
+        self.fail_log_file = f"./fails/{self.dic_agent_conf['LLM_MODEL']}-{self.dic_traffic_env_conf['TRAFFIC_FILE']}-{self.dic_traffic_env_conf['ROADNET_FILE']}.json"
+        self.fail_logs = []
+        self._init_ts_image_client()
+        if self.ts_image_adapter is None:
+            self._init_ts_image_adapter()
+        self._ensure_traffic_series_config()
+        self.initialize()
+
+    def initialize_llm(self):
+        device_map = "auto"
+
+        # init LLM
+        llm_path = self.dic_agent_conf["LLM_PATH"]
+        llm_path_lower = llm_path.lower()
+        if "qwen" in llm_path_lower and "vl" in llm_path_lower:
+            self.qwen=True
+            self.llm_model = Qwen3VLForConditionalGeneration.from_pretrained(
+                llm_path,
+                dtype="auto",
+                device_map=device_map,
+            )
+
+            # processor as tokenizer for text-only usage
+            self.processor = AutoProcessor.from_pretrained(llm_path, padding_side="left")
+            self.tokenizer = AutoTokenizer.from_pretrained(
+                llm_path,
+                padding_side="left",
+                padding=True
+            )
+            try:
+                self.tokenizer.pad_token_id = 0
+            except Exception:
+                pass
+        else:
+            self.llm_model = AutoModelForCausalLM.from_pretrained(
+                llm_path,
+                torch_dtype=torch.bfloat16,
+                device_map=device_map,
+                trust_remote_code=True
+            )
+
+            # init tokenizer
+            self.tokenizer = AutoTokenizer.from_pretrained(
+                llm_path,
+                padding_side="left",
+                padding=True
+            )
+            self.tokenizer.pad_token_id = 0
+
+            self.processor = AutoProcessor.from_pretrained(llm_path, padding_side="left")
+
+        self.test_generation_kwargs = {
+            "min_length": -1,
+            "top_k": 50,
+            "top_p": 1.0,
+            "temperature": 0.1,
+            "do_sample": True,
+            "max_new_tokens": self.dic_agent_conf["NEW_MAX_TOKENS"],
+            "pad_token_id": getattr(self.tokenizer, "pad_token_id", None),
+            "eos_token_id": getattr(self.tokenizer, "eos_token_id", None)
+        }
+        self._resolve_image_token()
+
+    def initialize(self):
+        path_check(self.dic_path)
+        copy_conf_file(self.dic_path, self.dic_agent_conf, self.dic_traffic_env_conf)
+        copy_cityflow_file(self.dic_path, self.dic_traffic_env_conf)
+
+        self.env = CityFlowEnv(
+            path_to_log=self.dic_path["PATH_TO_WORK_DIRECTORY"],
+            path_to_work_directory=self.dic_path["PATH_TO_WORK_DIRECTORY"],
+            dic_traffic_env_conf=self.dic_traffic_env_conf,
+            dic_path=self.dic_path
+        )
+        self.env.reset()
+        self.initialize_llm()
+
+    def _init_ts_image_client(self):
+        if not self.ts_image_service_url or self.ts_image_seq_len <= 0:
+            return
+
+
+    def _init_ts_image_adapter(self):
+        if self.ts_image_seq_len <= 0:
+            return
+        try:
+            input_dim = self.ts_feature_dim or len(location_direction_dict)
+            self.ts_image_adapter = TimeSeriesImageAdapter(
+                image_size=self.ts_image_size,
+                seq_len=self.ts_image_seq_len,
+                periodicity=self.ts_image_periodicity,
+                norm_const=self.ts_image_norm_const,
+                learnable_image=self.ts_image_learnable,
+                three_channel_image=self.ts_image_three_channel,
+                input_dim=input_dim,
+            )
+        except Exception as exc:
+            print(f"TS image adapter init error: {exc}")
+            self.ts_image_adapter = None
+
+    def _ensure_ts_history(self, num_intersections):
+        if self.ts_history is not None and len(self.ts_history) == num_intersections:
+            return
+        self.ts_history = [deque(maxlen=self.ts_image_seq_len) for _ in range(num_intersections)]
+
+    def _traffic_series_run_tag(self):
+        run_dir = str(self.dic_path.get("PATH_TO_WORK_DIRECTORY", "")).strip()
+        run_tag = os.path.basename(run_dir) if run_dir else ""
+        if not run_tag:
+            run_tag = time.strftime("%m_%d_%H_%M_%S", time.localtime(time.time()))
+        return run_tag
+
+    def _ensure_traffic_series_config(self):
+        if self._traffic_series_initialized:
+            return
+        base_dir = self.traffic_series_output_dir or os.path.join("data", "recorded")
+        run_tag = self._traffic_series_run_tag()
+        output_dir = os.path.join(base_dir, run_tag)
+        os.makedirs(output_dir, exist_ok=True)
+        suffix = self._traffic_count_suffix(self.traffic_series_interval_s)
+        filename = f"{self.traffic_series_basename}_{suffix}.jsonl"
+        self._traffic_series_output_path = os.path.join(output_dir, filename)
+        _prepare_jsonl_file(self._traffic_series_output_path)
+        self._traffic_series_initialized = True
+
+    def _resolve_series_movement_keys(self):
+        default_keys = ["NT", "NL", "ST", "SL", "ET", "EL", "WT", "WL"]
+        series_keys = list(self._traffic_series_movement_keys or [])
+        if not series_keys:
+            return default_keys, default_keys
+        output_keys = list(series_keys)
+        for key in default_keys:
+            if key not in output_keys:
+                output_keys.append(key)
+        return series_keys, output_keys
+
+    def _load_traffic_series(self):
+        if self._traffic_series_movement_keys is not None:
+            return
+        if self.env is None:
+            return
+        self._ensure_traffic_series_config()
+        interval = int(self.traffic_series_interval_s or 2)
+        if interval <= 0:
+            interval = 2
+
+        if not getattr(self.env, "traffic_count_enabled", False):
+            current_time = self.env.get_current_time()
+            if current_time in (None, 0, 0.0):
+                self.dic_traffic_env_conf["ENABLE_TRAFFIC_COUNT"] = True
+                self.dic_traffic_env_conf["TRAFFIC_COUNT_MODE"] = "intersection_movement"
+                self.dic_traffic_env_conf["TRAFFIC_COUNT_OUTPUT_FORMAT"] = "jsonl"
+
+        intervals = list(getattr(self.env, "traffic_count_intervals", []) or [])
+        if interval not in intervals:
+            intervals.append(interval)
+            self.dic_traffic_env_conf["TRAFFIC_COUNT_INTERVALS"] = sorted(set(intervals))
+            current_time = self.env.get_current_time()
+            if current_time in (None, 0, 0.0):
+                try:
+                    self.env._init_traffic_counter()
+                except Exception as exc:
+                    print(f"Traffic series counter init failed: {exc}")
+
+        self._traffic_series_intersection_index = {
+            inter_id: idx for idx, inter_id in enumerate(getattr(self.env, "traffic_intersection_ids", []) or [])
+        }
+        self._traffic_series_movement_keys = list(
+            getattr(self.env, "traffic_movement_keys", []) or ["NT", "NL", "ST", "SL", "ET", "EL", "WT", "WL"]
+        )
+        self._traffic_series_base_dt = getattr(self.env, "traffic_base_dt", None) or datetime(1970, 1, 1)
+
+    def _build_traffic_series_history(self, intersection_id, current_time_s):
+        self._load_traffic_series()
+        interval = int(self.traffic_series_interval_s or 2)
+        if interval <= 0:
+            interval = 2
+        series_keys, output_keys = self._resolve_series_movement_keys()
+        num_series_keys = len(series_keys)
+        counts = getattr(self.env, "traffic_counts_by_interval", {}).get(interval)
+        inter_idx = (self._traffic_series_intersection_index or {}).get(intersection_id)
+
+        current_bin = int(current_time_s) // interval
+        if counts is not None and counts.size > 0:
+            if current_bin >= counts.shape[0]:
+                current_bin = counts.shape[0] - 1
+        if current_bin < 0:
+            current_bin = 0
+
+        window_bins = int(self.traffic_series_window_s // interval) if interval > 0 else 0
+        start_bin = max(0, current_bin - window_bins)
+        base_dt = self._traffic_series_base_dt or datetime(1970, 1, 1)
+        history = []
+        for bin_idx in range(start_bin, current_bin + 1):
+            date_str = (base_dt + timedelta(seconds=bin_idx * interval)).strftime("%Y-%m-%d %H:%M:%S")
+            movement_counts = {key: 0 for key in output_keys}
+            if counts is not None and counts.size > 0 and inter_idx is not None and bin_idx >= 0:
+                if bin_idx < counts.shape[0]:
+                    offset = inter_idx * num_series_keys
+                    row = counts[bin_idx, offset : offset + num_series_keys]
+                    for mv_i, key in enumerate(series_keys):
+                        if mv_i < len(row):
+                            movement_counts[key] = int(row[mv_i])
+            history.append({"date": date_str, "movement_counts": movement_counts})
+        return history
+
+    def _record_traffic_prompt_series(self, current_time_s, prompts):
+        if not prompts:
+            return
+        self._load_traffic_series()
+        if not self._traffic_series_output_path:
+            return
+        interval = int(self.traffic_series_interval_s or 2)
+        if interval <= 0:
+            interval = 2
+        current_bin = int(current_time_s) // interval
+        if current_bin <= self._traffic_series_last_written_bin:
+            return
+        records = []
+        for idx, prompt in enumerate(prompts):
+            intersection_id = self.env.list_intersection[idx].inter_name
+            history = self._build_traffic_series_history(intersection_id, current_time_s)
+            for hist_idx, entry in enumerate(history):
+                record = {
+                    "date": entry.get("date"),
+                    "interval_s": int(interval),
+                    "intersection_id": intersection_id,
+                    "movement_counts": entry.get("movement_counts", {}),
+                    "prompt": prompt if hist_idx == len(history) - 1 else "",
+                }
+                records.append(record)
+        _append_jsonl_records(self._traffic_series_output_path, records)
+        self._traffic_series_last_written_bin = current_bin
+
+    def _state_to_features(self, state):
+        mode = self.ts_feature_mode
+        if mode not in ("movement_total", "movement_queue_cells", "movement_full"):
+            mode = "movement_total"
+        features = []
+        for key in location_direction_dict:
+            entry = state.get(key, {})
+            queue_len = float(entry.get("queue_len", 0.0))
+            cells = list(entry.get("cells", []) or [])
+            avg_wait = float(entry.get("avg_wait_time", 0.0))
+            if self.ts_cells_len is None:
+                self.ts_cells_len = len(cells)
+            if self.ts_cells_len:
+                if len(cells) < self.ts_cells_len:
+                    cells = cells + [0.0] * (self.ts_cells_len - len(cells))
+                else:
+                    cells = cells[:self.ts_cells_len]
+            if mode == "movement_total":
+                features.append(queue_len + sum(cells))
+            elif mode == "movement_queue_cells":
+                features.append(queue_len)
+                features.extend(cells)
+            else:
+                features.append(queue_len)
+                features.append(avg_wait)
+                features.extend(cells)
+        return features
+
+    def _update_ts_history(self, current_states):
+        self._ensure_ts_history(len(current_states))
+        for i, state in enumerate(current_states):
+            features = self._state_to_features(state)
+            if self.ts_feature_dim is None:
+                self.ts_feature_dim = len(features)
+            self.ts_history[i].append(features)
+
+    def _build_ts_batch(self):
+        batch = []
+        for history in self.ts_history:
+            history_list = list(history)
+            if not history_list:
+                if self.ts_feature_dim is None:
+                    return []
+                pad = [0.0] * self.ts_feature_dim
+                seq = [pad] * self.ts_image_seq_len
+            elif len(history_list) < self.ts_image_seq_len:
+                pad = history_list[0]
+                seq = [pad] * (self.ts_image_seq_len - len(history_list)) + history_list
+            else:
+                seq = history_list
+            batch.append(seq)
+        return batch
+
+    def _traffic_count_suffix(self, interval_seconds):
+        if interval_seconds == 60:
+            return "minute"
+        if interval_seconds == 3600:
+            return "hour"
+        return f"{interval_seconds}s"
+
+    def _resolve_traffic_history_output_path(self, interval_seconds):
+        path = str(self.dic_traffic_env_conf.get("TRAFFIC_COUNT_HISTORY_PATH", "")).strip()
+        if path:
+            return path
+        output_dir = self.dic_traffic_env_conf.get(
+            "TRAFFIC_COUNT_OUTPUT_DIR", self.dic_path["PATH_TO_WORK_DIRECTORY"]
+        )
+        base_name = self.dic_traffic_env_conf.get("TRAFFIC_COUNT_BASENAME", "traffic_counts")
+        suffix = self._traffic_count_suffix(interval_seconds)
+        return os.path.join(output_dir, f"{base_name}_{suffix}.jsonl")
+
+    def _load_traffic_history(self):
+        if self._traffic_history_interval is not None:
+            return
+        if self.env is None:
+            return
+        interval = int(self.dic_traffic_env_conf.get("MIN_ACTION_TIME", 1) or 1)
+        current_time = self.env.get_current_time()
+        needs_reinit = (
+            not getattr(self.env, "traffic_count_enabled", False)
+            or getattr(self.env, "traffic_count_mode", "") != "intersection_movement"
+            or interval not in getattr(self.env, "traffic_count_intervals", [])
+        )
+        if needs_reinit and current_time in (None, 0, 0.0):
+            self.dic_traffic_env_conf["ENABLE_TRAFFIC_COUNT"] = True
+            self.dic_traffic_env_conf["TRAFFIC_COUNT_MODE"] = "intersection_movement"
+            self.dic_traffic_env_conf["TRAFFIC_COUNT_OUTPUT_FORMAT"] = "jsonl"
+            intervals = self.dic_traffic_env_conf.get("TRAFFIC_COUNT_INTERVALS", None)
+            if intervals is None:
+                intervals = [interval]
+            elif isinstance(intervals, int):
+                intervals = [intervals]
+            intervals = [int(x) for x in intervals if int(x) > 0]
+            if interval not in intervals:
+                intervals.append(interval)
+            self.dic_traffic_env_conf["TRAFFIC_COUNT_INTERVALS"] = sorted(set(intervals))
+            try:
+                self.env._init_traffic_counter()
+            except Exception as exc:
+                print(f"Traffic counter init failed: {exc}")
+        elif needs_reinit:
+            print("Traffic counter not configured for MIN_ACTION_TIME; history may be empty.")
+
+        if not getattr(self.env, "traffic_count_enabled", False):
+            return
+        if getattr(self.env, "traffic_count_mode", "") != "intersection_movement":
+            return
+
+        intervals = getattr(self.env, "traffic_count_intervals", [])
+        if interval in intervals:
+            self._traffic_history_interval = interval
+        elif intervals:
+            self._traffic_history_interval = min(intervals)
+            print(
+                f"Using traffic interval {self._traffic_history_interval} "
+                f"(MIN_ACTION_TIME={interval} not available)."
+            )
+        else:
+            self._traffic_history_interval = interval
+
+        self._traffic_history_intersection_ids = list(getattr(self.env, "traffic_intersection_ids", []) or [])
+        self._traffic_history_intersection_index = {
+            inter_id: idx for idx, inter_id in enumerate(self._traffic_history_intersection_ids)
+        }
+        self._traffic_history_movement_keys = list(
+            getattr(self.env, "traffic_movement_keys", []) or ["NT", "NL", "ST", "SL", "ET", "EL", "WT", "WL"]
+        )
+        self._traffic_history_last_written_bin = -1
+        self._traffic_history_base_dt = getattr(self.env, "traffic_base_dt", None) or datetime(1970, 1, 1)
+        output_path = self._resolve_traffic_history_output_path(self._traffic_history_interval)
+        self._traffic_history_output_path = output_path
+        if output_path:
+            _prepare_jsonl_file(output_path)
+
+    def _get_traffic_history_until(self, intersection_id, current_time_s):
+        self._load_traffic_history()
+        interval = self._traffic_history_interval
+        if interval is None:
+            return []
+        counts = self.env.traffic_counts_by_interval.get(interval)
+        if counts is None or counts.size == 0:
+            return []
+        inter_idx = self._traffic_history_intersection_index.get(intersection_id)
+        if inter_idx is None:
+            return []
+        num_mv = len(self._traffic_history_movement_keys)
+        current_bin = int(current_time_s) // interval
+        if current_bin < 0:
+            return []
+        if current_bin >= counts.shape[0]:
+            current_bin = counts.shape[0] - 1
+        offset = inter_idx * num_mv
+        slice_rows = counts[: current_bin + 1, offset : offset + num_mv]
+        history = []
+        for row in slice_rows:
+            movement_counts = {
+                key: int(row[idx]) for idx, key in enumerate(self._traffic_history_movement_keys)
+            }
+            history.append(movement_counts)
+        return history
+
+    def _append_traffic_history_jsonl(self, current_time_s):
+        self._load_traffic_history()
+        interval = self._traffic_history_interval
+        if interval is None or not self._traffic_history_output_path:
+            return
+        counts = self.env.traffic_counts_by_interval.get(interval)
+        if counts is None or counts.size == 0:
+            return
+        current_bin = int(current_time_s) // interval
+        if current_bin < 0:
+            return
+        if current_bin >= counts.shape[0]:
+            current_bin = counts.shape[0] - 1
+        if current_bin <= self._traffic_history_last_written_bin:
+            return
+        base_dt = self._traffic_history_base_dt or datetime(1970, 1, 1)
+        num_mv = len(self._traffic_history_movement_keys)
+        records = []
+        for bin_idx in range(self._traffic_history_last_written_bin + 1, current_bin + 1):
+            date_str = (base_dt + timedelta(seconds=bin_idx * interval)).strftime("%Y-%m-%d %H:%M:%S")
+            row = counts[bin_idx, :]
+            for inter_idx, inter_id in enumerate(self._traffic_history_intersection_ids or []):
+                offset = inter_idx * num_mv
+                movement_counts = {
+                    key: int(row[offset + mv_i]) for mv_i, key in enumerate(self._traffic_history_movement_keys)
+                }
+                record = {
+                    "date": date_str,
+                    "interval_s": int(interval),
+                    "intersection_id": inter_id,
+                    "movement_counts": movement_counts,
+                }
+                records.append(record)
+        _append_jsonl_records(self._traffic_history_output_path, records)
+        self._traffic_history_last_written_bin = current_bin
+
+    def _token_in_vocab(self, token):
+        return _shared_token_in_vocab(self.tokenizer, token)
+
+    def _extract_image_token_candidates(self, llm_path):
+        return _shared_extract_image_token_candidates(llm_path, self.tokenizer)
+
+    def _resolve_image_token(self):
+        return _shared_resolve_image_token(self)
+
+    def _inject_image_token(self, prompt_text):
+        prefix = self.ts_image_prompt_prefix or ""
+        token = self._resolve_image_token() if (self.ts_image_token or self.tokenizer) else (self.ts_image_token or "")
+        if not token and not prefix:
+            return prompt_text
+        if token and token in prompt_text:
+            return prompt_text
+        return f"{prefix}{token}\n{prompt_text}"
+
+    def _tensor_images_to_pil(self, images):
+        if not torch.is_tensor(images):
+            return None
+        images = images.detach().cpu()
+        if images.ndim != 4:
+            return None
+        pil_images = []
+        for img in images:
+            if img.shape[0] == 1:
+                array = img.squeeze(0).numpy().astype(np.uint8)
+                mode = "L"
+            else:
+                array = img.permute(1, 2, 0).numpy().astype(np.uint8)
+                mode = "RGB"
+            pil_images.append(Image.fromarray(array, mode=mode))
+        return pil_images
+
+    def _generate_ts_images_local(self, ts_batch):
+        if self.ts_image_adapter is None:
+            return None
+        try:
+            images = self.ts_image_adapter.generate(ts_batch)
+        except Exception as exc:
+            print(f"TS image adapter error: {exc}")
+            return None
+        return self._tensor_images_to_pil(images)
+
+    def test(self, logger, test_round):
+        print("================ Start Test ================")
+        total_run_cnt = self.dic_traffic_env_conf["RUN_COUNTS"]
+
+        # initialize output streams
+        done = False
+        state = self.env.reset()
+        total_reward = 0.0
+        queue_length_episode = []
+        waiting_time_episode = []
+
+        print("end reset")
+        current_time = self.env.get_current_time()  # in seconds
+        start_time = time.time()
+
+        state_action_log = [[] for _ in range(len(state))]
+        self._load_traffic_history()
+
+        # self.llm_model.eval()
+        for step_num in tqdm(range(int(total_run_cnt / self.dic_traffic_env_conf["MIN_ACTION_TIME"]))):
+            if done or current_time >= total_run_cnt:
+                break
+
+            action_list = []
+            current_states = []
+
+            for i in range(len(state)):
+                # log statistic state
+                intersection = self.env.intersection_dict[self.env.list_intersection[i].inter_name]
+                roads = deepcopy(intersection["roads"])
+                statistic_state, statistic_state_incoming, mean_speed = get_state_detail(roads, self.env)
+
+                state_action_log[i].append(
+                    {
+                        "state": statistic_state,
+                        "state_incoming": statistic_state_incoming,
+                        "approaching_speed": mean_speed,
+                    }
+                )
+                current_states.append(statistic_state)
+
+            prompts = []
+            # ts_images = []
+
+            self._append_traffic_history_jsonl(current_time)
+            snapshot_path = _shared_maybe_take_snapshot(self, current_time)
+
+            movement_keys = self._traffic_history_movement_keys or ["NT", "NL", "ST", "SL", "ET", "EL", "WT", "WL"]
+            # ts_adapter = self.ts_image_adapter
+            # if ts_adapter is None:
+            #     raise RuntimeError(
+            #         "ts_image_adapter is not initialized; create it in run_open_LLM.py and pass it to LLM_Inference."
+            #     )
+
+            # inferred_dim = None
+            for idx, s in enumerate(current_states):
+                state_action_log[idx].append({"state": s})
+                intersection_id = self.env.list_intersection[idx].inter_name
+                traffic_history = self._get_traffic_history_until(intersection_id, current_time)
+
+            #     if not traffic_history:
+            #         raise ValueError(f"No traffic history for intersection {intersection_id} at t={current_time}.")
+
+            #     ts_seq = [[float(step.get(key, 0.0)) for key in movement_keys] for step in traffic_history]
+
+            #     try:
+            #         current_dim = len(ts_seq[0])
+            #     except (TypeError, IndexError):
+            #         current_dim = self.ts_feature_dim or 3
+
+            #     if inferred_dim is None:
+            #         inferred_dim = current_dim
+            #         if self.ts_feature_dim is None:
+            #             self.ts_feature_dim = inferred_dim
+
+            #         if getattr(ts_adapter, "learnable_image", False):
+            #             adapter_dim = getattr(ts_adapter, "input_dim", None)
+            #             if adapter_dim is not None and adapter_dim != inferred_dim:
+            #                 raise ValueError(
+            #                     "TS image adapter input_dim mismatch; reinitialize in main with input_dim="
+            #                     f"{inferred_dim}."
+            #                 )
+
+            #     elif current_dim != inferred_dim:
+            #         raise ValueError(
+            #             f"Traffic history feature dim mismatch for {intersection_id}: "
+            #             f"expected {inferred_dim}, got {current_dim}."
+            #         )
+
+            #     ts_images_local = ts_adapter.generate_images(ts_seq)
+                # if not ts_images_local:
+                #     raise RuntimeError(f"TS image adapter returned no images for intersection {intersection_id}.")
+
+                # ts_image = ts_images_local[0]
+                # ts_images.append(ts_image)
+
+                prompt = getPrompt(state2text(s))
+                prompt = prompt[0]["content"] + "\n\n### Instruction:\n" + prompt[1]["content"] + "\n\n### Response:\n"
+                prompt += f"\n\nsnapshot_path: {snapshot_path or ''}"
+                prompts.append(prompt)
+
+            self._record_traffic_prompt_series(current_time, prompts)
+
+            if hasattr(self, "qwen") and self.qwen is not None and self.qwen is True:
+                inputs_text = [
+                    self.tokenizer.apply_chat_template(
+                        [{"role": "user", "content": f"<start_of_image> {p}"}],  # 这里 content 直接用字符串 p
+                        tokenize=False,
+                        add_generation_prompt=True,
+                    )
+                    for p in prompts
+                ]
+
+            else:
+                inputs_text = [
+                    self.tokenizer.apply_chat_template(
+                        [{"role": "user", "content": f"<start_of_image> {p}"}],  # 这里 content 直接用字符串 p
+                        tokenize=False,
+                        add_generation_prompt=True,
+                    )
+                    for p in prompts
+                ]
+            
+
+            # images_batched = [[img] for img in ts_images]
+
+            # inputs = self.processor(text=inputs_text, images=images_batched, padding=True, return_tensors="pt")
+            inputs = self.processor(text=inputs_text, padding=True, return_tensors="pt")
+
+            responses = []
+            previous_flag = 0
+            for i in range(len(current_states)):
+                if (i + 1) % 16 == 0 or i + 1 >= len(current_states):
+                    current_inputs = {k: v[previous_flag : i + 1] for k, v in inputs.items()}
+                    
+                    response_ids = self.llm_model.generate(**current_inputs, **self.test_generation_kwargs)
+                    cur_response = self.tokenizer.batch_decode(response_ids, skip_special_tokens=True)
+
+                    responses += cur_response
+                    previous_flag = i + 1
+
+            fail_num = 0
+            vehicle_nums = self.get_vehicle_num(current_states)
+            critic_actions = []
+
+            for i, res in enumerate(responses):
+                res = res[len(prompts[i]) :]
+                signal_answer_pattern = r"<signal>(.*?)</signal>"
+                signals = re.findall(signal_answer_pattern, res)
+                signal_text = signals[-1] if len(signals) > 0 else "ETWT"
+
+                action_list.append(action2code(signal_text) if signal_text in four_phase_list else 0)
+
+                if len(signals) == 0 or signal_text not in four_phase_list:
+                    signal_text = "ETWT"
+                    if vehicle_nums[i] != 0:
+                        self.fail_logs.append({"state": current_states[i], "response": res})
+                        dump_json(self.fail_logs, self.fail_log_file)
+                        fail_num += 1
+
+                state_action_log[i][-1]["response"] = res
+                state_action_log[i][-1]["action"] = eight_phase_list[action_list[i]]
+
+            next_state, _, done, _ = self.env.step(action_list)
+            rewards = self.get_norm_reward(next_state)  # my reward
+
+            current_time = self.env.get_current_time()  # in seconds
+            state = next_state
+
+            # calculate logger results
+            total_reward += sum(rewards)
+
+            queue_length_inter = []
+            for inter in self.env.list_intersection:
+                queue_length_inter.append(sum(inter.dic_feature["lane_num_waiting_vehicle_in"]))
+            queue_length_episode.append(sum(queue_length_inter))
+
+            print("Fail Num:", fail_num, "Queuing Vehicles:", sum(queue_length_episode))
+
+            # waiting time
+            waiting_times = []
+            for veh in self.env.waiting_vehicle_list:
+                waiting_times.append(self.env.waiting_vehicle_list[veh]["time"])
+            waiting_time_episode.append(np.mean(waiting_times) if len(waiting_times) > 0 else 0.0)
+
+            # wandb logger
+            vehicle_travel_times = {}
+            for inter in self.env.list_intersection:
+                arrive_left_times = inter.dic_vehicle_arrive_leave_time
+                for veh in arrive_left_times:
+                    if "shadow" in veh:
+                        continue
+
+                    enter_time = arrive_left_times[veh]["enter_time"]
+                    leave_time = arrive_left_times[veh]["leave_time"]
+
+                    if not np.isnan(enter_time):
+                        leave_time = (
+                            leave_time
+                            if not np.isnan(leave_time)
+                            else self.dic_traffic_env_conf["RUN_COUNTS"]
+                        )
+                        if veh not in vehicle_travel_times:
+                            vehicle_travel_times[veh] = [leave_time - enter_time]
+                        else:
+                            vehicle_travel_times[veh].append(leave_time - enter_time)
+
+            total_travel_time = np.mean([sum(vehicle_travel_times[veh]) for veh in vehicle_travel_times])
+
+            results = {
+                "test_reward_over": total_reward,
+                "test_avg_queue_len_over": np.mean(queue_length_episode) if len(queue_length_episode) > 0 else 0,
+                "test_queuing_vehicle_num_over": np.sum(queue_length_episode) if len(queue_length_episode) > 0 else 0,
+                "test_avg_waiting_time_over": np.mean(waiting_time_episode) if len(queue_length_episode) > 0 else 0,
+                "test_avg_travel_time_over": total_travel_time,
+            }
+            logger.log(results)
+            print("Test Round:", test_round, results)
+
+        f_state_action = os.path.join(self.dic_path["PATH_TO_WORK_DIRECTORY"], "state_action.json")
+        dump_json(state_action_log, f_state_action)
+
+        print("Testing time: ", time.time() - start_time)
+        self.env.batch_log_2()
+        return results
+
+
+    def train_test(self):
+        all_config = merge(merge(self.dic_agent_conf, self.dic_path), self.dic_traffic_env_conf)
+        logger = wandb.init(
+            project=self.dic_traffic_env_conf['PROJECT_NAME'],
+            group=f"{self.dic_traffic_env_conf['MODEL_NAME']}-{self.roadnet}-{self.trafficflow}-{len(self.dic_traffic_env_conf['PHASE'])}_Phases",
+            name=f"{self.dic_traffic_env_conf['TRAFFIC_FILE'].replace('.json', '')}",
+            config=all_config,
+        )
+
+        self.test(logger, 0)
+        wandb.finish()
+
+    '''
+    ======================= Class Utils =======================
+    '''
+    def get_vehicle_num(self, states):
+        veh_nums = []
+
+        for i in range(len(states)):
+            vehicle_num = 0
+
+            for lane in states[i]:
+                vehicle_num += states[i][lane]['queue_len']
+                for cell in range(len(states[i][lane]['cells'])):
+                    vehicle_num += states[i][lane]['cells'][cell]
+
+            veh_nums.append(vehicle_num)
+
+        return veh_nums
+
+    def get_norm_reward(self, state):
+        rewards = []
+
+        for i in range(len(state)):
+            vehicle_num = 0
+            queue_length = 0
+
+            intersection = self.env.intersection_dict[self.env.list_intersection[i].inter_name]
+            roads = deepcopy(intersection["roads"])
+            statistic_state, _, _ = get_state_detail(roads, self.env)
+            for lane in statistic_state:
+                queue_length += statistic_state[lane]['queue_len']
+
+                vehicle_num += statistic_state[lane]['queue_len']
+                for cell in range(len(statistic_state[lane]['cells'])):
+                    vehicle_num += statistic_state[lane]['cells'][cell]
+
+            reward = -(queue_length / vehicle_num) if vehicle_num > 0.0 else -0.0
+            rewards.append(reward)
+
+        return rewards
 
 
 class _LocalTSImageModel:
@@ -105,39 +2037,6 @@ class _LocalTSImageModel:
         images = (images - min_vals) / scale
         images = (images * 255).clamp(0, 255).to(torch.uint8)
         return images
-
-def path_check(dic_path):
-    if os.path.exists(dic_path["PATH_TO_WORK_DIRECTORY"]):
-        if dic_path["PATH_TO_WORK_DIRECTORY"] != "records/default":
-            raise FileExistsError
-        else:
-            pass
-    else:
-        os.makedirs(dic_path["PATH_TO_WORK_DIRECTORY"])
-    if os.path.exists(dic_path["PATH_TO_MODEL"]):
-        if dic_path["PATH_TO_MODEL"] != "model/default":
-            raise FileExistsError
-        else:
-            pass
-    else:
-        os.makedirs(dic_path["PATH_TO_MODEL"])
-
-
-def copy_conf_file(dic_path, dic_agent_conf, dic_traffic_env_conf, path=None):
-    if path is None:
-        path = dic_path["PATH_TO_WORK_DIRECTORY"]
-    json.dump(dic_agent_conf, open(os.path.join(path, "agent.conf"), "w"), indent=4)
-    json.dump(dic_traffic_env_conf, open(os.path.join(path, "traffic_env.conf"), "w"), indent=4)
-
-
-def copy_cityflow_file(dic_path, dic_traffic_env_conf, path=None):
-    if path is None:
-        path = dic_path["PATH_TO_WORK_DIRECTORY"]
-    shutil.copy(os.path.join(dic_path["PATH_TO_DATA"], dic_traffic_env_conf["TRAFFIC_FILE"]),
-                os.path.join(path, dic_traffic_env_conf["TRAFFIC_FILE"]))
-    shutil.copy(os.path.join(dic_path["PATH_TO_DATA"], dic_traffic_env_conf["ROADNET_FILE"]),
-                os.path.join(path, dic_traffic_env_conf["ROADNET_FILE"]))
-
 
 class LLM_CGPR_Collector:
     def __init__(self, dic_agent_conf, dic_traffic_env_conf, dic_path, roadnet, trafficflow):
@@ -861,1739 +2760,3 @@ class LLM_CGPR_Trainer:
 
         return veh_nums
 
-
-class LLM_Inference:
-    def __init__(self, dic_agent_conf, dic_traffic_env_conf, dic_path, roadnet, trafficflow, ts_image_adapter=None):
-        self.dic_agent_conf = dic_agent_conf
-        self.dic_traffic_env_conf = dic_traffic_env_conf
-        self.dic_path = dic_path
-        self.agents = []
-        self.env = None
-        self.roadnet = roadnet
-        self.trafficflow = trafficflow
-        self.models = []
-        self.generation_kwargs = {}
-        self.epoch_num = 0
-        self.tokenizer = None
-        self.llm_model = None
-        self.llm_ref_model = None
-        self.dic_critic_agent_conf = None
-        self.training_args = None
-        self.trainer_built = False
-        self.trainer = None
-        self.device = None
-
-        self.ts_image_adapter = ts_image_adapter
-        self.ts_history = None
-        self.ts_feature_dim = None
-        self.ts_cells_len = None
-        self.ts_image_service_url = str(self.dic_agent_conf.get("TS_IMAGE_SERVICE_URL", "")).strip()
-        try:
-            self.ts_image_seq_len = int(self.dic_agent_conf.get("TS_IMAGE_SEQ_LEN", 0) or 0)
-        except (TypeError, ValueError):
-            self.ts_image_seq_len = 0
-        if self.ts_image_adapter is not None and self.ts_image_seq_len <= 0:
-            adapter_seq_len = getattr(self.ts_image_adapter, "seq_len", None)
-            if adapter_seq_len is not None:
-                self.ts_image_seq_len = int(adapter_seq_len)
-        self.ts_image_token = str(self.dic_agent_conf.get("TS_IMAGE_TOKEN", "<image>"))
-        self.ts_image_prompt_prefix = str(self.dic_agent_conf.get("TS_IMAGE_PROMPT_PREFIX", ""))
-        self.ts_feature_mode = str(self.dic_agent_conf.get("TS_FEATURE_MODE", "movement_total")).strip().lower()
-        try:
-            self.ts_image_timeout = float(self.dic_agent_conf.get("TS_IMAGE_TIMEOUT", 5.0))
-        except (TypeError, ValueError):
-            self.ts_image_timeout = 5.0
-        try:
-            self.ts_image_size = int(self.dic_agent_conf.get("TS_IMAGE_SIZE", 56) or 56)
-        except (TypeError, ValueError):
-            self.ts_image_size = 56 
-        try:
-            self.ts_image_periodicity = int(self.dic_agent_conf.get("TS_IMAGE_PERIODICITY", 24) or 24)
-        except (TypeError, ValueError):
-            self.ts_image_periodicity = 24
-        try:
-            self.ts_image_norm_const = float(self.dic_agent_conf.get("TS_IMAGE_NORM_CONST", 0.4) or 0.4)
-        except (TypeError, ValueError):
-            return
-        self.ts_image_norm_const = 0.4
-        self.ts_image_learnable = _str2bool(self.dic_agent_conf.get("TS_IMAGE_LEARNABLE", False))
-        self.ts_image_three_channel = _str2bool(self.dic_agent_conf.get("TS_IMAGE_THREE_CHANNEL", True))
-
-        self._traffic_history_interval = None
-        self._traffic_history_intersection_ids = None
-        self._traffic_history_intersection_index = None
-        self._traffic_history_movement_keys = None
-        self._traffic_history_output_path = None
-        self._traffic_history_last_written_bin = -1
-        self._traffic_history_base_dt = None
-
-        try:
-            self.traffic_series_interval_s = int(self.dic_agent_conf.get("TRAFFIC_SERIES_INTERVAL", 2) or 2)
-        except (TypeError, ValueError):
-            self.traffic_series_interval_s = 2
-        try:
-            self.traffic_series_window_s = int(self.dic_agent_conf.get("TRAFFIC_SERIES_WINDOW", 30) or 30)
-        except (TypeError, ValueError):
-            self.traffic_series_window_s = 30
-        self.traffic_series_output_dir = str(
-            self.dic_agent_conf.get("TRAFFIC_SERIES_OUTPUT_DIR", "")
-        ).strip()
-        if not self.traffic_series_output_dir:
-            self.traffic_series_output_dir = os.path.join("data", "recorded")
-        self.traffic_series_basename = str(
-            self.dic_agent_conf.get("TRAFFIC_SERIES_BASENAME", "traffic_prompt_series")
-        ).strip() or "traffic_prompt_series"
-        self._traffic_series_output_path = None
-        self._traffic_series_initialized = False
-        self._traffic_series_intersection_index = None
-        self._traffic_series_movement_keys = None
-        self._traffic_series_last_written_bin = -1
-        self._traffic_series_base_dt = None
-
-        if not os.path.exists("./fails"):
-            os.mkdir("./fails")
-        self.fail_log_file = f"./fails/{self.dic_agent_conf['LLM_MODEL']}-{self.dic_traffic_env_conf['TRAFFIC_FILE']}-{self.dic_traffic_env_conf['ROADNET_FILE']}.json"
-        self.fail_logs = []
-        self._init_ts_image_client()
-        if self.ts_image_adapter is None:
-            self._init_ts_image_adapter()
-        self._ensure_traffic_series_config()
-        self.initialize()
-
-    def initialize_llm(self):
-        device_map = "auto"
-
-        # init LLM
-        llm_path = self.dic_agent_conf["LLM_PATH"]
-        llm_path_lower = llm_path.lower()
-        if "qwen" in llm_path_lower and "vl" in llm_path_lower:
-            self.qwen=True
-            self.llm_model = Qwen3VLForConditionalGeneration.from_pretrained(
-                llm_path,
-                dtype="auto",
-                device_map=device_map,
-            )
-
-            # processor as tokenizer for text-only usage
-            self.processor = AutoProcessor.from_pretrained(llm_path, padding_side="left")
-            self.tokenizer = AutoTokenizer.from_pretrained(
-                llm_path,
-                padding_side="left",
-                padding=True
-            )
-            try:
-                self.tokenizer.pad_token_id = 0
-            except Exception:
-                pass
-        else:
-            self.llm_model = AutoModelForCausalLM.from_pretrained(
-                llm_path,
-                torch_dtype=torch.bfloat16,
-                device_map=device_map,
-                trust_remote_code=True
-            )
-
-            # init tokenizer
-            self.tokenizer = AutoTokenizer.from_pretrained(
-                llm_path,
-                padding_side="left",
-                padding=True
-            )
-            self.tokenizer.pad_token_id = 0
-
-            self.processor = AutoProcessor.from_pretrained(llm_path, padding_side="left")
-
-        self.test_generation_kwargs = {
-            "min_length": -1,
-            "top_k": 50,
-            "top_p": 1.0,
-            "temperature": 0.1,
-            "do_sample": True,
-            "max_new_tokens": self.dic_agent_conf["NEW_MAX_TOKENS"],
-            "pad_token_id": getattr(self.tokenizer, "pad_token_id", None),
-            "eos_token_id": getattr(self.tokenizer, "eos_token_id", None)
-        }
-
-    def initialize(self):
-        path_check(self.dic_path)
-        copy_conf_file(self.dic_path, self.dic_agent_conf, self.dic_traffic_env_conf)
-        copy_cityflow_file(self.dic_path, self.dic_traffic_env_conf)
-
-        self.env = CityFlowEnv(
-            path_to_log=self.dic_path["PATH_TO_WORK_DIRECTORY"],
-            path_to_work_directory=self.dic_path["PATH_TO_WORK_DIRECTORY"],
-            dic_traffic_env_conf=self.dic_traffic_env_conf,
-            dic_path=self.dic_path
-        )
-        self.env.reset()
-        self.initialize_llm()
-
-    def _init_ts_image_client(self):
-        if not self.ts_image_service_url or self.ts_image_seq_len <= 0:
-            return
-
-
-    def _init_ts_image_adapter(self):
-        if self.ts_image_seq_len <= 0:
-            return
-        try:
-            input_dim = self.ts_feature_dim or len(location_direction_dict)
-            self.ts_image_adapter = TimeSeriesImageAdapter(
-                image_size=self.ts_image_size,
-                seq_len=self.ts_image_seq_len,
-                periodicity=self.ts_image_periodicity,
-                norm_const=self.ts_image_norm_const,
-                learnable_image=self.ts_image_learnable,
-                three_channel_image=self.ts_image_three_channel,
-                input_dim=input_dim,
-            )
-        except Exception as exc:
-            print(f"TS image adapter init error: {exc}")
-            self.ts_image_adapter = None
-
-    def _ensure_ts_history(self, num_intersections):
-        if self.ts_history is not None and len(self.ts_history) == num_intersections:
-            return
-        self.ts_history = [deque(maxlen=self.ts_image_seq_len) for _ in range(num_intersections)]
-
-    def _traffic_series_run_tag(self):
-        run_dir = str(self.dic_path.get("PATH_TO_WORK_DIRECTORY", "")).strip()
-        run_tag = os.path.basename(run_dir) if run_dir else ""
-        if not run_tag:
-            run_tag = time.strftime("%m_%d_%H_%M_%S", time.localtime(time.time()))
-        return run_tag
-
-    def _ensure_traffic_series_config(self):
-        if self._traffic_series_initialized:
-            return
-        base_dir = self.traffic_series_output_dir or os.path.join("data", "recorded")
-        run_tag = self._traffic_series_run_tag()
-        output_dir = os.path.join(base_dir, run_tag)
-        os.makedirs(output_dir, exist_ok=True)
-        suffix = self._traffic_count_suffix(self.traffic_series_interval_s)
-        filename = f"{self.traffic_series_basename}_{suffix}.jsonl"
-        self._traffic_series_output_path = os.path.join(output_dir, filename)
-        with open(self._traffic_series_output_path, "w", encoding="utf-8"):
-            pass
-        self._traffic_series_initialized = True
-
-    def _resolve_series_movement_keys(self):
-        default_keys = ["NT", "NL", "ST", "SL", "ET", "EL", "WT", "WL"]
-        series_keys = list(self._traffic_series_movement_keys or [])
-        if not series_keys:
-            return default_keys, default_keys
-        output_keys = list(series_keys)
-        for key in default_keys:
-            if key not in output_keys:
-                output_keys.append(key)
-        return series_keys, output_keys
-
-    def _load_traffic_series(self):
-        if self._traffic_series_movement_keys is not None:
-            return
-        if self.env is None:
-            return
-        self._ensure_traffic_series_config()
-        interval = int(self.traffic_series_interval_s or 2)
-        if interval <= 0:
-            interval = 2
-
-        if not getattr(self.env, "traffic_count_enabled", False):
-            current_time = self.env.get_current_time()
-            if current_time in (None, 0, 0.0):
-                self.dic_traffic_env_conf["ENABLE_TRAFFIC_COUNT"] = True
-                self.dic_traffic_env_conf["TRAFFIC_COUNT_MODE"] = "intersection_movement"
-                self.dic_traffic_env_conf["TRAFFIC_COUNT_OUTPUT_FORMAT"] = "jsonl"
-
-        intervals = list(getattr(self.env, "traffic_count_intervals", []) or [])
-        if interval not in intervals:
-            intervals.append(interval)
-            self.dic_traffic_env_conf["TRAFFIC_COUNT_INTERVALS"] = sorted(set(intervals))
-            current_time = self.env.get_current_time()
-            if current_time in (None, 0, 0.0):
-                try:
-                    self.env._init_traffic_counter()
-                except Exception as exc:
-                    print(f"Traffic series counter init failed: {exc}")
-
-        self._traffic_series_intersection_index = {
-            inter_id: idx for idx, inter_id in enumerate(getattr(self.env, "traffic_intersection_ids", []) or [])
-        }
-        self._traffic_series_movement_keys = list(
-            getattr(self.env, "traffic_movement_keys", []) or ["NT", "NL", "ST", "SL", "ET", "EL", "WT", "WL"]
-        )
-        self._traffic_series_base_dt = getattr(self.env, "traffic_base_dt", None) or datetime(1970, 1, 1)
-
-    def _build_traffic_series_history(self, intersection_id, current_time_s):
-        self._load_traffic_series()
-        interval = int(self.traffic_series_interval_s or 2)
-        if interval <= 0:
-            interval = 2
-        series_keys, output_keys = self._resolve_series_movement_keys()
-        num_series_keys = len(series_keys)
-        counts = getattr(self.env, "traffic_counts_by_interval", {}).get(interval)
-        inter_idx = (self._traffic_series_intersection_index or {}).get(intersection_id)
-
-        current_bin = int(current_time_s) // interval
-        if counts is not None and counts.size > 0:
-            if current_bin >= counts.shape[0]:
-                current_bin = counts.shape[0] - 1
-        if current_bin < 0:
-            current_bin = 0
-
-        window_bins = int(self.traffic_series_window_s // interval) if interval > 0 else 0
-        start_bin = max(0, current_bin - window_bins)
-        base_dt = self._traffic_series_base_dt or datetime(1970, 1, 1)
-        history = []
-        for bin_idx in range(start_bin, current_bin + 1):
-            date_str = (base_dt + timedelta(seconds=bin_idx * interval)).strftime("%Y-%m-%d %H:%M:%S")
-            movement_counts = {key: 0 for key in output_keys}
-            if counts is not None and counts.size > 0 and inter_idx is not None and bin_idx >= 0:
-                if bin_idx < counts.shape[0]:
-                    offset = inter_idx * num_series_keys
-                    row = counts[bin_idx, offset : offset + num_series_keys]
-                    for mv_i, key in enumerate(series_keys):
-                        if mv_i < len(row):
-                            movement_counts[key] = int(row[mv_i])
-            history.append({"date": date_str, "movement_counts": movement_counts})
-        return history
-
-    def _record_traffic_prompt_series(self, current_time_s, prompts):
-        if not prompts:
-            return
-        self._load_traffic_series()
-        if not self._traffic_series_output_path:
-            return
-        interval = int(self.traffic_series_interval_s or 2)
-        if interval <= 0:
-            interval = 2
-        current_bin = int(current_time_s) // interval
-        if current_bin <= self._traffic_series_last_written_bin:
-            return
-        self._traffic_series_last_written_bin = current_bin
-
-        with open(self._traffic_series_output_path, "a", encoding="utf-8") as handle:
-            for idx, prompt in enumerate(prompts):
-                intersection_id = self.env.list_intersection[idx].inter_name
-                history = self._build_traffic_series_history(intersection_id, current_time_s)
-                for hist_idx, entry in enumerate(history):
-                    record = {
-                        "date": entry.get("date"),
-                        "interval_s": int(interval),
-                        "intersection_id": intersection_id,
-                        "movement_counts": entry.get("movement_counts", {}),
-                        "prompt": prompt if hist_idx == len(history) - 1 else "",
-                    }
-                    handle.write(json.dumps(record, ensure_ascii=False) + "\n")
-
-    def _state_to_features(self, state):
-        mode = self.ts_feature_mode
-        if mode not in ("movement_total", "movement_queue_cells", "movement_full"):
-            mode = "movement_total"
-        features = []
-        for key in location_direction_dict:
-            entry = state.get(key, {})
-            queue_len = float(entry.get("queue_len", 0.0))
-            cells = list(entry.get("cells", []) or [])
-            avg_wait = float(entry.get("avg_wait_time", 0.0))
-            if self.ts_cells_len is None:
-                self.ts_cells_len = len(cells)
-            if self.ts_cells_len:
-                if len(cells) < self.ts_cells_len:
-                    cells = cells + [0.0] * (self.ts_cells_len - len(cells))
-                else:
-                    cells = cells[:self.ts_cells_len]
-            if mode == "movement_total":
-                features.append(queue_len + sum(cells))
-            elif mode == "movement_queue_cells":
-                features.append(queue_len)
-                features.extend(cells)
-            else:
-                features.append(queue_len)
-                features.append(avg_wait)
-                features.extend(cells)
-        return features
-
-    def _update_ts_history(self, current_states):
-        self._ensure_ts_history(len(current_states))
-        for i, state in enumerate(current_states):
-            features = self._state_to_features(state)
-            if self.ts_feature_dim is None:
-                self.ts_feature_dim = len(features)
-            self.ts_history[i].append(features)
-
-    def _build_ts_batch(self):
-        batch = []
-        for history in self.ts_history:
-            history_list = list(history)
-            if not history_list:
-                if self.ts_feature_dim is None:
-                    return []
-                pad = [0.0] * self.ts_feature_dim
-                seq = [pad] * self.ts_image_seq_len
-            elif len(history_list) < self.ts_image_seq_len:
-                pad = history_list[0]
-                seq = [pad] * (self.ts_image_seq_len - len(history_list)) + history_list
-            else:
-                seq = history_list
-            batch.append(seq)
-        return batch
-
-    def _traffic_count_suffix(self, interval_seconds):
-        if interval_seconds == 60:
-            return "minute"
-        if interval_seconds == 3600:
-            return "hour"
-        return f"{interval_seconds}s"
-
-    def _resolve_traffic_history_output_path(self, interval_seconds):
-        path = str(self.dic_traffic_env_conf.get("TRAFFIC_COUNT_HISTORY_PATH", "")).strip()
-        if path:
-            return path
-        output_dir = self.dic_traffic_env_conf.get(
-            "TRAFFIC_COUNT_OUTPUT_DIR", self.dic_path["PATH_TO_WORK_DIRECTORY"]
-        )
-        base_name = self.dic_traffic_env_conf.get("TRAFFIC_COUNT_BASENAME", "traffic_counts")
-        suffix = self._traffic_count_suffix(interval_seconds)
-        return os.path.join(output_dir, f"{base_name}_{suffix}.jsonl")
-
-    def _load_traffic_history(self):
-        if self._traffic_history_interval is not None:
-            return
-        if self.env is None:
-            return
-        interval = int(self.dic_traffic_env_conf.get("MIN_ACTION_TIME", 1) or 1)
-        current_time = self.env.get_current_time()
-        needs_reinit = (
-            not getattr(self.env, "traffic_count_enabled", False)
-            or getattr(self.env, "traffic_count_mode", "") != "intersection_movement"
-            or interval not in getattr(self.env, "traffic_count_intervals", [])
-        )
-        if needs_reinit and current_time in (None, 0, 0.0):
-            self.dic_traffic_env_conf["ENABLE_TRAFFIC_COUNT"] = True
-            self.dic_traffic_env_conf["TRAFFIC_COUNT_MODE"] = "intersection_movement"
-            self.dic_traffic_env_conf["TRAFFIC_COUNT_OUTPUT_FORMAT"] = "jsonl"
-            intervals = self.dic_traffic_env_conf.get("TRAFFIC_COUNT_INTERVALS", None)
-            if intervals is None:
-                intervals = [interval]
-            elif isinstance(intervals, int):
-                intervals = [intervals]
-            intervals = [int(x) for x in intervals if int(x) > 0]
-            if interval not in intervals:
-                intervals.append(interval)
-            self.dic_traffic_env_conf["TRAFFIC_COUNT_INTERVALS"] = sorted(set(intervals))
-            try:
-                self.env._init_traffic_counter()
-            except Exception as exc:
-                print(f"Traffic counter init failed: {exc}")
-        elif needs_reinit:
-            print("Traffic counter not configured for MIN_ACTION_TIME; history may be empty.")
-
-        if not getattr(self.env, "traffic_count_enabled", False):
-            return
-        if getattr(self.env, "traffic_count_mode", "") != "intersection_movement":
-            return
-
-        intervals = getattr(self.env, "traffic_count_intervals", [])
-        if interval in intervals:
-            self._traffic_history_interval = interval
-        elif intervals:
-            self._traffic_history_interval = min(intervals)
-            print(
-                f"Using traffic interval {self._traffic_history_interval} "
-                f"(MIN_ACTION_TIME={interval} not available)."
-            )
-        else:
-            self._traffic_history_interval = interval
-
-        self._traffic_history_intersection_ids = list(getattr(self.env, "traffic_intersection_ids", []) or [])
-        self._traffic_history_intersection_index = {
-            inter_id: idx for idx, inter_id in enumerate(self._traffic_history_intersection_ids)
-        }
-        self._traffic_history_movement_keys = list(
-            getattr(self.env, "traffic_movement_keys", []) or ["NT", "NL", "ST", "SL", "ET", "EL", "WT", "WL"]
-        )
-        self._traffic_history_last_written_bin = -1
-        self._traffic_history_base_dt = getattr(self.env, "traffic_base_dt", None) or datetime(1970, 1, 1)
-        output_path = self._resolve_traffic_history_output_path(self._traffic_history_interval)
-        self._traffic_history_output_path = output_path
-        if output_path:
-            output_dir = os.path.dirname(output_path)
-            if output_dir:
-                os.makedirs(output_dir, exist_ok=True)
-            with open(output_path, "w", encoding="utf-8"):
-                pass
-
-    def _get_traffic_history_until(self, intersection_id, current_time_s):
-        self._load_traffic_history()
-        interval = self._traffic_history_interval
-        if interval is None:
-            return []
-        counts = self.env.traffic_counts_by_interval.get(interval)
-        if counts is None or counts.size == 0:
-            return []
-        inter_idx = self._traffic_history_intersection_index.get(intersection_id)
-        if inter_idx is None:
-            return []
-        num_mv = len(self._traffic_history_movement_keys)
-        current_bin = int(current_time_s) // interval
-        if current_bin < 0:
-            return []
-        if current_bin >= counts.shape[0]:
-            current_bin = counts.shape[0] - 1
-        offset = inter_idx * num_mv
-        slice_rows = counts[: current_bin + 1, offset : offset + num_mv]
-        history = []
-        for row in slice_rows:
-            movement_counts = {
-                key: int(row[idx]) for idx, key in enumerate(self._traffic_history_movement_keys)
-            }
-            history.append(movement_counts)
-        return history
-
-    def _append_traffic_history_jsonl(self, current_time_s):
-        self._load_traffic_history()
-        interval = self._traffic_history_interval
-        if interval is None or not self._traffic_history_output_path:
-            return
-        counts = self.env.traffic_counts_by_interval.get(interval)
-        if counts is None or counts.size == 0:
-            return
-        current_bin = int(current_time_s) // interval
-        if current_bin < 0:
-            return
-        if current_bin >= counts.shape[0]:
-            current_bin = counts.shape[0] - 1
-        if current_bin <= self._traffic_history_last_written_bin:
-            return
-        base_dt = self._traffic_history_base_dt or datetime(1970, 1, 1)
-        num_mv = len(self._traffic_history_movement_keys)
-        with open(self._traffic_history_output_path, "a", encoding="utf-8") as handle:
-            for bin_idx in range(self._traffic_history_last_written_bin + 1, current_bin + 1):
-                date_str = (base_dt + timedelta(seconds=bin_idx * interval)).strftime("%Y-%m-%d %H:%M:%S")
-                row = counts[bin_idx, :]
-                for inter_idx, inter_id in enumerate(self._traffic_history_intersection_ids or []):
-                    offset = inter_idx * num_mv
-                    movement_counts = {
-                        key: int(row[offset + mv_i]) for mv_i, key in enumerate(self._traffic_history_movement_keys)
-                    }
-                    record = {
-                        "date": date_str,
-                        "interval_s": int(interval),
-                        "intersection_id": inter_id,
-                        "movement_counts": movement_counts,
-                    }
-                    handle.write(json.dumps(record, ensure_ascii=False) + "\n")
-        self._traffic_history_last_written_bin = current_bin
-
-    def _inject_image_token(self, prompt_text):
-        prefix = self.ts_image_prompt_prefix or ""
-        token = self.ts_image_token or ""
-        if not token and not prefix:
-            return prompt_text
-        return f"{prefix}{token}\n{prompt_text}"
-
-    def _tensor_images_to_pil(self, images):
-        if not torch.is_tensor(images):
-            return None
-        images = images.detach().cpu()
-        if images.ndim != 4:
-            return None
-        pil_images = []
-        for img in images:
-            if img.shape[0] == 1:
-                array = img.squeeze(0).numpy().astype(np.uint8)
-                mode = "L"
-            else:
-                array = img.permute(1, 2, 0).numpy().astype(np.uint8)
-                mode = "RGB"
-            pil_images.append(Image.fromarray(array, mode=mode))
-        return pil_images
-
-    def _generate_ts_images_local(self, ts_batch):
-        if self.ts_image_adapter is None:
-            return None
-        try:
-            images = self.ts_image_adapter.generate(ts_batch)
-        except Exception as exc:
-            print(f"TS image adapter error: {exc}")
-            return None
-        return self._tensor_images_to_pil(images)
-
-    def test(self, logger, test_round):
-        print("================ Start Test ================")
-        total_run_cnt = self.dic_traffic_env_conf["RUN_COUNTS"]
-
-        # initialize output streams
-        done = False
-        state = self.env.reset()
-        total_reward = 0.0
-        queue_length_episode = []
-        waiting_time_episode = []
-
-        print("end reset")
-        current_time = self.env.get_current_time()  # in seconds
-        start_time = time.time()
-
-        state_action_log = [[] for _ in range(len(state))]
-        self._load_traffic_history()
-
-        # self.llm_model.eval()
-        for step_num in tqdm(range(int(total_run_cnt / self.dic_traffic_env_conf["MIN_ACTION_TIME"]))):
-            if done or current_time >= total_run_cnt:
-                break
-
-            action_list = []
-            current_states = []
-
-            for i in range(len(state)):
-                # log statistic state
-                intersection = self.env.intersection_dict[self.env.list_intersection[i].inter_name]
-                roads = deepcopy(intersection["roads"])
-                statistic_state, statistic_state_incoming, mean_speed = get_state_detail(roads, self.env)
-
-                state_action_log[i].append(
-                    {
-                        "state": statistic_state,
-                        "state_incoming": statistic_state_incoming,
-                        "approaching_speed": mean_speed,
-                    }
-                )
-                current_states.append(statistic_state)
-
-            prompts = []
-            ts_images = []
-
-            self._append_traffic_history_jsonl(current_time)
-
-            movement_keys = self._traffic_history_movement_keys or ["NT", "NL", "ST", "SL", "ET", "EL", "WT", "WL"]
-            # ts_adapter = self.ts_image_adapter
-            # if ts_adapter is None:
-            #     raise RuntimeError(
-            #         "ts_image_adapter is not initialized; create it in run_open_LLM.py and pass it to LLM_Inference."
-            #     )
-
-            inferred_dim = None
-            for idx, s in enumerate(current_states):
-                state_action_log[idx].append({"state": s})
-                intersection_id = self.env.list_intersection[idx].inter_name
-                traffic_history = self._get_traffic_history_until(intersection_id, current_time)
-
-                if not traffic_history:
-                    raise ValueError(f"No traffic history for intersection {intersection_id} at t={current_time}.")
-
-                ts_seq = [[float(step.get(key, 0.0)) for key in movement_keys] for step in traffic_history]
-
-                try:
-                    current_dim = len(ts_seq[0])
-                except (TypeError, IndexError):
-                    current_dim = self.ts_feature_dim or 3
-
-                if inferred_dim is None:
-                    inferred_dim = current_dim
-                    if self.ts_feature_dim is None:
-                        self.ts_feature_dim = inferred_dim
-
-                    if getattr(ts_adapter, "learnable_image", False):
-                        adapter_dim = getattr(ts_adapter, "input_dim", None)
-                        if adapter_dim is not None and adapter_dim != inferred_dim:
-                            raise ValueError(
-                                "TS image adapter input_dim mismatch; reinitialize in main with input_dim="
-                                f"{inferred_dim}."
-                            )
-
-                elif current_dim != inferred_dim:
-                    raise ValueError(
-                        f"Traffic history feature dim mismatch for {intersection_id}: "
-                        f"expected {inferred_dim}, got {current_dim}."
-                    )
-
-                ts_images_local = ts_adapter.generate_images(ts_seq)
-                if not ts_images_local:
-                    raise RuntimeError(f"TS image adapter returned no images for intersection {intersection_id}.")
-
-                ts_image = ts_images_local[0]
-                ts_images.append(ts_image)
-
-                prompt = getPrompt(state2text(s))
-                prompt = prompt[0]["content"] + "\n\n### Instruction:\n" + prompt[1]["content"] + "\n\n### Response:\n"
-
-                prompts.append(prompt)
-
-            self._record_traffic_prompt_series(current_time, prompts)
-
-            if hasattr(self, "qwen") and self.qwen is not None and self.qwen is True:
-                inputs_text = [
-                    self.tokenizer.apply_chat_template(
-                        [{"role": "user", "content": f"<start_of_image> {p}"}],  # 这里 content 直接用字符串 p
-                        tokenize=False,
-                        add_generation_prompt=True,
-                    )
-                    for p in prompts
-                ]
-
-            else:
-                inputs_text = [
-                    self.tokenizer.apply_chat_template(
-                        [{"role": "user", "content": f"<start_of_image> {p}"}],  # 这里 content 直接用字符串 p
-                        tokenize=False,
-                        add_generation_prompt=True,
-                    )
-                    for p in prompts
-                ]
-            
-
-            images_batched = [[img] for img in ts_images]
-
-            inputs = self.processor(text=inputs_text, images=images_batched, padding=True, return_tensors="pt")
-
-            responses = []
-            previous_flag = 0
-            for i in range(len(current_states)):
-                if (i + 1) % 16 == 0 or i + 1 >= len(current_states):
-                    current_inputs = {k: v[previous_flag : i + 1] for k, v in inputs.items()}
-                    
-                    response_ids = self.llm_model.generate(**current_inputs, **self.test_generation_kwargs)
-                    cur_response = self.tokenizer.batch_decode(response_ids, skip_special_tokens=True)
-
-                    responses += cur_response
-                    previous_flag = i + 1
-
-            fail_num = 0
-            vehicle_nums = self.get_vehicle_num(current_states)
-            critic_actions = []
-
-            for i, res in enumerate(responses):
-                res = res[len(prompts[i]) :]
-                signal_answer_pattern = r"<signal>(.*?)</signal>"
-                signals = re.findall(signal_answer_pattern, res)
-                signal_text = signals[-1] if len(signals) > 0 else "ETWT"
-
-                action_list.append(action2code(signal_text) if signal_text in four_phase_list else 0)
-
-                if len(signals) == 0 or signal_text not in four_phase_list:
-                    signal_text = "ETWT"
-                    if vehicle_nums[i] != 0:
-                        self.fail_logs.append({"state": current_states[i], "response": res})
-                        dump_json(self.fail_logs, self.fail_log_file)
-                        fail_num += 1
-
-                state_action_log[i][-1]["response"] = res
-                state_action_log[i][-1]["action"] = eight_phase_list[action_list[i]]
-
-            next_state, _, done, _ = self.env.step(action_list)
-            rewards = self.get_norm_reward(next_state)  # my reward
-
-            current_time = self.env.get_current_time()  # in seconds
-            state = next_state
-
-            # calculate logger results
-            total_reward += sum(rewards)
-
-            queue_length_inter = []
-            for inter in self.env.list_intersection:
-                queue_length_inter.append(sum(inter.dic_feature["lane_num_waiting_vehicle_in"]))
-            queue_length_episode.append(sum(queue_length_inter))
-
-            print("Fail Num:", fail_num, "Queuing Vehicles:", sum(queue_length_episode))
-
-            # waiting time
-            waiting_times = []
-            for veh in self.env.waiting_vehicle_list:
-                waiting_times.append(self.env.waiting_vehicle_list[veh]["time"])
-            waiting_time_episode.append(np.mean(waiting_times) if len(waiting_times) > 0 else 0.0)
-
-            # wandb logger
-            vehicle_travel_times = {}
-            for inter in self.env.list_intersection:
-                arrive_left_times = inter.dic_vehicle_arrive_leave_time
-                for veh in arrive_left_times:
-                    if "shadow" in veh:
-                        continue
-
-                    enter_time = arrive_left_times[veh]["enter_time"]
-                    leave_time = arrive_left_times[veh]["leave_time"]
-
-                    if not np.isnan(enter_time):
-                        leave_time = (
-                            leave_time
-                            if not np.isnan(leave_time)
-                            else self.dic_traffic_env_conf["RUN_COUNTS"]
-                        )
-                        if veh not in vehicle_travel_times:
-                            vehicle_travel_times[veh] = [leave_time - enter_time]
-                        else:
-                            vehicle_travel_times[veh].append(leave_time - enter_time)
-
-            total_travel_time = np.mean([sum(vehicle_travel_times[veh]) for veh in vehicle_travel_times])
-
-            results = {
-                "test_reward_over": total_reward,
-                "test_avg_queue_len_over": np.mean(queue_length_episode) if len(queue_length_episode) > 0 else 0,
-                "test_queuing_vehicle_num_over": np.sum(queue_length_episode) if len(queue_length_episode) > 0 else 0,
-                "test_avg_waiting_time_over": np.mean(waiting_time_episode) if len(queue_length_episode) > 0 else 0,
-                "test_avg_travel_time_over": total_travel_time,
-            }
-            logger.log(results)
-            print("Test Round:", test_round, results)
-
-        f_state_action = os.path.join(self.dic_path["PATH_TO_WORK_DIRECTORY"], "state_action.json")
-        dump_json(state_action_log, f_state_action)
-
-        print("Testing time: ", time.time() - start_time)
-        self.env.batch_log_2()
-        return results
-
-
-    def train_test(self):
-        all_config = merge(merge(self.dic_agent_conf, self.dic_path), self.dic_traffic_env_conf)
-        logger = wandb.init(
-            project=self.dic_traffic_env_conf['PROJECT_NAME'],
-            group=f"{self.dic_traffic_env_conf['MODEL_NAME']}-{self.roadnet}-{self.trafficflow}-{len(self.dic_traffic_env_conf['PHASE'])}_Phases",
-            name=f"{self.dic_traffic_env_conf['TRAFFIC_FILE'].replace('.json', '')}",
-            config=all_config,
-        )
-
-        self.test(logger, 0)
-        wandb.finish()
-
-    '''
-    ======================= Class Utils =======================
-    '''
-    def get_vehicle_num(self, states):
-        veh_nums = []
-
-        for i in range(len(states)):
-            vehicle_num = 0
-
-            for lane in states[i]:
-                vehicle_num += states[i][lane]['queue_len']
-                for cell in range(len(states[i][lane]['cells'])):
-                    vehicle_num += states[i][lane]['cells'][cell]
-
-            veh_nums.append(vehicle_num)
-
-        return veh_nums
-
-    def get_norm_reward(self, state):
-        rewards = []
-
-        for i in range(len(state)):
-            vehicle_num = 0
-            queue_length = 0
-
-            intersection = self.env.intersection_dict[self.env.list_intersection[i].inter_name]
-            roads = deepcopy(intersection["roads"])
-            statistic_state, _, _ = get_state_detail(roads, self.env)
-            for lane in statistic_state:
-                queue_length += statistic_state[lane]['queue_len']
-
-                vehicle_num += statistic_state[lane]['queue_len']
-                for cell in range(len(statistic_state[lane]['cells'])):
-                    vehicle_num += statistic_state[lane]['cells'][cell]
-
-            reward = -(queue_length / vehicle_num) if vehicle_num > 0.0 else -0.0
-            rewards.append(reward)
-
-        return rewards
-
-
-class LLM_Inference_VLLM:
-    def __init__(self, dic_agent_conf, dic_traffic_env_conf, dic_path, roadnet, trafficflow, ts_image_adapter=None):
-        self.dic_agent_conf = dic_agent_conf
-        self.dic_traffic_env_conf = dic_traffic_env_conf
-        self.dic_path = dic_path
-        self.agents = []
-        self.env = None
-        self.roadnet = roadnet
-        self.trafficflow = trafficflow
-        self.models = []
-        self.generation_kwargs = {}
-        self.epoch_num = 0
-        self.tokenizer = None
-        self.llm_model = None
-        self.llm_ref_model = None
-        self.dic_critic_agent_conf = None
-        self.training_args = None
-        self.trainer_built = False
-        self.trainer = None
-        self.device = None
-        self.ts_image_client = None
-        self.ts_image_adapter = ts_image_adapter
-        self.ts_history = None
-        self.ts_feature_dim = None
-        self.ts_cells_len = None
-  
-        try:
-            self.ts_image_seq_len = int(self.dic_agent_conf.get("TS_IMAGE_SEQ_LEN", 0) or 0)
-        except (TypeError, ValueError):
-            self.ts_image_seq_len = 0
-        if self.ts_image_adapter is not None and self.ts_image_seq_len <= 0:
-            adapter_seq_len = getattr(self.ts_image_adapter, "seq_len", None)
-            if adapter_seq_len is not None:
-                self.ts_image_seq_len = int(adapter_seq_len)
-        self.ts_image_token = str(self.dic_agent_conf.get("TS_IMAGE_TOKEN", "<image>"))
-        self.ts_image_prompt_prefix = str(self.dic_agent_conf.get("TS_IMAGE_PROMPT_PREFIX", ""))
-        self.ts_feature_mode = str(self.dic_agent_conf.get("TS_FEATURE_MODE", "movement_total")).strip().lower()
-        try:
-            self.ts_image_timeout = float(self.dic_agent_conf.get("TS_IMAGE_TIMEOUT", 5.0))
-        except (TypeError, ValueError):
-            self.ts_image_timeout = 5.0
-        try:
-            self.ts_image_size = int(self.dic_agent_conf.get("TS_IMAGE_SIZE", 56) or 56)
-        except (TypeError, ValueError):
-            self.ts_image_size = 56
-        try:
-            self.ts_image_periodicity = int(self.dic_agent_conf.get("TS_IMAGE_PERIODICITY", 24) or 24)
-        except (TypeError, ValueError):
-            self.ts_image_periodicity = 24
-        self.ts_image_norm_const = float(self.dic_agent_conf.get("TS_IMAGE_NORM_CONST", 0.4) or 0.4)
-
-        self.ts_image_norm_const = 0.4
-        self.ts_image_learnable = _str2bool(self.dic_agent_conf.get("TS_IMAGE_LEARNABLE", False))
-        self.ts_image_three_channel = _str2bool(self.dic_agent_conf.get("TS_IMAGE_THREE_CHANNEL", True))
-        self._resolved_image_token = None
-
-        self._traffic_history_interval = None
-        self._traffic_history_intersection_ids = None
-        self._traffic_history_intersection_index = None
-        self._traffic_history_movement_keys = None
-        self._traffic_history_output_path = None
-        self._traffic_history_last_written_bin = -1
-        self._traffic_history_base_dt = None
-
-        try:
-            self.traffic_series_interval_s = int(self.dic_agent_conf.get("TRAFFIC_SERIES_INTERVAL", 2) or 2)
-        except (TypeError, ValueError):
-            self.traffic_series_interval_s = 2
-        try:
-            self.traffic_series_window_s = int(self.dic_agent_conf.get("TRAFFIC_SERIES_WINDOW", 30) or 30)
-        except (TypeError, ValueError):
-            self.traffic_series_window_s = 30
-        self.traffic_series_output_dir = str(
-            self.dic_agent_conf.get("TRAFFIC_SERIES_OUTPUT_DIR", "")
-        ).strip()
-        if not self.traffic_series_output_dir:
-            self.traffic_series_output_dir = os.path.join("data", "recorded")
-        self.traffic_series_basename = str(
-            self.dic_agent_conf.get("TRAFFIC_SERIES_BASENAME", "traffic_prompt_series")
-        ).strip() or "traffic_prompt_series"
-        self._traffic_series_output_path = None
-        self._traffic_series_initialized = False
-        self._traffic_series_intersection_index = None
-        self._traffic_series_movement_keys = None
-        self._traffic_series_last_written_bin = -1
-        self._traffic_series_base_dt = None
- 
-        if not os.path.exists("./fails"):
-            os.mkdir("./fails")
-        self.fail_log_file = f"./fails/{self.dic_agent_conf['LLM_MODEL']}-{self.dic_traffic_env_conf['TRAFFIC_FILE']}-{self.dic_traffic_env_conf['ROADNET_FILE']}.json"
-        self.fail_logs = []
-        
-        if self.ts_image_adapter is None:
-            self._init_ts_image_adapter()
-        self._ensure_traffic_series_config()
-        self.initialize()
-
-    def _infer_tensor_parallel_size(self):
-        visible = os.environ.get("CUDA_VISIBLE_DEVICES")
-        if visible:
-            ids = [x.strip() for x in visible.split(",") if x.strip() != ""]
-            if len(ids) == 1 and "-" in ids[0]:
-                parts = ids[0].split("-")
-                if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit():
-                    start = int(parts[0])
-                    end = int(parts[1])
-                    if end >= start:
-                        return end - start + 1
-            if ids:
-                return len(ids)
-
-        count = torch.cuda.device_count()
-        return count if count > 0 else 1
-
-
-
-    def _init_ts_image_adapter(self):
-        if self.ts_image_seq_len <= 0:
-            return
-        try:
-            input_dim = self.ts_feature_dim or len(location_direction_dict)
-            self.ts_image_adapter = TimeSeriesImageAdapter(
-                image_size=self.ts_image_size,
-                seq_len=self.ts_image_seq_len,
-                periodicity=self.ts_image_periodicity,
-                norm_const=self.ts_image_norm_const,
-                learnable_image=self.ts_image_learnable,
-                three_channel_image=self.ts_image_three_channel,
-                input_dim=input_dim,
-            )
-        except Exception as exc:
-            print(f"TS image adapter init error: {exc}")
-            self.ts_image_adapter = None
-    def initialize_llm(self):
-        device_map = "auto"
-
-        # init LLM
-        llm_path = self.dic_agent_conf["LLM_PATH"]
-        llm_path_lower = llm_path.lower()
-        if "qwen" in llm_path_lower and "vl" in llm_path_lower:
-            # vllm may not support Qwen-VL; fallback to transformers loader
-            
-            self.qwen=True
-            print("Warning: detected Qwen-VL model in LLM_Inference_VLLM.initialize_llm — falling back to transformers loader")
-            self.llm_model = Qwen3VLForConditionalGeneration.from_pretrained(
-                llm_path,
-                dtype="auto",
-                device_map=device_map,
-            )
-            self.processor = AutoProcessor.from_pretrained(llm_path, padding_side="left")
-            # processor as tokenizer for text-only usage
-            self.tokenizer = AutoProcessor.from_pretrained(llm_path)
-            try:
-                self.tokenizer.pad_token_id = 0
-            except Exception:
-                pass
-
-            # set generation kwargs for transformer usage (note: calling code expects vllm usage)
-            self.generation_kwargs = {
-                "top_k": 50,
-                "top_p": 1.0,
-                "temperature": 0.1,
-                "max_new_tokens": self.dic_agent_conf["NEW_MAX_TOKENS"]
-            }
-            self.test_generation_kwargs = {
-                "min_length": -1,
-                "top_k": 50,
-                "top_p": 1.0,
-                "temperature": 0.1,
-                "do_sample": True,
-                "max_new_tokens": self.dic_agent_conf["NEW_MAX_TOKENS"],
-                "pad_token_id": getattr(self.tokenizer, "pad_token_id", None),
-                "eos_token_id": getattr(self.tokenizer, "eos_token_id", None),
-            }
-        else:
-            tensor_parallel_size = self.dic_agent_conf.get("TENSOR_PARALLEL_SIZE", 0)
-            try:
-                tensor_parallel_size = int(tensor_parallel_size)
-            except (TypeError, ValueError):
-                tensor_parallel_size = 0
-            if tensor_parallel_size < 1:
-                tensor_parallel_size = self._infer_tensor_parallel_size()
-
-            available_gpus = torch.cuda.device_count()
-            if available_gpus > 0 and tensor_parallel_size > available_gpus:
-                print(f"Warning: TENSOR_PARALLEL_SIZE={tensor_parallel_size} > visible GPUs={available_gpus}; "
-                      f"clamping to {available_gpus}.")
-                tensor_parallel_size = available_gpus
-            self.llm_model = vllm.LLM(
-                model=llm_path,
-                tokenizer=llm_path,
-                dtype=torch.bfloat16,            # 先排除 bf16 兼容性
-                tensor_parallel_size=4,         # 先排除 TP/NCCL
-                max_model_len=2048,             # 先降低上下文
-                max_num_seqs=4,                 # 先降低并发
-                max_num_batched_tokens=2048,
-                gpu_memory_utilization=0.9,    # 给 KV cache 足够空间
-                swap_space=16,                   # 先排除 CPU offload 相关变量
-            )
-
-
-
-
-            self.processor = AutoProcessor.from_pretrained(llm_path, padding_side="left")
-
-            # init tokenizer
-            self.tokenizer = AutoTokenizer.from_pretrained(
-                llm_path,
-                padding_side="left",
-                padding=True
-            )
-            self.tokenizer.pad_token_id = 0
-
-            test_generation_kwargs = {
-                "top_k": 50,
-                "top_p": 1.0,
-                "temperature": 0.1,
-                "max_tokens": 2048 + self.dic_agent_conf["NEW_MAX_TOKENS"]
-            }
-            self.generation_kwargs = vllm.SamplingParams(**test_generation_kwargs)
-            self.test_generation_kwargs = {}
-            # Align image placeholder token with the loaded model, if possible.
-            self._resolve_image_token()
-
-    def initialize(self):
-        path_check(self.dic_path)
-        copy_conf_file(self.dic_path, self.dic_agent_conf, self.dic_traffic_env_conf)
-        copy_cityflow_file(self.dic_path, self.dic_traffic_env_conf)
-
-        self.env = CityFlowEnv(
-            path_to_log=self.dic_path["PATH_TO_WORK_DIRECTORY"],
-            path_to_work_directory=self.dic_path["PATH_TO_WORK_DIRECTORY"],
-            dic_traffic_env_conf=self.dic_traffic_env_conf,
-            dic_path=self.dic_path
-        )
-        self.env.reset()
-        self.initialize_llm()
-
-    def _traffic_count_suffix(self, interval_seconds):
-        if interval_seconds == 60:
-            return "minute"
-        if interval_seconds == 3600:
-            return "hour"
-        return f"{interval_seconds}s"
-
-    def _resolve_traffic_history_output_path(self, interval_seconds):
-        path = str(self.dic_traffic_env_conf.get("TRAFFIC_COUNT_HISTORY_PATH", "")).strip()
-        if path:
-            return path
-        output_dir = self.dic_traffic_env_conf.get(
-            "TRAFFIC_COUNT_OUTPUT_DIR", self.dic_path["PATH_TO_WORK_DIRECTORY"]
-        )
-        base_name = self.dic_traffic_env_conf.get("TRAFFIC_COUNT_BASENAME", "traffic_counts")
-        suffix = self._traffic_count_suffix(interval_seconds)
-        return os.path.join(output_dir, f"{base_name}_{suffix}.jsonl")
-
-    def _load_traffic_history(self):
-        if self._traffic_history_interval is not None:
-            return
-        if self.env is None:
-            return
-        interval = int(self.dic_traffic_env_conf.get("MIN_ACTION_TIME", 1) or 1)
-        current_time = self.env.get_current_time()
-        needs_reinit = (
-            not getattr(self.env, "traffic_count_enabled", False)
-            or getattr(self.env, "traffic_count_mode", "") != "intersection_movement"
-            or interval not in getattr(self.env, "traffic_count_intervals", [])
-        )
-        if needs_reinit and current_time in (None, 0, 0.0):
-            self.dic_traffic_env_conf["ENABLE_TRAFFIC_COUNT"] = True
-            self.dic_traffic_env_conf["TRAFFIC_COUNT_MODE"] = "intersection_movement"
-            self.dic_traffic_env_conf["TRAFFIC_COUNT_OUTPUT_FORMAT"] = "jsonl"
-            intervals = self.dic_traffic_env_conf.get("TRAFFIC_COUNT_INTERVALS", None)
-            if intervals is None:
-                intervals = [interval]
-            elif isinstance(intervals, int):
-                intervals = [intervals]
-            intervals = [int(x) for x in intervals if int(x) > 0]
-            if interval not in intervals:
-                intervals.append(interval)
-            self.dic_traffic_env_conf["TRAFFIC_COUNT_INTERVALS"] = sorted(set(intervals))
-            try:
-                self.env._init_traffic_counter()
-            except Exception as exc:
-                print(f"Traffic counter init failed: {exc}")
-        elif needs_reinit:
-            print("Traffic counter not configured for MIN_ACTION_TIME; history may be empty.")
-
-        if not getattr(self.env, "traffic_count_enabled", False):
-            return
-        if getattr(self.env, "traffic_count_mode", "") != "intersection_movement":
-            return
-
-        intervals = getattr(self.env, "traffic_count_intervals", [])
-        if interval in intervals:
-            self._traffic_history_interval = interval
-        elif intervals:
-            self._traffic_history_interval = min(intervals)
-            print(
-                f"Using traffic interval {self._traffic_history_interval} "
-                f"(MIN_ACTION_TIME={interval} not available)."
-            )
-        else:
-            self._traffic_history_interval = interval
-
-        self._traffic_history_intersection_ids = list(getattr(self.env, "traffic_intersection_ids", []) or [])
-        self._traffic_history_intersection_index = {
-            inter_id: idx for idx, inter_id in enumerate(self._traffic_history_intersection_ids)
-        }
-        self._traffic_history_movement_keys = list(
-            getattr(self.env, "traffic_movement_keys", []) or ["NT", "NL", "ST", "SL", "ET", "EL", "WT", "WL"]
-        )
-        self._traffic_history_last_written_bin = -1
-        self._traffic_history_base_dt = getattr(self.env, "traffic_base_dt", None) or datetime(1970, 1, 1)
-        output_path = self._resolve_traffic_history_output_path(self._traffic_history_interval)
-        self._traffic_history_output_path = output_path
-        if output_path:
-            output_dir = os.path.dirname(output_path)
-            if output_dir:
-                os.makedirs(output_dir, exist_ok=True)
-            with open(output_path, "w", encoding="utf-8"):
-                pass
-
-    def _get_traffic_history_until(self, intersection_id, current_time_s):
-        self._load_traffic_history()
-        interval = self._traffic_history_interval
-        if interval is None:
-            return []
-        counts = self.env.traffic_counts_by_interval.get(interval)
-        if counts is None or counts.size == 0:
-            return []
-        inter_idx = self._traffic_history_intersection_index.get(intersection_id)
-        if inter_idx is None:
-            return []
-        num_mv = len(self._traffic_history_movement_keys)
-        current_bin = int(current_time_s) // interval
-        if current_bin < 0:
-            return []
-        if current_bin >= counts.shape[0]:
-            current_bin = counts.shape[0] - 1
-        offset = inter_idx * num_mv
-        slice_rows = counts[: current_bin + 1, offset : offset + num_mv]
-        history = []
-        for row in slice_rows:
-            movement_counts = {
-                key: int(row[idx]) for idx, key in enumerate(self._traffic_history_movement_keys)
-            }
-            history.append(movement_counts)
-        return history
-
-    def _append_traffic_history_jsonl(self, current_time_s):
-        self._load_traffic_history()
-        interval = self._traffic_history_interval
-        if interval is None or not self._traffic_history_output_path:
-            return
-        counts = self.env.traffic_counts_by_interval.get(interval)
-        if counts is None or counts.size == 0:
-            return
-        current_bin = int(current_time_s) // interval
-        if current_bin < 0:
-            return
-        if current_bin >= counts.shape[0]:
-            current_bin = counts.shape[0] - 1
-        if current_bin <= self._traffic_history_last_written_bin:
-            return
-        base_dt = self._traffic_history_base_dt or datetime(1970, 1, 1)
-        num_mv = len(self._traffic_history_movement_keys)
-        with open(self._traffic_history_output_path, "a", encoding="utf-8") as handle:
-            for bin_idx in range(self._traffic_history_last_written_bin + 1, current_bin + 1):
-                date_str = (base_dt + timedelta(seconds=bin_idx * interval)).strftime("%Y-%m-%d %H:%M:%S")
-                row = counts[bin_idx, :]
-                for inter_idx, inter_id in enumerate(self._traffic_history_intersection_ids or []):
-                    offset = inter_idx * num_mv
-                    movement_counts = {
-                        key: int(row[offset + mv_i]) for mv_i, key in enumerate(self._traffic_history_movement_keys)
-                    }
-                    record = {
-                        "date": date_str,
-                        "interval_s": int(interval),
-                        "intersection_id": inter_id,
-                        "movement_counts": movement_counts,
-                    }
-                    handle.write(json.dumps(record, ensure_ascii=False) + "\n")
-        self._traffic_history_last_written_bin = current_bin
-
-    def _traffic_series_run_tag(self):
-        run_dir = str(self.dic_path.get("PATH_TO_WORK_DIRECTORY", "")).strip()
-        run_tag = os.path.basename(run_dir) if run_dir else ""
-        if not run_tag:
-            run_tag = time.strftime("%m_%d_%H_%M_%S", time.localtime(time.time()))
-        return run_tag
-
-    def _ensure_traffic_series_config(self):
-        if self._traffic_series_initialized:
-            return
-        base_dir = self.traffic_series_output_dir or os.path.join("data", "recorded")
-        run_tag = self._traffic_series_run_tag()
-        output_dir = os.path.join(base_dir, run_tag)
-        os.makedirs(output_dir, exist_ok=True)
-        suffix = self._traffic_count_suffix(self.traffic_series_interval_s)
-        filename = f"{self.traffic_series_basename}_{suffix}.jsonl"
-        self._traffic_series_output_path = os.path.join(output_dir, filename)
-        with open(self._traffic_series_output_path, "w", encoding="utf-8"):
-            pass
-        self._traffic_series_initialized = True
-
-    def _resolve_series_movement_keys(self):
-        default_keys = ["NT", "NL", "ST", "SL", "ET", "EL", "WT", "WL"]
-        series_keys = list(self._traffic_series_movement_keys or [])
-        if not series_keys:
-            return default_keys, default_keys
-        output_keys = list(series_keys)
-        for key in default_keys:
-            if key not in output_keys:
-                output_keys.append(key)
-        return series_keys, output_keys
-
-    def _load_traffic_series(self):
-        if self._traffic_series_movement_keys is not None:
-            return
-        if self.env is None:
-            return
-        self._ensure_traffic_series_config()
-        interval = int(self.traffic_series_interval_s or 2)
-        if interval <= 0:
-            interval = 2
-
-        if not getattr(self.env, "traffic_count_enabled", False):
-            current_time = self.env.get_current_time()
-            if current_time in (None, 0, 0.0):
-                self.dic_traffic_env_conf["ENABLE_TRAFFIC_COUNT"] = True
-                self.dic_traffic_env_conf["TRAFFIC_COUNT_MODE"] = "intersection_movement"
-                self.dic_traffic_env_conf["TRAFFIC_COUNT_OUTPUT_FORMAT"] = "jsonl"
-
-        intervals = list(getattr(self.env, "traffic_count_intervals", []) or [])
-        if interval not in intervals:
-            intervals.append(interval)
-            self.dic_traffic_env_conf["TRAFFIC_COUNT_INTERVALS"] = sorted(set(intervals))
-            current_time = self.env.get_current_time()
-            if current_time in (None, 0, 0.0):
-                try:
-                    self.env._init_traffic_counter()
-                except Exception as exc:
-                    print(f"Traffic series counter init failed: {exc}")
-
-        self._traffic_series_intersection_index = {
-            inter_id: idx for idx, inter_id in enumerate(getattr(self.env, "traffic_intersection_ids", []) or [])
-        }
-        self._traffic_series_movement_keys = list(
-            getattr(self.env, "traffic_movement_keys", []) or ["NT", "NL", "ST", "SL", "ET", "EL", "WT", "WL"]
-        )
-        self._traffic_series_base_dt = getattr(self.env, "traffic_base_dt", None) or datetime(1970, 1, 1)
-
-    def _build_traffic_series_history(self, intersection_id, current_time_s):
-        self._load_traffic_series()
-        interval = int(self.traffic_series_interval_s or 2)
-        if interval <= 0:
-            interval = 2
-        series_keys, output_keys = self._resolve_series_movement_keys()
-        num_series_keys = len(series_keys)
-        counts = getattr(self.env, "traffic_counts_by_interval", {}).get(interval)
-        inter_idx = (self._traffic_series_intersection_index or {}).get(intersection_id)
-
-        current_bin = int(current_time_s) // interval
-        if counts is not None and counts.size > 0:
-            if current_bin >= counts.shape[0]:
-                current_bin = counts.shape[0] - 1
-        if current_bin < 0:
-            current_bin = 0
-
-        window_bins = int(self.traffic_series_window_s // interval) if interval > 0 else 0
-        start_bin = max(0, current_bin - window_bins)
-        base_dt = self._traffic_series_base_dt or datetime(1970, 1, 1)
-        history = []
-        for bin_idx in range(start_bin, current_bin + 1):
-            date_str = (base_dt + timedelta(seconds=bin_idx * interval)).strftime("%Y-%m-%d %H:%M:%S")
-            movement_counts = {key: 0 for key in output_keys}
-            if counts is not None and counts.size > 0 and inter_idx is not None and bin_idx >= 0:
-                if bin_idx < counts.shape[0]:
-                    offset = inter_idx * num_series_keys
-                    row = counts[bin_idx, offset : offset + num_series_keys]
-                    for mv_i, key in enumerate(series_keys):
-                        if mv_i < len(row):
-                            movement_counts[key] = int(row[mv_i])
-            history.append({"date": date_str, "movement_counts": movement_counts})
-        return history
-
-    def _record_traffic_prompt_series(self, current_time_s, prompts):
-        if not prompts:
-            return
-        self._load_traffic_series()
-        if not self._traffic_series_output_path:
-            return
-        interval = int(self.traffic_series_interval_s or 2)
-        if interval <= 0:
-            interval = 2
-        current_bin = int(current_time_s) // interval
-        if current_bin <= self._traffic_series_last_written_bin:
-            return
-        self._traffic_series_last_written_bin = current_bin
-
-        with open(self._traffic_series_output_path, "a", encoding="utf-8") as handle:
-            for idx, prompt in enumerate(prompts):
-                intersection_id = self.env.list_intersection[idx].inter_name
-                history = self._build_traffic_series_history(intersection_id, current_time_s)
-                for hist_idx, entry in enumerate(history):
-                    record = {
-                        "date": entry.get("date"),
-                        "interval_s": int(interval),
-                        "intersection_id": intersection_id,
-                        "movement_counts": entry.get("movement_counts", {}),
-                        "prompt": prompt if hist_idx == len(history) - 1 else "",
-                    }
-                    handle.write(json.dumps(record, ensure_ascii=False) + "\n")
-
-    def _token_in_vocab(self, token):
-        if not token or self.tokenizer is None:
-            return False
-        convert_fn = getattr(self.tokenizer, "convert_tokens_to_ids", None)
-        if convert_fn is None:
-            return False
-        try:
-            token_id = convert_fn(token)
-        except Exception:
-            return False
-        if token_id is None:
-            return False
-        unk_id = getattr(self.tokenizer, "unk_token_id", None)
-        if unk_id is not None and token_id == unk_id:
-            return False
-        try:
-            vocab = self.tokenizer.get_vocab()
-        except Exception:
-            vocab = None
-        if vocab is not None and token not in vocab:
-            return False
-        return True
-
-    def _extract_image_token_candidates(self, llm_path):
-        candidates = []
-
-        if llm_path:
-            for filename in ("processor_config.json", "preprocessor_config.json", "tokenizer_config.json", "config.json"):
-                path = os.path.join(llm_path, filename)
-                if not os.path.exists(path):
-                    continue
-                try:
-                    with open(path, "r", encoding="utf-8") as handle:
-                        data = json.load(handle)
-                except Exception:
-                    continue
-                if not isinstance(data, dict):
-                    continue
-                for key in (
-                    "image_token",
-                    "image_placeholder",
-                    "image_token_str",
-                    "image_token_string",
-                    "image_special_token",
-                ):
-                    value = data.get(key)
-                    if isinstance(value, str) and value:
-                        candidates.append(value)
-                for nested_key in ("image_processor", "processor", "multimodal_config", "mm_config"):
-                    nested = data.get(nested_key)
-                    if isinstance(nested, dict):
-                        for key in (
-                            "image_token",
-                            "image_placeholder",
-                            "image_token_str",
-                            "image_token_string",
-                            "image_special_token",
-                        ):
-                            value = nested.get(key)
-                            if isinstance(value, str) and value:
-                                candidates.append(value)
-
-        if self.tokenizer is not None:
-            for attr in ("image_token", "image_placeholder", "image_token_str", "image_token_string"):
-                value = getattr(self.tokenizer, attr, None)
-                if isinstance(value, str) and value:
-                    candidates.append(value)
-            extra = getattr(self.tokenizer, "additional_special_tokens", None) or []
-            for token in extra:
-                if isinstance(token, str) and token:
-                    candidates.append(token)
-
-        return candidates
-
-    def _resolve_image_token(self):
-        if self._resolved_image_token:
-            return self._resolved_image_token
-
-        config_token = (self.ts_image_token or "").strip()
-        if config_token and self._token_in_vocab(config_token):
-            self._resolved_image_token = config_token
-            return self._resolved_image_token
-
-        llm_path = str(self.dic_agent_conf.get("LLM_PATH", "")).strip()
-        candidates = []
-        candidates.extend(self._extract_image_token_candidates(llm_path))
-        candidates.extend(
-            [
-                "<start_of_image>",
-                "<image>",
-                "<image_placeholder>",
-                "<image_start>",
-                "<im_start>",
-                "<img>",
-            ]
-        )
-        if config_token:
-            candidates.insert(0, config_token)
-
-        seen = set()
-        for token in candidates:
-            token = token.strip()
-            if not token or token in seen:
-                continue
-            seen.add(token)
-            if self._token_in_vocab(token):
-                self._resolved_image_token = token
-                self.ts_image_token = token
-                return token
-
-        self._resolved_image_token = config_token or (candidates[0] if candidates else "<image>")
-        self.ts_image_token = self._resolved_image_token
-        return self._resolved_image_token
-
-    def _inject_image_token(self, prompt_text):
-        prefix = self.ts_image_prompt_prefix or ""
-        token = self._resolve_image_token() if (self.ts_image_token or self.tokenizer) else (self.ts_image_token or "")
-        if not token and not prefix:
-            return prompt_text
-        if token and token in prompt_text:
-            return prompt_text
-        return f"{prefix}{token}\n{prompt_text}"
-
-    def test(self, logger, test_round):
-        print("================ Start Test ================")
-        total_run_cnt = self.dic_traffic_env_conf["RUN_COUNTS"]
-        # initialize output streams
-        done = False
-        state = self.env.reset()
-        total_reward = 0.0
-        queue_length_episode = []
-        waiting_time_episode = []
-        print("end reset")
-        current_time = self.env.get_current_time()  # in seconds
-
-        start_time = time.time()
-        state_action_log = [[] for _ in range(len(state))]
-        self._load_traffic_history()
-
-        # self.llm_model.eval()
-        for step_num in tqdm(range(int(total_run_cnt / self.dic_traffic_env_conf['MIN_ACTION_TIME']))):
-            if done or current_time >= total_run_cnt:
-                break
-            action_list = []
-            current_states = []
-
-            for i in range(len(state)):
-                # log statistic state
-                intersection = self.env.intersection_dict[self.env.list_intersection[i].inter_name]
-                roads = deepcopy(intersection["roads"])
-                statistic_state, statistic_state_incoming, mean_speed = get_state_detail(roads, self.env)
-
-                state_action_log[i].append(
-                    {
-                        "state": statistic_state,
-                        "state_incoming": statistic_state_incoming,
-                        "approaching_speed": mean_speed,
-                    }
-                )
-                current_states.append(statistic_state)
-
-            prompts = []
-            ts_images = []
-
-            self._append_traffic_history_jsonl(current_time)
-
-            movement_keys = self._traffic_history_movement_keys or ["NT", "NL", "ST", "SL", "ET", "EL", "WT", "WL"]
-            ts_adapter = self.ts_image_adapter
-            if ts_adapter is None:
-                raise RuntimeError(
-                    "ts_image_adapter is not initialized; create it in run_open_LLM_with_vllm.py "
-                    "and pass it to LLM_Inference_VLLM."
-                )
-
-            inferred_dim = None
-            for idx, s in enumerate(current_states):
-                state_action_log[idx].append({"state": s})
-                intersection_id = self.env.list_intersection[idx].inter_name
-                traffic_history = self._get_traffic_history_until(intersection_id, current_time)
-
-                if not traffic_history:
-                    raise ValueError(f"No traffic history for intersection {intersection_id} at t={current_time}.")
-
-                ts_seq = [[float(step.get(key, 0.0)) for key in movement_keys] for step in traffic_history]
-
-                try:
-                    current_dim = len(ts_seq[0])
-                except (TypeError, IndexError):
-                    current_dim = self.ts_feature_dim or 3
-
-                if inferred_dim is None:
-                    inferred_dim = current_dim
-                    if self.ts_feature_dim is None:
-                        self.ts_feature_dim = inferred_dim
-
-                    if getattr(ts_adapter, "learnable_image", False):
-                        adapter_dim = getattr(ts_adapter, "input_dim", None)
-                        if adapter_dim is not None and adapter_dim != inferred_dim:
-                            raise ValueError(
-                                "TS image adapter input_dim mismatch; reinitialize in main with input_dim="
-                                f"{inferred_dim}."
-                            )
-                elif current_dim != inferred_dim:
-                    raise ValueError(
-                        f"Traffic history feature dim mismatch for {intersection_id}: "
-                        f"expected {inferred_dim}, got {current_dim}."
-                    )
-
-                ts_images_local = ts_adapter.generate_images(ts_seq)
-                if not ts_images_local:
-                    raise RuntimeError(f"TS image adapter returned no images for intersection {intersection_id}.")
-
-                ts_image = ts_images_local[0]
-                ts_images.append(ts_image)
-
-                prompt = getPrompt(state2text(s))
-                prompt = prompt[0]['content'] + "\n\n### Instruction:\n" + prompt[1]['content'] + "\n\n### Response:\n"
-                prompts.append(prompt)
-
-            self._record_traffic_prompt_series(current_time, prompts)
-
-            inputs_text = [
-                    self.tokenizer.apply_chat_template(
-                        [{"role": "user", "content": f"<start_of_image> {p}"}],  # 这里 content 直接用字符串 p
-                        tokenize=False,
-                        add_generation_prompt=True,
-                    )
-                    for p in prompts
-                ]
-            
-
-
-
-            # 2) vLLM 多模态输入：每条是一个 dict（prompt + multi_modal_data）
-            #    ts_images: List[PIL.Image.Image]
-            vllm_prompts = [
-                {
-                    "prompt": txt,
-                    "multi_modal_data": {"image": img},  # 单图直接放 PIL.Image
-                }
-                for txt, img in zip(inputs_text, ts_images)
-            ]
-
-            # 3) SamplingParams：vLLM 用这个，不是 HF 的 generate kwargs
-            sampling_params = self.generation_kwargs # 你的 generation_kwargs 需要是 vLLM 支持的字段
-
-            responses = []
-            bs = 16
-            for start in range(0, len(inputs_text), bs):
-                # batch = inputs_text[start:start + bs]
-                batch = vllm_prompts[start:start + bs]
-
-                # vLLM.generate 返回的是 RequestOutput 列表，不是 token ids
-                outputs = self.llm_model.generate(prompts=batch, sampling_params=sampling_params)
-
-                # 取每条的第一条 beam/候选文本
-                for out in outputs:
-                    responses.append(out.outputs[0].text)
-
-                    
-
-            fail_num = 0
-            vehicle_nums = self.get_vehicle_num(current_states)
-            for i, res in enumerate(responses):
-                res = res[len(prompts[i]):]
-                signal_answer_pattern = r'<signal>(.*?)</signal>'
-                signals = re.findall(signal_answer_pattern, res)
-                signal_text = signals[-1] if len(signals) > 0 else "ETWT"
-                action_list.append(action2code(signal_text) if signal_text in four_phase_list else 0)
-                if len(signals) == 0 or signal_text not in four_phase_list:
-                    signal_text = "ETWT"
-                    if vehicle_nums[i] != 0:
-                        self.fail_logs.append({"state": current_states[i], "response": res})
-                        dump_json(self.fail_logs, self.fail_log_file)
-                        fail_num += 1
-
-                state_action_log[i][-1]["response"] = res
-                state_action_log[i][-1]["action"] = eight_phase_list[action_list[i]]
-
-            next_state, _, done, _ = self.env.step(action_list)
-            rewards = self.get_norm_reward(next_state)  # my reward
-
-            current_time = self.env.get_current_time()  # in seconds
-            state = next_state
-
-            # calculate logger results
-            total_reward += sum(rewards)
-            queue_length_inter = []
-            for inter in self.env.list_intersection:
-                queue_length_inter.append(sum(inter.dic_feature['lane_num_waiting_vehicle_in']))
-            queue_length_episode.append(sum(queue_length_inter))
-            print("Fail Num:", fail_num, "Queuing Vehicles:", sum(queue_length_episode))
-
-            # waiting time
-            waiting_times = []
-            for veh in self.env.waiting_vehicle_list:
-                waiting_times.append(self.env.waiting_vehicle_list[veh]['time'])
-            waiting_time_episode.append(np.mean(waiting_times) if len(waiting_times) > 0 else 0.0)
-
-        # wandb logger
-        vehicle_travel_times = {}
-        for inter in self.env.list_intersection:
-            arrive_left_times = inter.dic_vehicle_arrive_leave_time
-            for veh in arrive_left_times:
-                if "shadow" in veh:
-                    continue
-                enter_time = arrive_left_times[veh]["enter_time"]
-                leave_time = arrive_left_times[veh]["leave_time"]
-                if not np.isnan(enter_time):
-                    leave_time = leave_time if not np.isnan(leave_time) else self.dic_traffic_env_conf["RUN_COUNTS"]
-                    if veh not in vehicle_travel_times:
-                        vehicle_travel_times[veh] = [leave_time - enter_time]
-                    else:
-                        vehicle_travel_times[veh].append(leave_time - enter_time)
-
-        total_travel_time = np.mean([sum(vehicle_travel_times[veh]) for veh in vehicle_travel_times])
-
-        results = {
-            "test_reward_over": total_reward,
-            "test_avg_queue_len_over": np.mean(queue_length_episode) if len(queue_length_episode) > 0 else 0,
-            "test_queuing_vehicle_num_over": np.sum(queue_length_episode) if len(queue_length_episode) > 0 else 0,
-            "test_avg_waiting_time_over": np.mean(waiting_time_episode) if len(queue_length_episode) > 0 else 0,
-            "test_avg_travel_time_over": total_travel_time}
-        logger.log(results)
-        print("Test Round:", test_round, results)
-        f_state_action = os.path.join(self.dic_path["PATH_TO_WORK_DIRECTORY"], "state_action.json")
-        dump_json(state_action_log, f_state_action)
-        print("Testing time: ", time.time() - start_time)
-
-        self.env.batch_log_2()
-
-        return results
-
-    def train_test(self):
-        all_config = merge(merge(self.dic_agent_conf, self.dic_path), self.dic_traffic_env_conf)
-        logger = wandb.init(
-            project=self.dic_traffic_env_conf['PROJECT_NAME'],
-            group=f"{self.dic_traffic_env_conf['MODEL_NAME']}-{self.roadnet}-{self.trafficflow}-{len(self.dic_traffic_env_conf['PHASE'])}_Phases",
-            name=f"{self.dic_traffic_env_conf['TRAFFIC_FILE'].replace('.json', '')}",
-            config=all_config,
-        )
-
-        self.test(logger, 0)
-        wandb.finish()
-
-    '''
-    ======================= Class Utils =======================
-    '''
-    def get_vehicle_num(self, states):
-        veh_nums = []
-
-        for i in range(len(states)):
-            vehicle_num = 0
-
-            for lane in states[i]:
-                vehicle_num += states[i][lane]['queue_len']
-                for cell in range(len(states[i][lane]['cells'])):
-                    vehicle_num += states[i][lane]['cells'][cell]
-
-            veh_nums.append(vehicle_num)
-
-        return veh_nums
-
-    def get_norm_reward(self, state):
-        rewards = []
-
-        for i in range(len(state)):
-            vehicle_num = 0
-            queue_length = 0
-
-            intersection = self.env.intersection_dict[self.env.list_intersection[i].inter_name]
-            roads = deepcopy(intersection["roads"])
-            statistic_state, _, _ = get_state_detail(roads, self.env)
-            for lane in statistic_state:
-                queue_length += statistic_state[lane]['queue_len']
-
-                vehicle_num += statistic_state[lane]['queue_len']
-                for cell in range(len(statistic_state[lane]['cells'])):
-                    vehicle_num += statistic_state[lane]['cells'][cell]
-
-            reward = -(queue_length / vehicle_num) if vehicle_num > 0.0 else -0.0
-            rewards.append(reward)
-
-        return rewards

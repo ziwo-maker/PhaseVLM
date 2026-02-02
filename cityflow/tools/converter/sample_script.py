@@ -11,7 +11,7 @@ config_dict = {
             "dir": "data/",
             "roadnetFile": "atlanta_out.json", 
             "flowFile": "atlanta_flow.json",
-            "rlTrafficLight": False,
+            "rlTrafficLight": True,
             "laneChange": False,
             "saveReplay": True,
             "roadnetLogFile":"frontend/test_atlanta.json", 

@@ -1,6 +1,4 @@
-FROM nvidia/cuda:12.8.0-runtime-ubuntu20.04
-
-
+FROM nvidia/cuda:13.1.1-devel-ubuntu24.04 
 
 # 防止安装过程中的交互式提示
 ENV DEBIAN_FRONTEND=noninteractive
@@ -32,11 +30,11 @@ RUN wget -P /tmp/ https://repo.anaconda.com/miniconda/Miniconda3-py310_23.10.0-1
     echo ". /opt/conda/etc/profile.d/conda.sh" >> ~/.bashrc && \
     conda clean -afy
 
-#RUN pip3 install torch torchvision
-# 3. 升级 pip
-# 在安装任何 Python 包之前,确保 pip 是最新的
+
 RUN python -m pip install --upgrade pip
 
+
+RUN pip3 install torch torchvision --index-url https://download.pytorch.org/whl/cu130
 # 4. 安装 CityFlow
 # 先安装 Flask 依赖,再编译安装 CityFlow
 RUN git clone https://github.com/cityflow-project/CityFlow.git /home/CityFlow && \
@@ -45,14 +43,21 @@ RUN git clone https://github.com/cityflow-project/CityFlow.git /home/CityFlow &&
     pip install --no-cache-dir .
 # 5. 安装业务依赖
 # 复制 requirements.txt 并安装
+
+
 COPY requirements.txt /home/requirements.txt
 RUN pip install --no-cache-dir -r /home/requirements.txt -i https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple
 
 # 6. 安装深度学习框架 (PyTorch & TensorFlow)
 # 注意:cu130 目前通常不可用,已替换为稳定的 cu118 (CUDA 11.8)
 # 如果你的宿主机驱动支持 CUDA 12,也可以改为 cu121
-RUN pip install --no-cache-dir torch torchvision && \
-    pip install --no-cache-dir tensorflow && \
+RUN pip install --no-cache-dir tensorflow && \
     pip install --no-cache-dir rich typing_extensions
-RUN pip install tf-keras
+RUN pip install tf-keras -i https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple
+
+# RUN pip install flash-attn --no-build-isolation
+RUN pip install PyWavelets -i https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple
+RUN pip install matplotlib -i https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple
+RUN pip install pytorch_wavelets -i https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple
+RUN pip install flash-attn --no-build-isolation
 WORKDIR /home/code

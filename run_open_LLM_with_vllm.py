@@ -163,7 +163,7 @@ def main(in_args):
     ts_adapter = TimeSeriesImageAdapter(
         input_dim=len(location_direction_dict),
         seq_len=in_args.ts_image_seq_len,
-        device=_resolve_ts_adapter_device(),
+        device=_resolve_ts_adapter_device()
     )
     trainer = LLM_Inference_VLLM(dic_agent_conf_extra,
                                  merge(dic_traffic_env_conf, dic_traffic_env_conf_extra),
