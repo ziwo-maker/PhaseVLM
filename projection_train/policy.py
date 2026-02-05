@@ -54,7 +54,7 @@ class GemmaVLPolicy:
     def __init__(
         self,
         model_path: str,
-        max_length: int = 4096,
+        max_length: int = 2048,
         torch_dtype: torch.dtype = torch.bfloat16,
         device: Optional[Union[str, torch.device]] = None,
         device_map: Optional[Union[str, dict]] = None,
@@ -89,20 +89,35 @@ class GemmaVLPolicy:
             model_kwargs["device_map"] = device_map
         if max_memory is not None:
             model_kwargs["max_memory"] = max_memory
-        # flash_kwargs = dict(model_kwargs)
-        # flash_kwargs["attn_implementation"] = "flash_attention_2"
-        # self.model = AutoModelForCausalLM.from_pretrained(model_path, **flash_kwargs)
-        # try:
-        #     flash_kwargs = dict(model_kwargs)
-        #     flash_kwargs["attn_implementation"] = "flash_attention_2"
-        #     self.model = AutoModelForCausalLM.from_pretrained(model_path, **flash_kwargs)
-        # except Exception as exc:
-        #     print(f"Warning: flash_attention_2 unavailable, fallback to default attention: {exc}")
+
         self.model = AutoModelForCausalLM.from_pretrained(model_path, **model_kwargs)
+        self.model.config.use_cache = False
         if device_map is None:
             self.model.to(self.device)
 
-
+    
+    def compute_entropy(self, prompts: list[str], images: torch.Tensor) -> torch.Tensor:
+        """
+        计算策略的熵（用于entropy bonus）
+        
+        Args:
+            prompts: 提示文本列表 [B]
+            images: 图像tensor [B, C, H, W]
+        
+        Returns:
+            entropy: 熵值 [B]
+        """
+        # 获取动作logits
+        logits = self.get_action_logits(prompts, images)  # [B, num_actions]
+        
+        # 计算概率和log概率
+        probs = F.softmax(logits, dim=-1)
+        log_probs = F.log_softmax(logits, dim=-1)
+        
+        # 计算熵: H = -sum(p * log(p))
+        entropy = -(probs * log_probs).sum(dim=-1)  # [B]
+        
+        return entropy
     @staticmethod
     def _resolve_device(device: Optional[Union[str, torch.device]]) -> Optional[torch.device]:
         if device is None:
@@ -366,3 +381,32 @@ class GemmaVLPolicy:
                 # 预测位置 pos 的 token 来自 logits 的 pos-1
                 logp[i] = logp[i] + (logits[i, pos - 1, token_id] - logsumexp[i, pos - 1])
         return logp
+
+
+
+
+def get_action_logits(self, prompts: list[str], images: torch.Tensor) -> torch.Tensor:
+    """
+    获取所有动作的logits
+    
+    Args:
+        prompts: 提示文本列表 [B]
+        images: 图像tensor [B, C, H, W]
+    
+    Returns:
+        logits: 所有动作的logits [B, num_actions]
+    """
+    batch_size = len(prompts)
+    num_actions = len(ACTION_LIST)
+    
+    # 为每个动作计算log概率
+    all_logprobs = []
+    for action_idx in range(num_actions):
+        action = ACTION_LIST[action_idx]
+        actions = [action] * batch_size
+        logprobs = self.action_logprob(prompts, images, actions)  # [B]
+        all_logprobs.append(logprobs)
+    
+    logits = torch.stack(all_logprobs, dim=-1)  # [B, num_actions]
+    
+    return logits

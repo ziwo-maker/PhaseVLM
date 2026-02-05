@@ -119,3 +119,176 @@ class LearnableTimeSeriesToImage(nn.Module):
         
         # 输出形状: [B, output_channels, H, W]
         return x_enc
+
+
+
+
+
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+class LearnableTimeSeriesToImage_hot(nn.Module):
+    """
+    可学习的“Time×Lane 热力图 + (raw/delta/trend) 三通道”图像生成模块
+
+    输入:
+        x_enc: [B, L, D]
+            B: batch size
+            L: 时间长度（例如 30s 窗口采样 1s -> 30；采样 2s -> 15）
+            D: 车道数（例如 8）
+
+    输出:
+        img: [B, 3, H, W]
+            3 通道图像（类似 RGB），H=W=image_size
+            输出范围约在 [0,1]（方便接视觉模型/后续网络）
+    """
+
+    def __init__(
+        self,
+        input_dim: int,         # D：车道数
+        hidden_dim: int,        # 中间特征维度
+        image_size: int,        # 输出图像大小 H=W=image_size
+        trend_kernel: int = 5,  # trend 平滑核大小（建议 3/5/7）
+    ):
+        super().__init__()
+        self.input_dim = input_dim
+        self.hidden_dim = hidden_dim
+        self.image_size = image_size
+
+        # ============================================================
+        # ① 生成 3 通道特征图：raw / delta / trend
+        #    - raw   : 原始强度（建议 log1p 压缩长尾）
+        #    - delta : 一阶差分（突出突变/边缘）
+        #    - trend : 平滑趋势（突出慢变化）
+        # ============================================================
+
+        # trend 用“可学习平滑”：深度可分离 1D 卷积（每条车道独立一个平滑核）
+        # 输入 [B, D, L] -> 输出 [B, D, L]
+        k = int(trend_kernel)
+        if k % 2 == 0:
+            k += 1  # 确保是奇数，便于对称平滑
+        self.trend_dw = nn.Conv1d(
+            in_channels=input_dim,
+            out_channels=input_dim,
+            kernel_size=k,
+            padding=k // 2,
+            groups=input_dim,   # depthwise：每个车道单独一组卷积核
+            bias=False
+        )
+        # 初始化为“均值滤波”(moving average)：训练开始像移动平均，之后可自己学更合适的平滑方式
+        with torch.no_grad():
+            self.trend_dw.weight.fill_(1.0 / k)
+
+        # ============================================================
+        # ② 让它“像你原始代码那样可训练”：
+        #    先对每条车道做 1D 卷积（沿时间提局部模式），再做 2D 卷积（车道×时间提空间结构）
+        # ============================================================
+
+        # 1D 卷积：输入通道固定为 3（raw/delta/trend）
+        self.conv1d = nn.Conv1d(
+            in_channels=3,
+            out_channels=hidden_dim,
+            kernel_size=3,
+            padding=1
+        )
+
+        # 2D 卷积：在 (车道 D, 时间 L) 的二维平面提取结构
+        self.conv2d_1 = nn.Conv2d(
+            in_channels=hidden_dim,
+            out_channels=hidden_dim // 2,
+            kernel_size=3,
+            padding=1
+        )
+        # 输出通道固定为 3（最终图像 3 通道）
+        self.conv2d_2 = nn.Conv2d(
+            in_channels=hidden_dim // 2,
+            out_channels=3,
+            kernel_size=3,
+            padding=1
+        )
+
+    def forward(self, x_enc: torch.Tensor) -> torch.Tensor:
+        """
+        将输入时序转为图像张量 [B, 3, H, W]
+        """
+        # --------- 0) 形状检查 ----------
+        if x_enc.dim() != 3:
+            raise ValueError(f"x_enc 必须是 [B, L, D]，但收到 {tuple(x_enc.shape)}")
+        B, L, D = x_enc.shape
+        if D != self.input_dim:
+            raise ValueError(f"input_dim={self.input_dim} 但输入 D={D}，请检查车道维是否一致")
+
+        x = x_enc.float()
+        eps = 1e-6
+        
+        # ============================================================
+        # 1) 三通道特征构造（只保留 raw / delta / trend）
+        # ============================================================
+
+        # 1.1 raw：原始强度
+        # 交通流量/队列通常非负且长尾，用 log1p 可以压缩动态范围，训练更稳
+        raw = torch.log1p(torch.clamp(x, min=0.0))  # [B, L, D]
+
+        # 1.2 delta：一阶差分（突出突变）
+        # delta[t] = x[t] - x[t-1]，第 0 帧设为 0
+        delta = torch.zeros_like(x)
+        delta[:, 1:, :] = x[:, 1:, :] - x[:, :-1, :]  # [B, L, D]
+
+        # 1.3 trend：平滑趋势（突出慢变化）
+        # 这里用“可学习平滑”的 depthwise conv1d，初始化成移动平均
+        trend = self.trend_dw(x.permute(0, 2, 1)).permute(0, 2, 1)  # [B, L, D]
+
+        # 1.4 拼成 3 通道特征： [B, L, D, 3]
+        feat = torch.stack([raw, delta, trend], dim=-1)
+
+        # 1.5 轻量标准化（强烈建议）
+        # 目的：让 raw/delta/trend 三个通道的尺度接近，避免某个通道“压死”其他通道
+        # 在 (L, D) 上做均值方差归一化，保留通道维
+        mean = feat.mean(dim=(1, 2), keepdim=True)
+        std = feat.std(dim=(1, 2), keepdim=True) + eps
+        feat = (feat - mean) / std  # [B, L, D, 3]
+
+        # ============================================================
+        # 2) 可训练网络：1D(时间) + 2D(车道×时间)
+        # ============================================================
+
+        # 2.1 适配 1D conv：把每条车道当成一条序列，卷积核共享
+        # [B, L, D, 3] -> [B, D, 3, L] -> [B*D, 3, L]
+        feat = feat.permute(0, 2, 3, 1).reshape(B * D, 3, L)
+
+        # 1D 卷积提取时间局部模式
+        feat = F.silu(self.conv1d(feat))  # [B*D, hidden_dim, L]
+
+        # 还原回 batch 和车道维：
+        # [B*D, hidden_dim, L] -> [B, D, hidden_dim, L]
+        feat = feat.reshape(B, D, self.hidden_dim, L)
+
+        # 2.2 适配 2D conv：把 (D, L) 当成二维平面
+        # [B, D, hidden_dim, L] -> [B, hidden_dim, D, L]
+        feat = feat.permute(0, 2, 1, 3)
+
+        # 2D 卷积提取“车道之间 + 时间之间”的联合结构
+        feat = F.silu(self.conv2d_1(feat))
+        img = self.conv2d_2(feat)  # [B, 3, D, L]
+
+        # ============================================================
+        # 3) 插值到目标图像大小，并把值压到 [0,1] 范围
+        # ============================================================
+
+        # 3.1 双线性插值到 [B, 3, H, W]
+        img = F.interpolate(
+            img,
+            size=(self.image_size, self.image_size),
+            mode="bilinear",
+            align_corners=False
+        )
+
+        # 3.2 输出范围压缩到 [0,1]
+        # 用 tanh 再线性映射，比 sigmoid 更不容易早期饱和
+        img = torch.tanh(img)          # [-1, 1]
+        img = (img + 1.0) * 0.5        # [0, 1]
+
+        return img

@@ -236,35 +236,48 @@ def _shared_resolve_image_token(instance):
 
 
 def _shared_maybe_take_snapshot(instance, current_time_s):
+    import os
+    import uuid
+
     snapshot_path = None
     interval = int(getattr(instance, "traffic_series_interval_s", 2) or 2)
     if interval <= 0:
         interval = 2
     current_bin = int(current_time_s) // interval
     last_written = getattr(instance, "_traffic_series_last_written_bin", -1)
+
     if current_bin > last_written:
         try:
             ensure = getattr(instance, "_ensure_traffic_series_config", None)
             if callable(ensure):
                 ensure()
+
             output_path = getattr(instance, "_traffic_series_output_path", "") or ""
             output_dir = os.path.dirname(output_path)
             if not output_dir:
                 dic_path = getattr(instance, "dic_path", {}) or {}
                 output_dir = dic_path.get("PATH_TO_WORK_DIRECTORY", "") or "."
+
             snapshot_dir = os.path.join(output_dir, "snapshots")
             os.makedirs(snapshot_dir, exist_ok=True)
-            snapshot_name = f"snapshot_t{int(current_time_s)}_b{current_bin}.json"
+
+            # 添加随机数/随机标识，避免同名覆盖
+            rand_tag = uuid.uuid4().hex[:8]
+            snapshot_name = f"snapshot_t{int(current_time_s)}_b{current_bin}_{rand_tag}.json"
             snapshot_path = os.path.join(snapshot_dir, snapshot_name)
+
             env = getattr(instance, "env", None)
             if env is None or not hasattr(env, "eng"):
                 raise RuntimeError("CityFlow env is not initialized.")
+
             archive = env.eng.snapshot()
             archive.dump(snapshot_path)
             env.eng.load_from_file(snapshot_path)
-        except Exception as exc:
+            print(f"Snapshot success copy and loaded")
+        except Exception as exc:    
             print(f"Snapshot failed at t={current_time_s}: {exc}")
             snapshot_path = None
+
     return snapshot_path
 
 
@@ -641,7 +654,7 @@ class LLM_Inference_VLLM:
             history.append(movement_counts)
         return history
 
-    def _append_traffic_history_jsonl(self, current_time_s):
+    
         self._load_traffic_history()
         interval = self._traffic_history_interval
         if interval is None or not self._traffic_history_output_path:
@@ -865,9 +878,6 @@ class LLM_Inference_VLLM:
             prompts = []
             ts_images = []
 
-            self._append_traffic_history_jsonl(current_time)
-
-
             snapshot_path = _shared_maybe_take_snapshot(self, current_time)
 
             movement_keys = self._traffic_history_movement_keys or ["NT", "NL", "ST", "SL", "ET", "EL", "WT", "WL"]
@@ -877,7 +887,7 @@ class LLM_Inference_VLLM:
                     "ts_image_adapter is not initialized; create it in run_open_LLM_with_vllm.py "
                     "and pass it to LLM_Inference_VLLM."
                 )
-
+            
             inferred_dim = None
             for idx, s in enumerate(current_states):
                 state_action_log[idx].append({"state": s})
@@ -1610,42 +1620,7 @@ class LLM_Inference:
             history.append(movement_counts)
         return history
 
-    def _append_traffic_history_jsonl(self, current_time_s):
-        self._load_traffic_history()
-        interval = self._traffic_history_interval
-        if interval is None or not self._traffic_history_output_path:
-            return
-        counts = self.env.traffic_counts_by_interval.get(interval)
-        if counts is None or counts.size == 0:
-            return
-        current_bin = int(current_time_s) // interval
-        if current_bin < 0:
-            return
-        if current_bin >= counts.shape[0]:
-            current_bin = counts.shape[0] - 1
-        if current_bin <= self._traffic_history_last_written_bin:
-            return
-        base_dt = self._traffic_history_base_dt or datetime(1970, 1, 1)
-        num_mv = len(self._traffic_history_movement_keys)
-        records = []
-        for bin_idx in range(self._traffic_history_last_written_bin + 1, current_bin + 1):
-            date_str = (base_dt + timedelta(seconds=bin_idx * interval)).strftime("%Y-%m-%d %H:%M:%S")
-            row = counts[bin_idx, :]
-            for inter_idx, inter_id in enumerate(self._traffic_history_intersection_ids or []):
-                offset = inter_idx * num_mv
-                movement_counts = {
-                    key: int(row[offset + mv_i]) for mv_i, key in enumerate(self._traffic_history_movement_keys)
-                }
-                record = {
-                    "date": date_str,
-                    "interval_s": int(interval),
-                    "intersection_id": inter_id,
-                    "movement_counts": movement_counts,
-                }
-                records.append(record)
-        _append_jsonl_records(self._traffic_history_output_path, records)
-        self._traffic_history_last_written_bin = current_bin
-
+   
     def _token_in_vocab(self, token):
         return _shared_token_in_vocab(self.tokenizer, token)
 
@@ -1735,7 +1710,7 @@ class LLM_Inference:
             prompts = []
             # ts_images = []
 
-            self._append_traffic_history_jsonl(current_time)
+           
             snapshot_path = _shared_maybe_take_snapshot(self, current_time)
 
             movement_keys = self._traffic_history_movement_keys or ["NT", "NL", "ST", "SL", "ET", "EL", "WT", "WL"]
@@ -2759,4 +2734,3 @@ class LLM_CGPR_Trainer:
             veh_nums.append(vehicle_num)
 
         return veh_nums
-

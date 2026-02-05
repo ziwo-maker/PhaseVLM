@@ -14,11 +14,15 @@ import math
 from copy import deepcopy
 from functools import lru_cache
 from typing import Optional
-
+# --- add near imports ---
+import re
+from typing import Any, Optional
 import numpy as np
 import torch
 import torch.distributed as dist
 
+import torch.nn as nn
+import torch.nn.functional as F
 # Ensure repo root is on sys.path so `import src.*` works when run from subdir.
 _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
 if _REPO_ROOT not in sys.path:
@@ -166,42 +170,6 @@ def _infer_grid_size(intersection_ids: list[str]) -> tuple[int, int]:
         # fallback to 1x1 if ids are not in expected format
         return 1, 1
     return max_row, max_col
-
-
-def _flows_from_lane_details(lane_details: dict, lane_route_map: dict, vehicle_template: dict) -> tuple[list, list]:
-    flows = []
-    missing = []
-    if not isinstance(lane_details, dict):
-        return flows, missing
-    for movement, lane_map in lane_details.items():
-        if not isinstance(lane_map, dict):
-            continue
-        for lane_id, veh_list in lane_map.items():
-            count = len(veh_list or [])
-            if count <= 0:
-                continue
-            route = lane_route_map.get(lane_id)
-            if not route:
-                missing.append(lane_id)
-                continue
-            for _ in range(count):
-                flows.append(
-                    {
-                        "vehicle": deepcopy(vehicle_template),
-                        "route": route,
-                        "interval": 1.0,
-                        "startTime": 0,
-                        "endTime": 0,
-                    }
-                )
-    return flows, missing
-
-
-def _write_traffic_file(path: str, flows: list) -> None:
-    with open(path, "w", encoding="utf-8") as handle:
-        json.dump(flows, handle, ensure_ascii=False, indent=2)
-
-
 @lru_cache(maxsize=32)
 def _load_incoming_lane_ids(intersection_id: str) -> list[str]:
     """Load incoming lane ids for an intersection from the fixed roadnet file."""
@@ -265,7 +233,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--jsonl_path",
         type=str,
-        default="/home/code/LLMSTSC/data/recorded/anon_3_4_jinan_real.json_01_30_04_11_52/traffic_prompt_series_2s.jsonl",
+        default="/home/code/LLMSTSC/data/recorded/anon_3_4_jinan_real.json_02_04_08_41_17/traffic_prompt_series_2s.jsonl",
     )
     parser.add_argument("--intersection_id", type=str, default="intersection_1_1")
     parser.add_argument("--seq_len", type=int, default=15)
@@ -296,13 +264,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--traffic_out", type=str, default="traffic_1_1.json")
     parser.add_argument("--flow_interval", type=float, default=2.0)
 
-    parser.add_argument("--min_action_time", type=int, default=60)
+    parser.add_argument("--min_action_time", type=int, default=30)
     parser.add_argument("--run_counts", type=int, default=0)
     parser.add_argument("--num_rounds", type=int, default=1)
     parser.add_argument(
         "--ppo_model_path",
         type=str,
-        default="/home/code/LLMSTSC/model/projection_train/anon_3_4_jinan_real.json_01_30_09_42_15/round_0/ts_image_adapter.pt",
+        default="",
         help="PPO projection model path. If set, skip training and run evaluation only.",
     )
 
@@ -314,7 +282,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--learning_rate", type=float, default=1e-4)
     parser.add_argument("--ppo_epochs", type=int, default=4)
     parser.add_argument("--batch_size", type=int, default=2)
-    parser.add_argument("--mini_batch_size", type=int, default=2)
+    parser.add_argument("--mini_batch_size", type=int, default=8)
     parser.add_argument("--gamma", type=float, default=0.99)
     parser.add_argument("--clip_range", type=float, default=0.2)
 
@@ -409,6 +377,41 @@ def _split_indices(total: int, test_ratio: float, seed: int) -> tuple[list[int],
     return train_indices, test_indices
 
 
+# --- add somewhere (e.g., above main / above training loop) ---
+def parse_action_id(action: Any, num_actions: int, default: int = 0) -> int:
+    """
+
+    """
+    if action is None:
+        print("action is Null")
+        return default
+
+    # already numeric
+    if isinstance(action, (int,)):
+        a = action
+    elif isinstance(action, float):
+        a = int(round(action))
+    elif isinstance(action, str):
+        s = action.strip()
+        # exact digit string
+        if s.isdigit() or (s.startswith("-") and s[1:].isdigit()):
+            a = int(s)
+        else:
+            # pick the first integer appearing in the string
+            m = re.search(r"-?\d+", s)
+            a = int(m.group(0)) if m else default
+    else:
+        # try best-effort cast
+        try:
+            a = int(action)
+        except Exception:
+            print("action 不能被解析");
+            a = default
+
+   
+    return a
+
+
 def evaluate_policy(
     dataset: TrafficPromptSeriesDataset,
     indices: list[int],
@@ -442,21 +445,20 @@ def evaluate_policy(
                 images,
                 generation_kwargs,
             )
-        action = batch_actions[0]
+        action = batch_actions[0]  # 不一定能获得动作
+        # --- in your sampling loop, after you get `action` from policy.generate_actions(...) ---
+        # NOTE: ACTION_LIST length is your discrete action space size
+        # action_id = parse_action_id(action, num_actions=len(ACTION_LIST), default=0)  #这里不能用action_id，logprob 必须对应“实际执行的动作”
+
 
         if snapshot_path:
             eng.load_from_file(snapshot_path)
         target_index = intersection_id_to_index.get(intersection_id)
         if target_index is None:
             raise ValueError(f"intersection_id not found in roadnet: {intersection_id}")
-        action_list = [
-            random.randrange(len(ACTION_LIST))
-            for _ in range(intersections_count)
-        ]
-        action_list[target_index] = action
-        for iid, phase in zip(intersection_ids, action_list):
-            eng.set_tl_phase(iid, int(phase))
-        eng.next_step()
+        eng.set_tl_phase(intersection_id, action)
+        
+        
         reward = -mean_waiting_time(eng, intersection_id)
         rewards.append(reward)
 
@@ -486,7 +488,33 @@ def evaluate_policy(
     }
 
 
+class ImageCritic(nn.Module):
+    """
+    V(s) baseline: 输入是 adapter 生成的图像 [B, 3, H, W]，输出每个样本的 state value [B]
+    """
+    def __init__(self, in_ch: int = 3, hidden: int = 128):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv2d(in_ch, 32, kernel_size=3, stride=2, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1),
+            nn.ReLU(inplace=True),
+            nn.AdaptiveAvgPool2d((1, 1)),
+        )
+        self.v_head = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(128, hidden),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden, 1),
+        )
 
+    def forward(self, images: torch.Tensor) -> torch.Tensor:
+        # images: [B, 3, H, W]
+        h = self.net(images)
+        v = self.v_head(h).squeeze(-1)   # [B]
+        return v
 
 def main() -> None:
     args = parse_args()
@@ -585,7 +613,7 @@ def main() -> None:
             len(dataset), args.seq_len, args.intersection_id
         )
     )
-    train_indices, test_indices = _split_indices(len(dataset), 0.9, args.seed)
+    train_indices, test_indices = _split_indices(len(dataset), 0.3, args.seed)
     print(
         "数据集拆分完成：训练样本数={}，测试样本数={}（20%测试集）。".format(
             len(train_indices), len(test_indices)
@@ -599,8 +627,7 @@ def main() -> None:
         raise FileNotFoundError(f"Roadnet not found: {roadnet_path}")
     with open(roadnet_path, "r", encoding="utf-8") as handle:
         roadnet_single = json.load(handle)
-    vehicle_template = _load_vehicle_template(traffic_path)
-    lane_route_map = _build_lane_route_map(roadnet_single, args.intersection_id)
+   
     intersection_ids = [
         inter.get("id") for inter in roadnet_single.get("intersections", []) or []
     ]
@@ -608,20 +635,8 @@ def main() -> None:
         inter_id: idx for idx, inter_id in enumerate(intersection_ids) if inter_id
     }
     intersections_count = len(intersection_ids)
-    num_row, num_col = _infer_grid_size(intersection_ids)
 
 
-    # 根据样本长度设定仿真步数
-    run_counts = args.run_counts or (args.min_action_time * len(dataset))
-    env_conf = build_env_conf(
-        traffic_file=os.path.basename(traffic_path),
-        roadnet_file=os.path.basename(roadnet_path),
-        run_counts=run_counts,
-        min_action_time=args.min_action_time,
-        num_row=num_row,
-        num_col=num_col,
-        num_intersections=intersections_count,
-    )
 
     # 准备训练输出目录与 CityFlow 工作目录
     timestamp = None
@@ -636,13 +651,13 @@ def main() -> None:
     rank_work_dir = resolve_rank_work_dir(dic_path["PATH_TO_WORK_DIRECTORY"], local_rank)
     dic_path["PATH_TO_WORK_DIRECTORY"] = rank_work_dir
     os.makedirs(rank_work_dir, exist_ok=True)
-    copy_cityflow_files(dic_path, env_conf)
+
     _barrier()
 
     # 初始化 CityFlow 环境（从保存的参数加载）
     cityflow_env_args_path = (
         "/home/code/LLMSTSC/records/LLMTLCSRun/"
-        "anon_3_4_jinan_real.json_01_29_17_15_14/"
+        "anon_3_4_jinan_real.json_02_04_08_41_17/"
         "cityflow_env_init/cityflow_env_args.json"
     )
     with open(cityflow_env_args_path, "r", encoding="utf-8") as handle:
@@ -662,6 +677,18 @@ def main() -> None:
         save_images=False,
         device=device,
     )
+    loss_device = device
+    critic = ImageCritic(in_ch=3, hidden=128).to(loss_device)
+    critic.train()
+
+    # 如果你原来 optimizer 只优化 adapter，这里把 critic 参数也加进去
+    optimizer = torch.optim.Adam(
+        list(ts_adapter.learnable_image_module.parameters()) + list(critic.parameters()),
+        lr=args.learning_rate
+    )
+
+    # 价值函数系数（常用 0.5）
+    vf_coef = getattr(args, "vf_coef", 0.5)
     if ts_adapter.learnable_image_module is None:
         raise RuntimeError("TimeSeriesImageAdapter learnable_image_module is not initialized.")
     if use_multi_gpu:
@@ -699,12 +726,7 @@ def main() -> None:
         if hasattr(policy.model, "config") and policy.model.config is not None:
             policy.model.config.use_cache = False
 
-    # 只优化可学习的图像投影模块
-    optimizer = torch.optim.AdamW(
-        ts_adapter.learnable_image_module.parameters(),
-        lr=args.learning_rate,
-    )
-    loss_device = device
+
 
     # LLM 生成超参
     generation_kwargs = {
@@ -775,7 +797,7 @@ def main() -> None:
                 handle.write("\n".join(log_lines))
             print(f"[日志保存] 训练/测试日志已保存到：{log_path}")
         return
-
+    minibatch_idx=12
     for round_idx in range(args.num_rounds):
         print(
             "\n======== 开始第 {}/{} 轮训练 ========".format(
@@ -833,17 +855,15 @@ def main() -> None:
                         .tolist()
                     )
 
-                for prompt, seq, action, logprob, lane_details, snapshot_path, intersection_id in zip(
+                for prompt, seq, action, logprob,  snapshot_path, intersection_id in zip(
                     batch_prompts,
                     batch_seqs,
                     batch_actions,
                     batch_logprobs,
-                    batch_lane_details,
+        
                     batch_snapshot_paths,
                     batch_intersection_ids,
                 ):
-                    
-            
                     
                     if snapshot_path:
                         eng.load_from_file(snapshot_path)
@@ -853,15 +873,18 @@ def main() -> None:
                         raise ValueError(
                             f"intersection_id not found in roadnet: {intersection_id}"
                         )
-                    action_list = [
-                        random.randrange(len(ACTION_LIST))
-                        for _ in range(intersections_count)
-                    ]
-                    action_list[target_index] = action
-                    # 在仿真环境中执行动作
-                    for iid, phase in zip(intersection_ids, action_list):
-                        eng.set_tl_phase(iid, int(phase))   # 逐路口设置相位
-                    eng.next_step()  
+                    # action_list = [
+                    #     random.randrange(len(ACTION_LIST))
+                    #     for _ in range(intersections_count)
+                    # ]
+                    # action_list[target_index] = action
+                    # # 在仿真环境中执行动作
+                    # for iid, phase in zip(intersection_ids, action_list):
+                    #     eng.set_tl_phase(iid, int(phase))   # 逐路口设置相位
+                    # action_id = parse_action_id(action, num_actions=len(ACTION_LIST), default=0)
+                    eng.set_tl_phase(intersection_id, action)
+                    
+                  
                     # 奖励：负的平均等待时间（越小越好）
                     reward = -mean_waiting_time(eng, intersection_id)
                     print(action, -reward)
@@ -909,81 +932,157 @@ def main() -> None:
                         )
                     )
                 _barrier()
+        
 
-        # 计算回报与优势（用于 PPO 更新）
-        returns = discounted_returns(rewards, args.gamma).to(loss_device)
-        advantages = returns.clone()
+        print("[步骤1] 全局计算values和advantages...")
+        
+        # 构建returns tensor
+        returns = torch.tensor(rewards, dtype=torch.float32, device=loss_device)
+        
+        # 一次性计算所有样本的values（用于advantage计算）
+        all_values = []
+        batch_size_for_value = 8  # 防止OOM，可根据GPU显存调整
+        
+        with torch.no_grad():
+            for i in range(0, len(sequences), batch_size_for_value):
+                batch_seqs = sequences[i : i + batch_size_for_value]
+                ts_tensor = torch.tensor(batch_seqs, dtype=torch.float32, device=device)
+                images = ts_adapter.generate(ts_tensor)
+                batch_values = critic(images)  # [batch_size_for_value]
+                all_values.append(batch_values.to(loss_device))
+        
+        values_all = torch.cat(all_values, dim=0)  # [total_samples]
+        
+        # 全局计算advantages（重要：只归一化一次）
+        advantages = returns - values_all
         advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+        
+        print(f"  - Returns: mean={returns.mean():.4f}, std={returns.std():.4f}")
+        print(f"  - Values: mean={values_all.mean():.4f}, std={values_all.std():.4f}")
+        print(f"  - Advantages: mean={advantages.mean():.4f}, std={advantages.std():.4f}")
 
         indices = list(range(len(prompts)))
         minibatch_total = math.ceil(len(indices) / max(1, args.mini_batch_size))
         for epoch_idx in range(args.ppo_epochs):
-            # random.shuffle(indices)
+            random.shuffle(indices)  # 启用shuffle以打破时间相关性
             epoch_losses = []
             epoch_clip_fracs = []
+            # PPO更新时直接索引
             for start in range(0, len(indices), args.mini_batch_size):
                 batch_idx = indices[start : start + args.mini_batch_size]
-                minibatch_idx = start // args.mini_batch_size + 1
                 batch_prompts = [prompts[i] for i in batch_idx]
-                batch_seqs = [sequences[i] for i in batch_idx]
                 batch_actions = [actions[i] for i in batch_idx]
-
-                # 重新计算图像与新策略的对数概率
+                batch_seqs = [sequences[i] for i in batch_idx]
                 ts_tensor = torch.tensor(batch_seqs, dtype=torch.float32, device=device)
                 images = ts_adapter.generate(ts_tensor)
-
                 new_logprobs = policy.action_logprob(batch_prompts, images, batch_actions)
+
                 old_logprob_tensor = torch.tensor(
                     [old_logprobs[i] for i in batch_idx],
                     dtype=new_logprobs.dtype,
                     device=new_logprobs.device,
-                )
-                advantage_tensor = advantages[batch_idx].to(new_logprobs.device)
+                )  # [B]
 
-                # PPO 裁剪目标
-                ratio = torch.exp(new_logprobs - old_logprob_tensor)
-                unclipped = ratio * advantage_tensor
-                clipped = torch.clamp(ratio, 1.0 - args.clip_range, 1.0 + args.clip_range) * advantage_tensor
-                policy_loss = -torch.min(unclipped, clipped).mean()
-                clip_frac = (
-                    (torch.abs(ratio - 1.0) > args.clip_range).float().mean().item()
-                )
+                returns_b = returns[batch_idx].to(new_logprobs.device)  # [B]
+                
+                # 从全局advantages中索引当前batch（已经归一化过，无需重复）
+                advantages_b = advantages[batch_idx].to(new_logprobs.device)  # [B]
+                
+                # 从全局values中索引当前batch（用于value clipping）
+                old_values_b = values_all[batch_idx].to(new_logprobs.device)  # [B]
 
-                # 反向传播更新可学习投影模块
+                # critic
+                values = critic(images)  # [B]
+
+                # PPO ratio
+                ratio = torch.exp(new_logprobs - old_logprob_tensor)  # [B]
+
+                surr1 = ratio * advantages_b
+                surr2 = torch.clamp(ratio, 1.0 - args.clip_range, 1.0 + args.clip_range) * advantages_b
+                policy_loss = -torch.min(surr1, surr2).mean()
+                
+                # ============================================================
+                # Value Loss (带Clipping，防止value更新过大)
+                # ============================================================
+                
+                # Clip value predictions
+                values_clipped = old_values_b + torch.clamp(
+                    values - old_values_b,
+                    -args.clip_range,
+                    args.clip_range,
+                )
+                
+          
+                # 方法2：更简洁（OpenAI标准实现）
+                vpredclipped = old_values_b + torch.clamp(values - old_values_b, -args.clip_range, args.clip_range)
+                vf_loss1 = (values - returns_b).pow(2)
+                vf_loss2 = (vpredclipped - returns_b).pow(2)
+                value_loss = 0.5 * torch.mean(torch.max(vf_loss1, vf_loss2))
+                # ============================================================
+                # Entropy Loss (鼓励探索)
+                # ============================================================
+                
+                # 计算熵（需要policy类支持compute_entropy方法）
+                try:
+                    entropy = policy.compute_entropy(batch_prompts, images)
+                    entropy_loss = -entropy.mean()  # 负号因为我们要最大化熵
+                    ent_coef = 0.01  # 可调超参数
+                except AttributeError:
+                    # 如果policy没有实现entropy，跳过
+                    entropy_loss = torch.tensor(0.0, device=new_logprobs.device)
+                    ent_coef = 0.0
+                    if epoch_idx == 0 :
+                        print("[警告] Policy未实现compute_entropy方法，跳过entropy bonus")
+                
+                
+                # ============================================================
+                # Total Loss
+                # ============================================================
+                
+                loss = policy_loss + vf_coef * value_loss + ent_coef * entropy_loss
+
                 optimizer.zero_grad(set_to_none=True)
-                policy_loss.backward()
+                loss.backward()
+                # 梯度裁剪防止梯度爆炸
+                torch.nn.utils.clip_grad_norm_(
+                    list(ts_adapter.learnable_image_module.parameters()) + list(critic.parameters()),
+                    max_norm=0.5
+                )
                 optimizer.step()
 
-                epoch_losses.append(float(policy_loss.detach().cpu().item()))
+                clip_frac = (torch.abs(ratio - 1.0) > args.clip_range).float().mean().item()
+
+
+
+                
+
+                epoch_losses.append({
+                    'policy_loss': float(policy_loss.detach().cpu().item()),
+                    'value_loss': float(value_loss.detach().cpu().item()),
+                    'entropy_loss': float(entropy_loss.detach().cpu().item()) if isinstance(entropy_loss, torch.Tensor) else 0.0,
+                    'total_loss': float(loss.detach().cpu().item()),
+                })
                 epoch_clip_fracs.append(clip_frac)
 
-                if args.log_interval > 0 and (
-                    minibatch_idx == 1
-                    or minibatch_idx == minibatch_total
-                    or minibatch_idx % args.log_interval == 0
-                ):
-                    print(
-                        "[更新进度] Epoch {}/{} | Batch {}/{} | 策略损失loss={:.6f}(越小越稳定) | clip占比={:.3f}".format(
-                            epoch_idx + 1,
-                            args.ppo_epochs,
-                            minibatch_idx,
-                            minibatch_total,
-                            epoch_losses[-1],
-                            clip_frac,
-                        )
-                    )
-
+              
             if epoch_losses:
+                avg_policy = np.mean([l['policy_loss'] for l in epoch_losses])
+                avg_value = np.mean([l['value_loss'] for l in epoch_losses])
+                avg_entropy = np.mean([l['entropy_loss'] for l in epoch_losses])
+                avg_total = np.mean([l['total_loss'] for l in epoch_losses])
                 print(
-                    "[Epoch汇总] {}/{} | 平均loss={:.6f} | 平均clip占比={:.3f}".format(
+                    "[Epoch汇总] {}/{} | avg_policy={:.6f} | avg_value={:.6f} | "
+                    "avg_entropy={:.6f} | avg_total={:.6f} | avg_clip={:.3f}".format(
                         epoch_idx + 1,
                         args.ppo_epochs,
-                        float(np.mean(epoch_losses)),
+                        avg_policy,
+                        avg_value,
+                        avg_entropy,
+                        avg_total,
                         float(np.mean(epoch_clip_fracs)) if epoch_clip_fracs else 0.0,
                     )
                 )
 
-        # 保存当前轮次的投影模块权重
         ckpt_dir = os.path.join(dic_path["PATH_TO_MODEL"], f"round_{round_idx}")
         os.makedirs(ckpt_dir, exist_ok=True)
         if _is_rank0():
@@ -1009,7 +1108,11 @@ def main() -> None:
                     round_idx + 1, avg_reward, avg_waiting, ckpt_dir
                 )
             )
-
+    # 每个epoch打印
+        print(f"ratio stats: mean={ratio.mean():.3f}, std={ratio.std():.3f}, "
+            f"min={ratio.min():.3f}, max={ratio.max():.3f}")
+        print(f"old_logprobs: mean={old_logprob_tensor.mean():.3f}")
+        print(f"new_logprobs: mean={new_logprobs.mean():.3f}")
     test_result = evaluate_policy(
         dataset=dataset,
         indices=test_indices,

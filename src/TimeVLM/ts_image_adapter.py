@@ -5,7 +5,7 @@ import torch
 from PIL import Image
 
 
-from layers.Learnable_TimeSeries_To_Image import LearnableTimeSeriesToImage
+from layers.Learnable_TimeSeries_To_Image import LearnableTimeSeriesToImage,LearnableTimeSeriesToImage_hot
 from layers.TimeSeries_To_Image import time_series_to_simple_image
 class TimeSeriesImageAdapter:
     """
@@ -55,12 +55,12 @@ class TimeSeriesImageAdapter:
 
         if self.learnable_image:
             out_channels = 3 if self.three_channel_image else 1
-            self.learnable_image_module = LearnableTimeSeriesToImage(
+            self.learnable_image_module = LearnableTimeSeriesToImage_hot(
                 input_dim=self.input_dim,
                 hidden_dim=self.hidden_dim,
-                output_channels=out_channels,
+               
                 image_size=self.image_size,
-                periodicity=self.periodicity,
+             
             )
             if self.device is not None:
                 self.learnable_image_module = self.learnable_image_module.to(self.device)
@@ -72,6 +72,7 @@ class TimeSeriesImageAdapter:
     # 输入处理
     # ---------------------------
     def _ensure_tensor(self, data: Any) -> torch.Tensor:
+        # 确保输入是 float32 张量，形状为 (B, L, C)，并放到目标设备上。
         if torch.is_tensor(data):
             x_enc = data
         else:
@@ -92,6 +93,7 @@ class TimeSeriesImageAdapter:
         return x_enc
 
     def _align_device(self, x_enc: torch.Tensor) -> torch.Tensor:
+        # 若存在可学习图像模块，保证输入与模块在同一 device 上。
         if self.learnable_image_module is None:
             return x_enc
         module_device = next(self.learnable_image_module.parameters()).device
@@ -100,6 +102,7 @@ class TimeSeriesImageAdapter:
         return x_enc
 
     def _context_len(self, x_enc: torch.Tensor) -> int:
+        # 使用实际序列长度，允许与配置的 seq_len 不一致。
         if self.seq_len is None or self.seq_len <= 0:
             return x_enc.shape[1]
         # 允许输入长度不等于 seq_len（例如在线控制窗口变化）
@@ -174,22 +177,23 @@ class TimeSeriesImageAdapter:
         """
         返回 float 图像（默认 [0,1]），保持可导（尤其是 learnable_image=True 时）。
         """
+        
+        # 通过可学习模块或固定映射将时序转为图像。
         if self.learnable_image:
             if self.learnable_image_module is None:
                 out_channels = 3 if self.three_channel_image else 1
-                self.learnable_image_module = LearnableTimeSeriesToImage(
+        
+                self.learnable_image_module = LearnableTimeSeriesToImage_hot(
                     input_dim=self.input_dim,
                     hidden_dim=self.hidden_dim,
-                    output_channels=out_channels,
                     image_size=image_size,
-                    periodicity=periodicity,
                 )
             images = self.learnable_image_module(x_enc)  # 期望 float: [B,C,H,W]
         else:
             images = time_series_to_simple_image(x_enc, image_size, context_len, periodicity)
 
         # ✅ 关键：缩放保持 float 可导（不再强制 uint8）
-        images_scaled = self._scale_images(images)
+        images_scaled = images
 
         # 可选保存（保存时才转 uint8）
         if self.save_images:
@@ -203,7 +207,8 @@ class TimeSeriesImageAdapter:
         """
         x_enc = self._ensure_tensor(data)
         x_enc = self._align_device(x_enc)
-        x_enc, _, _ = self._normalize_input(x_enc)
+        # 在转图像前，沿时间维进行标准化。
+        # x_enc, _, _ = self._normalize_input(x_enc)  #自定义类不需要标准化
         context_len = self._context_len(x_enc)
         return self.vision_augmented_learner(x_enc, self.image_size, context_len, self.periodicity)
 
