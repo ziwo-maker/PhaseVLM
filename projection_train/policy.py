@@ -2,7 +2,16 @@ import re
 from typing import List, Optional, Tuple, Union, Dict
 
 import torch
-from transformers import AutoModelForCausalLM, AutoProcessor, AutoTokenizer
+import torch.nn.functional as F
+from transformers import AutoConfig, AutoModelForCausalLM, AutoProcessor, AutoTokenizer
+try:
+    from transformers import AutoModelForVision2Seq
+except Exception:
+    AutoModelForVision2Seq = None
+try:
+    from transformers import AutoModelForImageTextToText
+except Exception:
+    AutoModelForImageTextToText = None
 ACTION_LIST = ["ETWT", "NTST", "ELWL", "NLSL"]
 ACTION_SET = set(ACTION_LIST)
 
@@ -79,7 +88,19 @@ class GemmaVLPolicy:
             model_path,
             trust_remote_code=trust_remote_code,
         )
+        # decoder-only 模型需要 left padding；同时确保 processor 的 tokenizer 一致
+        if hasattr(self.processor, "tokenizer"):
+            try:
+                self.processor.tokenizer.padding_side = "left"
+                if self.processor.tokenizer.pad_token_id is None:
+                    self.processor.tokenizer.pad_token = self.processor.tokenizer.eos_token
+            except Exception:
+                pass
 
+        config = AutoConfig.from_pretrained(
+            model_path,
+            trust_remote_code=trust_remote_code,
+        )
         model_kwargs = {
             "torch_dtype": torch_dtype,
             "trust_remote_code": trust_remote_code,
@@ -90,7 +111,8 @@ class GemmaVLPolicy:
         if max_memory is not None:
             model_kwargs["max_memory"] = max_memory
 
-        self.model = AutoModelForCausalLM.from_pretrained(model_path, **model_kwargs)
+        model_cls = self._select_model_class(config)
+        self.model = model_cls.from_pretrained(model_path, **model_kwargs)
         self.model.config.use_cache = False
         if device_map is None:
             self.model.to(self.device)
@@ -118,6 +140,20 @@ class GemmaVLPolicy:
         entropy = -(probs * log_probs).sum(dim=-1)  # [B]
         
         return entropy
+
+    @staticmethod
+    def _select_model_class(config: AutoConfig):
+        model_type = str(getattr(config, "model_type", "") or "").lower()
+        class_name = config.__class__.__name__ if config is not None else ""
+        is_vl = ("vl" in model_type) or ("vision" in model_type) or ("image" in model_type)
+        if ("VL" in class_name) or ("Vision" in class_name):
+            is_vl = True
+        if is_vl:
+            if AutoModelForVision2Seq is not None:
+                return AutoModelForVision2Seq
+            if AutoModelForImageTextToText is not None:
+                return AutoModelForImageTextToText
+        return AutoModelForCausalLM
     @staticmethod
     def _resolve_device(device: Optional[Union[str, torch.device]]) -> Optional[torch.device]:
         if device is None:
@@ -260,7 +296,7 @@ class GemmaVLPolicy:
         self,
         prompts: List[str],
         pixel_values: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor, List[int]]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, List[int], Optional[torch.Tensor]]:
         """将文本提示词编码为 input_ids/attention_mask，并返回每条提示词的长度。"""
         formatted = self._format_multimodal_prompts(prompts)
 
@@ -273,7 +309,7 @@ class GemmaVLPolicy:
                 images_for_processor = [img.detach().cpu() for img in pixel_values]
             else:
                 images_for_processor = pixel_values
-        images_for_processor = [[img] for img in images_for_processor]
+            images_for_processor = [[img] for img in images_for_processor]
         encoding = self.processor(
             text=formatted,
             images=images_for_processor,
@@ -285,7 +321,8 @@ class GemmaVLPolicy:
         input_ids = encoding["input_ids"].to(self.device)
         attention_mask = encoding["attention_mask"].to(self.device)
         lengths = attention_mask.sum(dim=1).tolist()
-        return input_ids, attention_mask, lengths
+        image_grid_thw = encoding.get("image_grid_thw")
+        return input_ids, attention_mask, lengths, image_grid_thw
 
     def generate_actions(
         self,
@@ -294,16 +331,21 @@ class GemmaVLPolicy:
         generation_kwargs: dict,
     ) -> Tuple[List[int], List[str]]:
         """根据提示词与图像生成动作及模型原始回答文本。"""
-        input_ids, attention_mask, lengths = self.encode_inputs(prompts, pixel_values)
+        input_ids, attention_mask, lengths, image_grid_thw = self.encode_inputs(prompts, pixel_values)
         # 将图像张量移动到模型设备并对齐数据类型
         if pixel_values is not None:
             pixel_device = self.vision_device or self.device
             pixel_values = pixel_values.to(pixel_device, dtype=self.model.dtype)
+            if image_grid_thw is not None:
+                image_grid_thw = image_grid_thw.to(pixel_device)
+        generate_kwargs = dict(generation_kwargs)
+        if image_grid_thw is not None:
+            generate_kwargs["image_grid_thw"] = image_grid_thw
         output_ids = self.model.generate(
             input_ids=input_ids,
             attention_mask=attention_mask,
             pixel_values=pixel_values,
-            **generation_kwargs,
+            **generate_kwargs,
         )
 
         responses = []
@@ -326,9 +368,11 @@ class GemmaVLPolicy:
         actions: List[int],
     ) -> torch.Tensor:
         """计算给定动作对应的对数概率（按动作标签 token 的对数似然求和）。"""
-        input_ids, attention_mask, lengths = self.encode_inputs(prompts, pixel_values)
+        input_ids, attention_mask, lengths, image_grid_thw = self.encode_inputs(prompts, pixel_values)
         pixel_device = self.vision_device or self.device
         pixel_values = pixel_values.to(pixel_device, dtype=self.model.dtype)
+        if image_grid_thw is not None:
+            image_grid_thw = image_grid_thw.to(pixel_device)
         pad_id = int(self.tokenizer.pad_token_id)
 
         # 将动作索引转换为带 <signal> 标签的 token 序列
@@ -362,11 +406,14 @@ class GemmaVLPolicy:
             full_mask[i, :total_len] = 1
 
         # 前向推理得到每个位置的 token logits
-        outputs = self._model_forward(
-            input_ids=full_ids,
-            attention_mask=full_mask,
-            pixel_values=pixel_values,
-        )
+        forward_kwargs = {
+            "input_ids": full_ids,
+            "attention_mask": full_mask,
+            "pixel_values": pixel_values,
+        }
+        if image_grid_thw is not None:
+            forward_kwargs["image_grid_thw"] = image_grid_thw
+        outputs = self._model_forward(**forward_kwargs)
         logits = outputs.logits  # [B, T, V], bf16/fp16
         logsumexp = torch.logsumexp(logits, dim=-1)  # [B, T]
         # 累加动作标签 token 的对数概率（保持可反传）
@@ -382,31 +429,27 @@ class GemmaVLPolicy:
                 logp[i] = logp[i] + (logits[i, pos - 1, token_id] - logsumexp[i, pos - 1])
         return logp
 
+    def get_action_logits(self, prompts: list[str], images: torch.Tensor) -> torch.Tensor:
+        """
+        获取所有动作的logits
 
+        Args:
+            prompts: 提示文本列表 [B]
+            images: 图像tensor [B, C, H, W]
 
+        Returns:
+            logits: 所有动作的logits [B, num_actions]
+        """
+        batch_size = len(prompts)
+        num_actions = len(ACTION_LIST)
 
-def get_action_logits(self, prompts: list[str], images: torch.Tensor) -> torch.Tensor:
-    """
-    获取所有动作的logits
-    
-    Args:
-        prompts: 提示文本列表 [B]
-        images: 图像tensor [B, C, H, W]
-    
-    Returns:
-        logits: 所有动作的logits [B, num_actions]
-    """
-    batch_size = len(prompts)
-    num_actions = len(ACTION_LIST)
-    
-    # 为每个动作计算log概率
-    all_logprobs = []
-    for action_idx in range(num_actions):
-        action = ACTION_LIST[action_idx]
-        actions = [action] * batch_size
-        logprobs = self.action_logprob(prompts, images, actions)  # [B]
-        all_logprobs.append(logprobs)
-    
-    logits = torch.stack(all_logprobs, dim=-1)  # [B, num_actions]
-    
-    return logits
+        # 为每个动作计算log概率
+        all_logprobs = []
+        for action_idx in range(num_actions):
+            action = ACTION_LIST[action_idx]
+            actions = [action] * batch_size
+            logprobs = self.action_logprob(prompts, images, actions)  # [B]
+            all_logprobs.append(logprobs)
+
+        logits = torch.stack(all_logprobs, dim=-1)  # [B, num_actions]
+        return logits

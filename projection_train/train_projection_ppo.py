@@ -13,16 +13,16 @@ import time
 import math
 from copy import deepcopy
 from functools import lru_cache
-from typing import Optional
+from typing import Any, Optional
 # --- add near imports ---
 import re
-from typing import Any, Optional
 import numpy as np
 import torch
 import torch.distributed as dist
 
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.nn.parallel import DistributedDataParallel as DDP
 # Ensure repo root is on sys.path so `import src.*` works when run from subdir.
 _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
 if _REPO_ROOT not in sys.path:
@@ -239,18 +239,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seq_len", type=int, default=15)
     parser.add_argument("--interval_s", type=int, default=2)
     parser.add_argument("--llm_path", type=str, default="/home/data/model/gemma-12B/")
-    parser.add_argument(
-        "--train_device_ids",
-        type=str,
-        default="1",
-        help="Comma-separated CUDA device ids for training the time-series image adapter.",
-    )
-    parser.add_argument(
-        "--llm_device_ids",
-        type=str,
-        default="0,1",
-        help="Comma-separated CUDA device ids for LLM loading/sharding.",
-    )
     parser.add_argument("--seed", type=int, default=2024)
 
     parser.add_argument(
@@ -273,7 +261,7 @@ def parse_args() -> argparse.Namespace:
         default="",
         help="PPO projection model path. If set, skip training and run evaluation only.",
     )
-
+    # gemma 
     parser.add_argument("--image_size", type=int, default=896)
     parser.add_argument("--periodicity", type=int, default=24)
     parser.add_argument("--norm_const", type=float, default=0.4)
@@ -282,13 +270,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--learning_rate", type=float, default=1e-4)
     parser.add_argument("--ppo_epochs", type=int, default=4)
     parser.add_argument("--batch_size", type=int, default=2)
-    parser.add_argument("--mini_batch_size", type=int, default=8)
+    parser.add_argument("--mini_batch_size", type=int, default=2)
     parser.add_argument("--gamma", type=float, default=0.99)
     parser.add_argument("--clip_range", type=float, default=0.2)
 
     parser.add_argument("--max_new_tokens", type=int, default=1500)
     parser.add_argument("--temperature", type=float, default=0.1)
-    parser.add_argument("--top_p", type=float, default=1.0)
+    parser.add_argument("--top_p", type=float, default=1.0) 
     parser.add_argument(
         "--log_interval",
         type=int,
@@ -320,12 +308,54 @@ def _barrier() -> None:
         dist.barrier()
 
 
+def _sync_if_cuda(device: torch.device) -> None:
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+
+
+def _get_rank_world_size() -> tuple[int, int]:
+    if dist.is_initialized():
+        return dist.get_rank(), dist.get_world_size()
+    return 0, 1
+
+
+def _init_distributed(local_rank: int) -> torch.device:
+    use_cuda = torch.cuda.is_available()
+    if use_cuda:
+        if local_rank >= 0:
+            device = torch.device(f"cuda:{local_rank}")
+            torch.cuda.set_device(device)
+        else:
+            device = torch.device("cuda:0")
+            torch.cuda.set_device(device)
+    else:
+        device = torch.device("cpu")
+
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    if world_size > 1 and not dist.is_initialized():
+        backend = "nccl" if use_cuda else "gloo"
+        dist.init_process_group(backend=backend, init_method="env://")
+    return device
+
+
+def _shard_indices(indices: list[int], rank: int, world_size: int) -> list[int]:
+    if world_size <= 1:
+        return indices
+    return [idx for pos, idx in enumerate(indices) if pos % world_size == rank]
+
+
 def _broadcast_object(value):
     if not dist.is_initialized():
         return value
     obj_list = [value]
     dist.broadcast_object_list(obj_list, src=0)
     return obj_list[0]
+
+
+def _unwrap_module(module: nn.Module) -> nn.Module:
+    if isinstance(module, (DDP, torch.nn.DataParallel)):
+        return module.module
+    return module
 
 
 def _resolve_snapshot_path(snapshot_path: str, jsonl_path: str) -> Optional[str]:
@@ -525,80 +555,17 @@ def main() -> None:
     if local_rank < 0:
         local_rank = int(os.environ.get("LOCAL_RANK", "-1"))
 
-    use_cuda = torch.cuda.is_available()
-    gpu_count = torch.cuda.device_count() if use_cuda else 0
-
-    def _parse_device_ids(value: str) -> list[int]:
-        text = str(value or "").strip()
-        if not text or text.lower() in ("none", "auto", "cpu"):
-            return []
-        seen = set()
-        ids: list[int] = []
-        for chunk in text.split(","):
-            chunk = chunk.strip()
-            if not chunk:
-                continue
-            did = int(chunk)
-            if did in seen:
-                continue
-            seen.add(did)
-            ids.append(did)
-        return ids
-
-    train_device_ids = _parse_device_ids(args.train_device_ids)
-    llm_device_ids = _parse_device_ids(args.llm_device_ids)
-
-    if use_cuda:
-        for label, ids in (("training", train_device_ids), ("LLM", llm_device_ids)):
-            for did in ids:
-                if did < 0 or did >= gpu_count:
-                    raise RuntimeError(
-                        f"Requested {label} device cuda:{did} is not available. "
-                        f"Visible GPU count: {gpu_count}."
-                    )
-    else:
-        if (train_device_ids or llm_device_ids) and _is_rank0():
-            print("Warning: CUDA is not available; falling back to CPU.")
-        train_device_ids = []
-        llm_device_ids = []
-
-    if use_cuda and train_device_ids:
-        primary_device_id = train_device_ids[0]
-        torch.cuda.set_device(primary_device_id)
-        device = torch.device(f"cuda:{primary_device_id}")
-    else:
-        primary_device_id = None
-        device = torch.device("cpu")
-
-    if use_cuda and train_device_ids and llm_device_ids:
-        overlap = set(train_device_ids) & set(llm_device_ids)
-        if overlap and _is_rank0():
-            print(
-                "Warning: training devices overlap with LLM devices: "
-                f"{sorted(overlap)}."
-            )
-
-    use_multi_gpu = use_cuda and len(train_device_ids) > 1
-
-    def _build_max_memory(device_ids: list[int]) -> dict[int, str]:
-        max_memory = {}
-        for did in device_ids:
-            props = torch.cuda.get_device_properties(did)
-            total_gib = int(props.total_memory / (1024**3) * 0.9)
-            total_gib = max(total_gib, 1)
-            max_memory[did] = f"{total_gib}GiB"
-        return max_memory
+    device = _init_distributed(local_rank)
+    rank, world_size = _get_rank_world_size()
+    use_cuda = device.type == "cuda"
+    if use_cuda and local_rank < 0 and world_size > 1:
+        local_rank = rank
+        torch.cuda.set_device(local_rank)
+        device = torch.device(f"cuda:{local_rank}")
 
     llm_device_map = None
     llm_max_memory = None
-    llm_primary_device = None
-    if use_cuda and llm_device_ids:
-        llm_primary_device = torch.device(f"cuda:{llm_device_ids[0]}")
-        if len(llm_device_ids) > 1:
-            llm_device_map = "auto"
-            llm_max_memory = _build_max_memory(llm_device_ids)
-    else:
-        llm_primary_device = torch.device("cpu")
+    llm_primary_device = device
 
     # 加载时间序列提示词样本（用于生成动作）
     dataset = TrafficPromptSeriesDataset(
@@ -614,6 +581,14 @@ def main() -> None:
         )
     )
     train_indices, test_indices = _split_indices(len(dataset), 0.3, args.seed)
+    train_indices = _shard_indices(train_indices, rank, world_size)
+    if dist.is_initialized():
+        local_len = torch.tensor(len(train_indices), device=device)
+        dist.all_reduce(local_len, op=dist.ReduceOp.MIN)
+        min_len = int(local_len.item())
+        train_indices = train_indices[:min_len]
+        if min_len == 0:
+            raise RuntimeError("No training samples left after DDP sharding.")
     print(
         "数据集拆分完成：训练样本数={}，测试样本数={}（20%测试集）。".format(
             len(train_indices), len(test_indices)
@@ -681,31 +656,28 @@ def main() -> None:
     critic = ImageCritic(in_ch=3, hidden=128).to(loss_device)
     critic.train()
 
+    # 价值函数系数（常用 0.5）
+    vf_coef = getattr(args, "vf_coef", 0.5)
+    if ts_adapter.learnable_image_module is None:
+        raise RuntimeError("TimeSeriesImageAdapter learnable_image_module is not initialized.")
+    if dist.is_initialized():
+        ddp_device_ids = [device.index] if device.type == "cuda" else None
+        ts_adapter.learnable_image_module = DDP(
+            ts_adapter.learnable_image_module,
+            device_ids=ddp_device_ids,
+            output_device=device.index if device.type == "cuda" else None,
+        )
+        critic = DDP(
+            critic,
+            device_ids=ddp_device_ids,
+            output_device=device.index if device.type == "cuda" else None,
+        )
+
     # 如果你原来 optimizer 只优化 adapter，这里把 critic 参数也加进去
     optimizer = torch.optim.Adam(
         list(ts_adapter.learnable_image_module.parameters()) + list(critic.parameters()),
         lr=args.learning_rate
     )
-
-    # 价值函数系数（常用 0.5）
-    vf_coef = getattr(args, "vf_coef", 0.5)
-    if ts_adapter.learnable_image_module is None:
-        raise RuntimeError("TimeSeriesImageAdapter learnable_image_module is not initialized.")
-    if use_multi_gpu:
-        device_ids = list(train_device_ids)
-        if primary_device_id in device_ids:
-            device_ids.remove(primary_device_id)
-            device_ids.insert(0, primary_device_id)
-        ts_adapter.learnable_image_module = torch.nn.DataParallel(
-            ts_adapter.learnable_image_module,
-            device_ids=device_ids,
-            output_device=device_ids[0],
-        )
-        if _is_rank0():
-            print(f"Using DataParallel on GPUs {device_ids} for learnable image adapter.")
-    elif use_cuda:
-        if _is_rank0():
-            print(f"Training device set to cuda:{primary_device_id}.")
 
     # 初始化 LLM 策略（负责生成动作）
     policy = GemmaVLPolicy(
@@ -740,23 +712,21 @@ def main() -> None:
 
     cache_dir = os.path.join("records", "projection_train", "sampling_cache")
     cache_key = os.path.basename(args.jsonl_path)
-    cache_path = os.path.join(cache_dir, f"{cache_key}.pt")
-    if _is_rank0():
-        os.makedirs(cache_dir, exist_ok=True)
+    cache_path = os.path.join(cache_dir, f"{cache_key}_rank{rank}.pt")
+    os.makedirs(cache_dir, exist_ok=True)
     _barrier()
 
     log_lines = []
     log_dir = os.path.join("records", "projection_train", "model")
-    if _is_rank0():
-        os.makedirs(log_dir, exist_ok=True)
+    os.makedirs(log_dir, exist_ok=True)
     log_date = time.strftime("%Y%m%d_%H%M%S", time.localtime())
-    log_path = os.path.join(log_dir, f"projection_ppo_{log_date}.txt")
-    if _is_rank0():
-        log_lines.append(
-            "数据集拆分：训练样本数={}，测试样本数={}（20%测试集）。".format(
-                len(train_indices), len(test_indices)
-            )
+    log_path = os.path.join(log_dir, f"projection_ppo_{log_date}_rank{rank}.txt")
+    log_lines.append(f"DDP rank={rank}, world_size={world_size}, device={device}.")
+    log_lines.append(
+        "数据集拆分：训练样本数={}，测试样本数={}（20%测试集）。".format(
+            len(train_indices), len(test_indices)
         )
+    )
 
     model_path = _resolve_model_path(args.ppo_model_path, args.jsonl_path)
     if args.ppo_model_path and model_path is None:
@@ -766,26 +736,23 @@ def main() -> None:
         if _is_rank0():
             print(f"检测到 ppo_model_path，跳过训练，加载模型进行测试：{model_path}")
             log_lines.append(f"Skip training. Load model: {model_path}")
-        module = ts_adapter.learnable_image_module
-        state_dict = torch.load(model_path, map_location=device)
-        if isinstance(module, torch.nn.DataParallel):
-            module.module.load_state_dict(state_dict, strict=True)
-        else:
-            module.load_state_dict(state_dict, strict=True)
-        test_result = evaluate_policy(
-            dataset=dataset,
-            indices=test_indices,
-            ts_adapter=ts_adapter,
-            policy=policy,
-            device=device,
-            eng=eng,
-            intersection_ids=intersection_ids,
-            intersection_id_to_index=intersection_id_to_index,
-            intersections_count=intersections_count,
-            generation_kwargs=generation_kwargs,
-            log_interval=args.log_interval,
-        )
         if _is_rank0():
+            module = ts_adapter.learnable_image_module
+            state_dict = torch.load(model_path, map_location=device)
+            _unwrap_module(module).load_state_dict(state_dict, strict=True)
+            test_result = evaluate_policy(
+                dataset=dataset,
+                indices=test_indices,
+                ts_adapter=ts_adapter,
+                policy=policy,
+                device=device,
+                eng=eng,
+                intersection_ids=intersection_ids,
+                intersection_id_to_index=intersection_id_to_index,
+                intersections_count=intersections_count,
+                generation_kwargs=generation_kwargs,
+                log_interval=args.log_interval,
+            )
             summary = (
                 f"[测试汇总] 样本数={test_result['num_samples']} | "
                 f"平均奖励(负等待)={test_result['avg_reward']:.4f} | "
@@ -793,9 +760,12 @@ def main() -> None:
             )
             print(summary)
             log_lines.append(summary)
-            with open(log_path, "w", encoding="utf-8") as handle:
-                handle.write("\n".join(log_lines))
-            print(f"[日志保存] 训练/测试日志已保存到：{log_path}")
+        _barrier()
+        with open(log_path, "w", encoding="utf-8") as handle:
+            handle.write("\n".join(log_lines))
+        print(f"[日志保存] 训练/测试日志已保存到：{log_path}")
+        if dist.is_initialized():
+            dist.destroy_process_group()
         return
     minibatch_idx=12
     for round_idx in range(args.num_rounds):
@@ -820,6 +790,8 @@ def main() -> None:
 
             total_samples = len(train_indices)
             collect_start = time.time()
+            ts_image_time = 0.0
+            llm_time = 0.0
 
             indices = list(train_indices)
             random.shuffle(indices)
@@ -839,21 +811,33 @@ def main() -> None:
                 # 将时间序列编码为图像输入
                 ts_tensor = torch.tensor(batch_seqs, dtype=torch.float32, device=device)
                 with torch.no_grad():
+                    _sync_if_cuda(device)
+                    ts_start = time.perf_counter()
                     images = ts_adapter.generate(ts_tensor)
+                    _sync_if_cuda(device)
+                    ts_image_time += time.perf_counter() - ts_start
              
                     # 用 LLM 策略生成动作（文本形式）
+                    _sync_if_cuda(device)
+                    llm_start = time.perf_counter()
                     batch_actions, _ = policy.generate_actions(
                         batch_prompts,
                         images,
                         generation_kwargs,
                     )
+                    _sync_if_cuda(device)
+                    llm_time += time.perf_counter() - llm_start
                     # 计算当前动作的对数概率（旧策略）
+                    _sync_if_cuda(device)
+                    llm_start = time.perf_counter()
                     batch_logprobs = (
                         policy.action_logprob(batch_prompts, images, batch_actions)
                         .detach()
                         .cpu()
                         .tolist()
                     )
+                    _sync_if_cuda(device)
+                    llm_time += time.perf_counter() - llm_start
 
                 for prompt, seq, action, logprob,  snapshot_path, intersection_id in zip(
                     batch_prompts,
@@ -903,34 +887,39 @@ def main() -> None:
                     ):
                         avg_reward_so_far = float(np.mean(rewards)) if rewards else 0.0
                         elapsed = time.time() - collect_start
+                        ts_avg = ts_image_time / max(1, sample_counter)
+                        llm_avg = llm_time / max(1, sample_counter)
                         print(
-                            "[采样进度] {}/{} | 即时奖励(负等待)={:.4f} | 平均奖励={:.4f} | 动作={} | 用时{:.1f}s".format(
+                            "[采样进度] {}/{} | 即时奖励(负等待)={:.4f} | 平均奖励={:.4f} | 动作={} | 用时{:.1f}s | ts_images累计{:.1f}s(均{:.3f}s/样本) | LLM累计{:.1f}s(均{:.3f}s/样本)".format(
                                 sample_counter,
                                 total_samples,
                                 reward,
                                 avg_reward_so_far,
                                 _shorten(action),
                                 elapsed,
+                                ts_image_time,
+                                ts_avg,
+                                llm_time,
+                                llm_avg,
                             )
                         )
 
             if round_idx == 0:
-                if _is_rank0():
-                    torch.save(
-                        {
-                            "prompts": prompts,
-                            "sequences": sequences,
-                            "actions": actions,
-                            "old_logprobs": old_logprobs,
-                            "rewards": rewards,
-                        },
-                        cache_path,
+                torch.save(
+                    {
+                        "prompts": prompts,
+                        "sequences": sequences,
+                        "actions": actions,
+                        "old_logprobs": old_logprobs,
+                        "rewards": rewards,
+                    },
+                    cache_path,
+                )
+                print(
+                    "[采样缓存] 已保存缓存结果：{} | 样本数={}".format(
+                        cache_path, len(prompts)
                     )
-                    print(
-                        "[采样缓存] 已保存缓存结果：{} | 样本数={}".format(
-                            cache_path, len(prompts)
-                        )
-                    )
+                )
                 _barrier()
         
 
@@ -1085,14 +1074,12 @@ def main() -> None:
 
         ckpt_dir = os.path.join(dic_path["PATH_TO_MODEL"], f"round_{round_idx}")
         os.makedirs(ckpt_dir, exist_ok=True)
-        if _is_rank0():
-            module = ts_adapter.learnable_image_module
-            state_dict = (
-                module.module.state_dict()
-                if isinstance(module, torch.nn.DataParallel)
-                else module.state_dict()
-            )
-            torch.save(state_dict, os.path.join(ckpt_dir, "ts_image_adapter.pt"))
+        module = ts_adapter.learnable_image_module
+        state_dict = _unwrap_module(module).state_dict()
+        torch.save(
+            state_dict,
+            os.path.join(ckpt_dir, f"ts_image_adapter_rank{rank}.pt"),
+        )
 
         # 输出本轮平均奖励
         avg_reward = float(np.mean(rewards)) if rewards else 0.0
@@ -1102,31 +1089,30 @@ def main() -> None:
                 round_idx + 1, avg_reward, avg_waiting, ckpt_dir
             )
         )
-        if _is_rank0():
-            log_lines.append(
-                "第 {} 轮完成：平均奖励(负等待)={:.4f}，估计平均等待时间={:.4f}。模型已保存到 {}。".format(
-                    round_idx + 1, avg_reward, avg_waiting, ckpt_dir
-                )
+        log_lines.append(
+            "第 {} 轮完成：平均奖励(负等待)={:.4f}，估计平均等待时间={:.4f}。模型已保存到 {}。".format(
+                round_idx + 1, avg_reward, avg_waiting, ckpt_dir
             )
+        )
     # 每个epoch打印
         print(f"ratio stats: mean={ratio.mean():.3f}, std={ratio.std():.3f}, "
             f"min={ratio.min():.3f}, max={ratio.max():.3f}")
         print(f"old_logprobs: mean={old_logprob_tensor.mean():.3f}")
         print(f"new_logprobs: mean={new_logprobs.mean():.3f}")
-    test_result = evaluate_policy(
-        dataset=dataset,
-        indices=test_indices,
-        ts_adapter=ts_adapter,
-        policy=policy,
-        device=device,
-        eng=eng,
-        intersection_ids=intersection_ids,
-        intersection_id_to_index=intersection_id_to_index,
-        intersections_count=intersections_count,
-        generation_kwargs=generation_kwargs,
-        log_interval=args.log_interval,
-    )
     if _is_rank0():
+        test_result = evaluate_policy(
+            dataset=dataset,
+            indices=test_indices,
+            ts_adapter=ts_adapter,
+            policy=policy,
+            device=device,
+            eng=eng,
+            intersection_ids=intersection_ids,
+            intersection_id_to_index=intersection_id_to_index,
+            intersections_count=intersections_count,
+            generation_kwargs=generation_kwargs,
+            log_interval=args.log_interval,
+        )
         summary = (
             f"[测试汇总] 样本数={test_result['num_samples']} | "
             f"平均奖励(负等待)={test_result['avg_reward']:.4f} | "
@@ -1134,9 +1120,11 @@ def main() -> None:
         )
         print(summary)
         log_lines.append(summary)
-        with open(log_path, "w", encoding="utf-8") as handle:
-            handle.write("\n".join(log_lines))
-        print(f"[日志保存] 训练/测试日志已保存到：{log_path}")
+    with open(log_path, "w", encoding="utf-8") as handle:
+        handle.write("\n".join(log_lines))
+    print(f"[日志保存] 训练/测试日志已保存到：{log_path}")
+    if dist.is_initialized():
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":
