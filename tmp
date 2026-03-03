@@ -851,7 +851,7 @@ def main() -> None:
                     
                     if snapshot_path:
                         eng.load_from_file(snapshot_path)
-                        print("SUCCESS load")
+                        # print("SUCCESS load")
                     target_index = intersection_id_to_index.get(intersection_id)
                     if target_index is None:
                         raise ValueError(
@@ -871,9 +871,9 @@ def main() -> None:
                   
                     # 奖励：负的平均等待时间（越小越好）
                     reward = -mean_waiting_time(eng, intersection_id)
-                    print(action, -reward)
+                    # print(action, -reward)
                     prompts.append(prompt)
-                    print("*********")
+                    # print("*********")
                     sequences.append(seq)
                     actions.append(action)
                     old_logprobs.append(logprob)

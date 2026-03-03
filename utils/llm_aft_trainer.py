@@ -235,6 +235,126 @@ def _shared_resolve_image_token(instance):
     return resolved
 
 
+def _clip_level(value: float, reference: float) -> str:
+    if value <= 0:
+        return "none"
+    if reference <= 0:
+        return "low"
+    ratio = value / reference
+    if ratio < 0.5:
+        return "low"
+    if ratio < 1.5:
+        return "moderate"
+    return "high"
+
+
+def _clip_trend_label(first_total: float, last_total: float) -> str:
+    delta = last_total - first_total
+    threshold = max(2.0, 0.2 * max(first_total, 1.0))
+    if delta >= threshold:
+        return "rising"
+    if delta <= -threshold:
+        return "declining"
+    return "steady"
+
+
+def _build_clip_caption(history: list[dict], movement_keys: list[str]) -> str:
+    if not history:
+        return ""
+    last = history[-1].get("movement_counts") or {}
+    first = history[0].get("movement_counts") or {}
+    keys = list(movement_keys or []) or list(last.keys())
+    if not keys:
+        return ""
+
+    counts = {}
+    for key in keys:
+        try:
+            counts[key] = int(last.get(key, 0) or 0)
+        except (TypeError, ValueError):
+            counts[key] = 0
+
+    total_last = sum(counts.values())
+    if total_last <= 0:
+        return "No vehicles observed in the latest window."
+
+    try:
+        total_first = sum(int(first.get(k, 0) or 0) for k in keys)
+    except (TypeError, ValueError):
+        total_first = 0
+
+    sorted_keys = sorted(keys, key=lambda k: counts.get(k, 0), reverse=True)
+    top_keys = [k for k in sorted_keys if counts.get(k, 0) > 0][:2]
+    if not top_keys:
+        top_keys = sorted_keys[:1]
+    top_phrase = " and ".join(f"{k}({counts.get(k, 0)})" for k in top_keys if k)
+    top_sum = sum(counts.get(k, 0) for k in top_keys)
+    top_share = top_sum / total_last if total_last > 0 else 0.0
+
+    through_keys = [k for k in keys if str(k).endswith("T")]
+    left_keys = [k for k in keys if str(k).endswith("L")]
+    overall_avg = total_last / max(len(keys), 1)
+    through_avg = (
+        sum(counts.get(k, 0) for k in through_keys) / max(len(through_keys), 1)
+        if through_keys
+        else 0.0
+    )
+    left_avg = (
+        sum(counts.get(k, 0) for k in left_keys) / max(len(left_keys), 1)
+        if left_keys
+        else 0.0
+    )
+    through_level = _clip_level(through_avg, overall_avg)
+    left_level = _clip_level(left_avg, overall_avg)
+    trend = _clip_trend_label(total_first, total_last)
+
+    ew_sum = sum(counts.get(k, 0) for k in keys if str(k).startswith(("E", "W")))
+    ns_sum = sum(counts.get(k, 0) for k in keys if str(k).startswith(("N", "S")))
+    ew_share = ew_sum / total_last if total_last > 0 else 0.0
+    ns_share = ns_sum / total_last if total_last > 0 else 0.0
+    if abs(ew_share - ns_share) < 0.1:
+        dominance = "balanced"
+    else:
+        dominance = "east-west dominant" if ew_share > ns_share else "north-south dominant"
+
+    return (
+        f"Highest demand on {top_phrase}, top-2 share {top_share:.0%}. "
+        f"Through lanes {through_level}, left-turn lanes {left_level}; overall demand {trend}. "
+        f"East-West share {ew_share:.0%}, North-South share {ns_share:.0%} ({dominance})."
+    )
+
+
+def _build_clip_meta(
+    movement_keys: list[str],
+    ts_feature_mode: str,
+    ts_image_seq_len: int,
+    interval_s: int,
+    window_s: int,
+    image_size: int,
+    periodicity: int,
+    norm_const: float,
+    three_channel: bool,
+    learnable: bool,
+    caption_style: str = "clip_caption_v2",
+) -> dict:
+    return {
+        "schema": "clip_v1",
+        "movement_keys": list(movement_keys or []),
+        "ts_feature_mode": str(ts_feature_mode or ""),
+        "ts_image": {
+            "seq_len": int(ts_image_seq_len or 0),
+            "interval_s": int(interval_s or 0),
+            "window_s": int(window_s or 0),
+            "size": int(image_size or 0),
+            "periodicity": int(periodicity or 0),
+            "norm_const": float(norm_const or 0.0),
+            "three_channel": bool(three_channel),
+            "learnable": bool(learnable),
+        },
+        "caption_style": str(caption_style or "clip_caption_v1"),
+    }
+
+
 def _shared_maybe_take_snapshot(instance, current_time_s):
     import os
     import uuid
@@ -372,6 +492,27 @@ class LLM_Inference_VLLM:
         self._traffic_series_movement_keys = None
         self._traffic_series_last_written_bin = -1
         self._traffic_series_base_dt = None
+        self.clip_caption_mode = str(self.dic_agent_conf.get("CLIP_CAPTION_MODE", "traffic_summary")).strip().lower()
+        self.clip_caption_language = str(self.dic_agent_conf.get("CLIP_CAPTION_LANGUAGE", "en")).strip().lower()
+        self.clip_caption_prompt = str(self.dic_agent_conf.get("CLIP_CAPTION_PROMPT", "")).strip()
+        try:
+            self.clip_caption_max_tokens = int(self.dic_agent_conf.get("CLIP_CAPTION_MAX_TOKENS", 64) or 64)
+        except (TypeError, ValueError):
+            self.clip_caption_max_tokens = 64
+        try:
+            self.clip_caption_temperature = float(
+                self.dic_agent_conf.get("CLIP_CAPTION_TEMPERATURE", 0.2) or 0.2
+            )
+        except (TypeError, ValueError):
+            self.clip_caption_temperature = 0.2
+        try:
+            self.clip_caption_top_p = float(self.dic_agent_conf.get("CLIP_CAPTION_TOP_P", 0.9) or 0.9)
+        except (TypeError, ValueError):
+            self.clip_caption_top_p = 0.9
+        try:
+            self.clip_caption_batch_size = int(self.dic_agent_conf.get("CLIP_CAPTION_BATCH_SIZE", 8) or 8)
+        except (TypeError, ValueError):
+            self.clip_caption_batch_size = 8
  
         if not os.path.exists("./fails"):
             os.mkdir("./fails")
@@ -791,7 +932,94 @@ class LLM_Inference_VLLM:
             history.append({"date": date_str, "movement_counts": movement_counts})
         return history
 
-    def _record_traffic_prompt_series(self, current_time_s, prompts):
+    def _clip_caption_instruction(self):
+        if self.clip_caption_prompt:
+            return self.clip_caption_prompt
+        lang = self.clip_caption_language or "en"
+        language = "English"
+        if lang not in ("en", "eng", "english"):
+            language = lang
+        return (
+            "Rewrite the following traffic-control prompt into a concise visual description of the scene, "
+            "as if captioning a single image. Focus on vehicles, directions, queues, and flow. "
+            f"Write in {language}. Output one sentence with no quotes."
+        )
+
+    def _clean_clip_caption(self, text):
+        if text is None:
+            return ""
+        text = str(text).strip()
+        if not text:
+            return ""
+        text = text.splitlines()[0].strip()
+        for prefix in ("caption:", "description:", "answer:", "output:", "response:"):
+            if text.lower().startswith(prefix):
+                text = text[len(prefix):].strip()
+                break
+        return " ".join(text.split())
+
+    def _build_clip_caption_from_prompts(self, prompts):
+        if not prompts:
+            return []
+        if self.llm_model is None:
+            return ["" for _ in prompts]
+
+        instruction = self._clip_caption_instruction()
+        caption_prompts = [f"{instruction}\n\nPrompt:\n{prompt}\n\nCaption:" for prompt in prompts]
+
+        try:
+            if getattr(self, "qwen", False):
+                inputs = self.tokenizer(
+                    caption_prompts,
+                    return_tensors="pt",
+                    padding=True,
+                    truncation=True,
+                    max_length=2048,
+                )
+                inputs = {k: v.to(self.llm_model.device) for k, v in inputs.items()}
+                gen_kwargs = {
+                    "max_new_tokens": self.clip_caption_max_tokens,
+                    "temperature": self.clip_caption_temperature,
+                    "top_p": self.clip_caption_top_p,
+                    "do_sample": True,
+                    "pad_token_id": getattr(self.tokenizer, "pad_token_id", None),
+                    "eos_token_id": getattr(self.tokenizer, "eos_token_id", None),
+                }
+                with torch.no_grad():
+                    output_ids = self.llm_model.generate(**inputs, **gen_kwargs)
+                decoded = self.tokenizer.batch_decode(output_ids, skip_special_tokens=True)
+                captions = []
+                for prompt, text in zip(caption_prompts, decoded):
+                    if text.startswith(prompt):
+                        text = text[len(prompt):]
+                    captions.append(self._clean_clip_caption(text))
+                return captions
+
+            sampling_params = SamplingParams(
+                temperature=self.clip_caption_temperature,
+                top_p=self.clip_caption_top_p,
+                max_tokens=self.clip_caption_max_tokens,
+            )
+            captions = []
+            batch_size = max(1, int(self.clip_caption_batch_size or 1))
+            for start in range(0, len(caption_prompts), batch_size):
+                batch = caption_prompts[start:start + batch_size]
+                outputs = self.llm_model.generate(prompts=batch, sampling_params=sampling_params)
+                for out in outputs:
+                    text = out.outputs[0].text if out.outputs else ""
+                    captions.append(self._clean_clip_caption(text))
+            return captions
+        except Exception as exc:
+            print(f"Clip caption generation failed: {exc}")
+            return ["" for _ in prompts]
+
+    def _record_traffic_prompt_series(
+        self,
+        current_time_s,
+        prompts,
+        expert_actions=None,
+        snapshot_paths=None,
+    ):
         if not prompts:
             return
         self._load_traffic_series()
@@ -803,10 +1031,48 @@ class LLM_Inference_VLLM:
         current_bin = int(current_time_s) // interval
         if current_bin <= self._traffic_series_last_written_bin:
             return
+
+        if isinstance(snapshot_paths, str):
+            snapshot_paths = [snapshot_paths] * len(prompts)
+        if snapshot_paths is None:
+            snapshot_paths = ["" for _ in range(len(prompts))]
+        if expert_actions is None:
+            expert_actions = ["" for _ in range(len(prompts))]
+
+        _, output_keys = self._resolve_series_movement_keys()
+        meta_payload = _build_clip_meta(
+            movement_keys=output_keys,
+            ts_feature_mode=self.ts_feature_mode,
+            ts_image_seq_len=self.ts_image_seq_len,
+            interval_s=interval,
+            window_s=self.traffic_series_window_s,
+            image_size=self.ts_image_size,
+            periodicity=self.ts_image_periodicity,
+            norm_const=self.ts_image_norm_const,
+            three_channel=self.ts_image_three_channel,
+            learnable=self.ts_image_learnable,
+        )
+
+        prompt_captions = None
+        
+        prompt_captions = self._build_clip_caption_from_prompts(prompts)
+
         records = []
         for idx, prompt in enumerate(prompts):
             intersection_id = self.env.list_intersection[idx].inter_name
             history = self._build_traffic_series_history(intersection_id, current_time_s)
+            clip_caption = ""
+            if prompt_captions is not None:
+                if idx < len(prompt_captions):
+                    clip_caption = str(prompt_captions[idx] or "")
+            if not clip_caption:
+                clip_caption = _build_clip_caption(history, output_keys)
+            expert_action = (
+                expert_actions[idx] if idx < len(expert_actions) and expert_actions[idx] is not None else ""
+            )
+            snapshot_path = (
+                snapshot_paths[idx] if idx < len(snapshot_paths) and snapshot_paths[idx] is not None else ""
+            )
             for hist_idx, entry in enumerate(history):
                 record = {
                     "date": entry.get("date"),
@@ -815,6 +1081,11 @@ class LLM_Inference_VLLM:
                     "movement_counts": entry.get("movement_counts", {}),
                     "prompt": prompt if hist_idx == len(history) - 1 else "",
                 }
+                if hist_idx == len(history) - 1:
+                    record["clip_caption"] = clip_caption
+                    record["expert_action"] = str(expert_action or "")
+                    record["snapshot_path"] = str(snapshot_path or "")
+                    record["meta"] = meta_payload
                 records.append(record)
         _append_jsonl_records(self._traffic_series_output_path, records)
         self._traffic_series_last_written_bin = current_bin
@@ -877,6 +1148,7 @@ class LLM_Inference_VLLM:
 
             prompts = []
             ts_images = []
+            snapshot_paths = []
 
             snapshot_path = _shared_maybe_take_snapshot(self, current_time)
 
@@ -931,10 +1203,8 @@ class LLM_Inference_VLLM:
 
                 prompt = getPrompt(state2text(s))
                 prompt = prompt[0]['content'] + "\n\n### Instruction:\n" + prompt[1]['content'] + "\n\n### Response:\n"
-                prompt += f"\n\nsnapshot_path: {snapshot_path or ''}"
                 prompts.append(prompt)
-
-            self._record_traffic_prompt_series(current_time, prompts)
+                snapshot_paths.append(snapshot_path or "")
 
             inputs_text = [
                     self.tokenizer.apply_chat_template(
@@ -978,14 +1248,17 @@ class LLM_Inference_VLLM:
 
             fail_num = 0
             vehicle_nums = self.get_vehicle_num(current_states)
+            expert_actions = []
             for i, res in enumerate(responses):
-                res = res[len(prompts[i]):]
                 signal_answer_pattern = r'<signal>(.*?)</signal>'
                 signals = re.findall(signal_answer_pattern, res)
-                signal_text = signals[-1] if len(signals) > 0 else "ETWT"
+                raw_signal = signals[-1] if len(signals) > 0 else ""
+                is_valid = raw_signal in four_phase_list
+                signal_text = raw_signal if is_valid else "ERROR"
+                expert_actions.append(signal_text)
                 action_list.append(action2code(signal_text) if signal_text in four_phase_list else 0)
-                if len(signals) == 0 or signal_text not in four_phase_list:
-                    signal_text = "ETWT"
+                if len(signals) == 0 or not is_valid:
+                    signal_text = "ERROR"
                     if vehicle_nums[i] != 0:
                         self.fail_logs.append({"state": current_states[i], "response": res})
                         dump_json(self.fail_logs, self.fail_log_file)
@@ -993,6 +1266,13 @@ class LLM_Inference_VLLM:
 
                 state_action_log[i][-1]["response"] = res
                 state_action_log[i][-1]["action"] = eight_phase_list[action_list[i]]
+
+            self._record_traffic_prompt_series(
+                current_time,
+                prompts,
+                expert_actions=expert_actions,
+                snapshot_paths=snapshot_paths,
+            )
 
             next_state, _, done, _ = self.env.step(action_list)
             rewards = self.get_norm_reward(next_state)  # my reward
@@ -1431,7 +1711,13 @@ class LLM_Inference:
             history.append({"date": date_str, "movement_counts": movement_counts})
         return history
 
-    def _record_traffic_prompt_series(self, current_time_s, prompts):
+    def _record_traffic_prompt_series(
+        self,
+        current_time_s,
+        prompts,
+        expert_actions=None,
+        snapshot_paths=None,
+    ):
         if not prompts:
             return
         self._load_traffic_series()
@@ -1443,10 +1729,39 @@ class LLM_Inference:
         current_bin = int(current_time_s) // interval
         if current_bin <= self._traffic_series_last_written_bin:
             return
+
+        if isinstance(snapshot_paths, str):
+            snapshot_paths = [snapshot_paths] * len(prompts)
+        if snapshot_paths is None:
+            snapshot_paths = ["" for _ in range(len(prompts))]
+        if expert_actions is None:
+            expert_actions = ["" for _ in range(len(prompts))]
+
+        _, output_keys = self._resolve_series_movement_keys()
+        meta_payload = _build_clip_meta(
+            movement_keys=output_keys,
+            ts_feature_mode=self.ts_feature_mode,
+            ts_image_seq_len=self.ts_image_seq_len,
+            interval_s=interval,
+            window_s=self.traffic_series_window_s,
+            image_size=self.ts_image_size,
+            periodicity=self.ts_image_periodicity,
+            norm_const=self.ts_image_norm_const,
+            three_channel=self.ts_image_three_channel,
+            learnable=self.ts_image_learnable,
+        )
+
         records = []
         for idx, prompt in enumerate(prompts):
             intersection_id = self.env.list_intersection[idx].inter_name
             history = self._build_traffic_series_history(intersection_id, current_time_s)
+            clip_caption = _build_clip_caption(history, output_keys)
+            expert_action = (
+                expert_actions[idx] if idx < len(expert_actions) and expert_actions[idx] is not None else ""
+            )
+            snapshot_path = (
+                snapshot_paths[idx] if idx < len(snapshot_paths) and snapshot_paths[idx] is not None else ""
+            )
             for hist_idx, entry in enumerate(history):
                 record = {
                     "date": entry.get("date"),
@@ -1455,6 +1770,11 @@ class LLM_Inference:
                     "movement_counts": entry.get("movement_counts", {}),
                     "prompt": prompt if hist_idx == len(history) - 1 else "",
                 }
+                if hist_idx == len(history) - 1:
+                    record["clip_caption"] = clip_caption
+                    record["expert_action"] = str(expert_action or "")
+                    record["snapshot_path"] = str(snapshot_path or "")
+                    record["meta"] = meta_payload
                 records.append(record)
         _append_jsonl_records(self._traffic_series_output_path, records)
         self._traffic_series_last_written_bin = current_bin
@@ -1708,6 +2028,7 @@ class LLM_Inference:
                 current_states.append(statistic_state)
 
             prompts = []
+            snapshot_paths = []
             # ts_images = []
 
            
@@ -1764,10 +2085,8 @@ class LLM_Inference:
 
                 prompt = getPrompt(state2text(s))
                 prompt = prompt[0]["content"] + "\n\n### Instruction:\n" + prompt[1]["content"] + "\n\n### Response:\n"
-                prompt += f"\n\nsnapshot_path: {snapshot_path or ''}"
                 prompts.append(prompt)
-
-            self._record_traffic_prompt_series(current_time, prompts)
+                snapshot_paths.append(snapshot_path or "")
 
             if hasattr(self, "qwen") and self.qwen is not None and self.qwen is True:
                 inputs_text = [
@@ -1810,16 +2129,20 @@ class LLM_Inference:
             fail_num = 0
             vehicle_nums = self.get_vehicle_num(current_states)
             critic_actions = []
+            expert_actions = []
 
             for i, res in enumerate(responses):
                 res = res[len(prompts[i]) :]
                 signal_answer_pattern = r"<signal>(.*?)</signal>"
                 signals = re.findall(signal_answer_pattern, res)
-                signal_text = signals[-1] if len(signals) > 0 else "ETWT"
+                raw_signal = signals[-1] if len(signals) > 0 else ""
+                is_valid = raw_signal in four_phase_list
+                signal_text = raw_signal if is_valid else "ETWT"
+                expert_actions.append(signal_text)
 
                 action_list.append(action2code(signal_text) if signal_text in four_phase_list else 0)
 
-                if len(signals) == 0 or signal_text not in four_phase_list:
+                if len(signals) == 0 or not is_valid:
                     signal_text = "ETWT"
                     if vehicle_nums[i] != 0:
                         self.fail_logs.append({"state": current_states[i], "response": res})
@@ -1828,6 +2151,13 @@ class LLM_Inference:
 
                 state_action_log[i][-1]["response"] = res
                 state_action_log[i][-1]["action"] = eight_phase_list[action_list[i]]
+
+            self._record_traffic_prompt_series(
+                current_time,
+                prompts,
+                expert_actions=expert_actions,
+                snapshot_paths=snapshot_paths,
+            )
 
             next_state, _, done, _ = self.env.step(action_list)
             rewards = self.get_norm_reward(next_state)  # my reward
