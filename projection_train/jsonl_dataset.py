@@ -61,6 +61,15 @@ class TrafficPromptSeriesDataset:
                     # 解析单行 json
                     record = json.loads(line)
 
+                    raw_intersection_id = record.get("intersection_id")
+                    if raw_intersection_id is None:
+                        raw_intersection_id = record.get("road_id")
+                    intersection_id = "" if raw_intersection_id is None else str(raw_intersection_id)
+                    if self.intersection_id and intersection_id and intersection_id != self.intersection_id:
+                        # 过滤到其他路口时，丢弃当前累计历史，避免跨路口拼接序列。
+                        group_history = []
+                        continue
+
                     # 取出当前时刻的各方向流量计数
                     movement_counts = record.get("movement_counts") or {}
                     # 将当前计数加入组内历史（时间序列）
@@ -74,10 +83,6 @@ class TrafficPromptSeriesDataset:
                     # 收集样本（日期字段可为空）
                     lane_details = record.get("lane_details") or {}
                     snapshot_path = record.get("snapshot_path") or ""
-                    raw_intersection_id = record.get("intersection_id")
-                    if raw_intersection_id is None:
-                        raw_intersection_id = record.get("road_id")
-                    intersection_id = "" if raw_intersection_id is None else str(raw_intersection_id)
                     clip_caption = record.get("clip_caption") or ""
                     expert_action = record.get("expert_action") or ""
                     meta = record.get("meta") or {}

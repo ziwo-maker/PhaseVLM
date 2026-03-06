@@ -316,7 +316,7 @@ def main():
     parser.add_argument("--logit_scale_max", type=float, default=100.0)
     parser.add_argument("--batch_size", type=int, default=16, help="per-GPU batch size")
     parser.add_argument("--lr", type=float, default=1e-4)
-    parser.add_argument("--warmup_ratio", type=float, default=0.05)
+    parser.add_argument("--warmup_ratio", type=float, default=0.5)
     parser.add_argument("--min_lr", type=float, default=0.0)
     parser.add_argument(
         "--lr_schedule",

@@ -958,15 +958,85 @@ class LLM_Inference_VLLM:
                 break
         return " ".join(text.split())
 
-    def _build_clip_caption_from_prompts(self, prompts):
-        if not prompts:
+    def _clip_caption_instruction_series(self):
+        if self.clip_caption_prompt:
+            return self.clip_caption_prompt
+        lang = self.clip_caption_language or "en"
+        language = "English"
+        if lang not in ("en", "eng", "english"):
+            language = lang
+        return (
+            "Convert the following structured traffic time-series summary into a concise visual description "
+            "of the scene, as if captioning a single image. Focus on vehicle volume, dominant directions, "
+            "queues, and flow. Do not mention data, time series, or charts. "
+            f"Write in {language}. Output one sentence with no quotes."
+        )
+
+    def _summarize_history_for_caption(self, history, movement_keys, interval_s, window_s):
+        if not history:
+            return "No observations."
+        keys = list(movement_keys or [])
+        if not keys:
+            keys = list((history[-1].get("movement_counts") or {}).keys())
+        if not keys:
+            return "No movements."
+
+        per_bin_totals = []
+        window_counts = {k: 0 for k in keys}
+        for entry in history:
+            counts = entry.get("movement_counts") or {}
+            total = 0
+            for k in keys:
+                try:
+                    value = int(counts.get(k, 0) or 0)
+                except (TypeError, ValueError):
+                    value = 0
+                window_counts[k] += value
+                total += value
+            per_bin_totals.append(total)
+
+        total_sum = sum(per_bin_totals)
+        avg_total = total_sum / max(len(per_bin_totals), 1)
+        first_total = per_bin_totals[0] if per_bin_totals else 0
+        last_total = per_bin_totals[-1] if per_bin_totals else 0
+        trend = _clip_trend_label(first_total, last_total)
+        peak_idx = max(range(len(per_bin_totals)), key=lambda i: per_bin_totals[i]) if per_bin_totals else 0
+        peak_total = per_bin_totals[peak_idx] if per_bin_totals else 0
+        peak_time = history[peak_idx].get("date") if history else ""
+
+        sorted_keys = sorted(keys, key=lambda k: window_counts.get(k, 0), reverse=True)
+        top_keys = [k for k in sorted_keys if window_counts.get(k, 0) > 0][:3]
+        top_phrase = ", ".join(f"{k}({window_counts.get(k, 0)})" for k in top_keys) if top_keys else "none"
+
+        through_sum = sum(window_counts.get(k, 0) for k in keys if str(k).endswith("T"))
+        left_sum = sum(window_counts.get(k, 0) for k in keys if str(k).endswith("L"))
+        ew_sum = sum(window_counts.get(k, 0) for k in keys if str(k).startswith(("E", "W")))
+        ns_sum = sum(window_counts.get(k, 0) for k in keys if str(k).startswith(("N", "S")))
+        total_dir = max(ew_sum + ns_sum, 1)
+        ew_share = ew_sum / total_dir
+        ns_share = ns_sum / total_dir
+        if abs(ew_share - ns_share) < 0.1:
+            dominance = "balanced"
+        else:
+            dominance = "east-west dominant" if ew_share > ns_share else "north-south dominant"
+
+        start_time = history[0].get("date")
+        end_time = history[-1].get("date")
+        lines = [
+            f"Window: {start_time} to {end_time} (interval {int(interval_s)}s, span {int(window_s)}s).",
+            f"Total vehicles in window: {total_sum}, average per bin: {avg_total:.1f}, trend: {trend}.",
+            f"Peak bin: {peak_time} with {peak_total} vehicles.",
+            f"Top movements: {top_phrase}.",
+            f"Direction balance: EW {ew_share:.0%}, NS {ns_share:.0%} ({dominance}).",
+            f"Turn balance: through {through_sum}, left {left_sum}.",
+        ]
+        return "\n".join(lines)
+
+    def _generate_clip_captions(self, caption_prompts):
+        if not caption_prompts:
             return []
         if self.llm_model is None:
-            return ["" for _ in prompts]
-
-        instruction = self._clip_caption_instruction()
-        caption_prompts = [f"{instruction}\n\nPrompt:\n{prompt}\n\nCaption:" for prompt in prompts]
-
+            return ["" for _ in caption_prompts]
         try:
             if getattr(self, "qwen", False):
                 inputs = self.tokenizer(
@@ -1011,7 +1081,24 @@ class LLM_Inference_VLLM:
             return captions
         except Exception as exc:
             print(f"Clip caption generation failed: {exc}")
-            return ["" for _ in prompts]
+            return ["" for _ in caption_prompts]
+
+    def _build_clip_caption_from_prompts(self, prompts):
+        if not prompts:
+            return []
+        instruction = self._clip_caption_instruction()
+        caption_prompts = [f"{instruction}\n\nPrompt:\n{prompt}\n\nCaption:" for prompt in prompts]
+        return self._generate_clip_captions(caption_prompts)
+
+    def _build_clip_caption_from_history(self, histories, movement_keys, interval_s, window_s):
+        if not histories:
+            return []
+        instruction = self._clip_caption_instruction_series()
+        caption_prompts = []
+        for history in histories:
+            summary = self._summarize_history_for_caption(history, movement_keys, interval_s, window_s)
+            caption_prompts.append(f"{instruction}\n\nTraffic summary:\n{summary}\n\nCaption:")
+        return self._generate_clip_captions(caption_prompts)
 
     def _record_traffic_prompt_series(
         self,
@@ -1053,18 +1140,25 @@ class LLM_Inference_VLLM:
             learnable=self.ts_image_learnable,
         )
 
-        prompt_captions = None
-        
-        prompt_captions = self._build_clip_caption_from_prompts(prompts)
+        histories = []
+        for idx in range(len(prompts)):
+            intersection_id = self.env.list_intersection[idx].inter_name
+            histories.append(self._build_traffic_series_history(intersection_id, current_time_s))
+
+        prompt_captions = self._build_clip_caption_from_history(
+            histories,
+            output_keys,
+            interval,
+            self.traffic_series_window_s,
+        )
 
         records = []
         for idx, prompt in enumerate(prompts):
             intersection_id = self.env.list_intersection[idx].inter_name
-            history = self._build_traffic_series_history(intersection_id, current_time_s)
+            history = histories[idx] if idx < len(histories) else []
             clip_caption = ""
-            if prompt_captions is not None:
-                if idx < len(prompt_captions):
-                    clip_caption = str(prompt_captions[idx] or "")
+            if prompt_captions is not None and idx < len(prompt_captions):
+                clip_caption = str(prompt_captions[idx] or "")
             if not clip_caption:
                 clip_caption = _build_clip_caption(history, output_keys)
             expert_action = (

@@ -1,0 +1,45 @@
+# Core runtime
+numpy==1.26.2
+pandas==1.5.0
+scipy
+torch
+torchvision
+transformers==4.45.0
+accelerate==0.27.2
+datasets==2.16.1
+peft==0.7.1
+trl
+tqdm
+einops
+pillow
+pytorch-wavelets
+PyWavelets
+matplotlib
+scikit-learn
+wandb
+requests
+sentencepiece
+protobuf<=3.20.3
+
+# Simulation / serving
+# cityflow
+fastapi
+uvicorn
+pydantic
+fire
+timm
+sympy
+mpmath
+
+# Optional heavy dependencies (uncomment if needed)
+# deepspeed
+# vllm
+# tensorflow
+# sktime
+# patool
+# statsmodels
+# arch
+# umap-learn
+# seaborn
+# sumolib
+# traci
