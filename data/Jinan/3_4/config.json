@@ -1,0 +1,8 @@
+{
+    "dir": "data/Jinan/3_4/",
+    "roadnetFile": "roadnet_3_4.json",
+    "flowFile": "flow_3_4.json",
+    "rlTrafficLight": true,
+    "interval": 1.0,
+    "seed": 0
+}
