@@ -36,6 +36,14 @@ except Exception:  # pragma: no cover - optional dependency
 from src.TimeVLM.ts_image_adapter import TimeSeriesImageAdapter
 
 
+def _normalize_pretrained_model_path(model_path: str) -> str:
+    text = str(model_path or "").strip()
+    if not text:
+        raise ValueError("model_path must not be empty.")
+    trimmed = text.rstrip("/\\")
+    return trimmed or text
+
+
 class TimeSeriesProjector(nn.Module):
     """Learnable time-series -> image adapter."""
 
@@ -107,6 +115,7 @@ class Qwen3VLBackbone(nn.Module):
         fsdp_sharding_strategy: str = "full_shard",
     ) -> None:
         super().__init__()
+        model_path = _normalize_pretrained_model_path(model_path)
         self.device = device or (torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu"))
         self.max_length = int(max_length)
         self.processor = AutoProcessor.from_pretrained(model_path, trust_remote_code=True)

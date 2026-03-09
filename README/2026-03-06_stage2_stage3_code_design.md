@@ -61,87 +61,6 @@ LLM 本体和 vision tower 冻结。
 
 这样 Stage 2 / 3 的 adapter 语义才和 alignment checkpoint 保持一致。
 
-### 4. Stage 3 先做单步在线 PPO
-
-现有数据更像“单状态决策样本”，而不是长轨迹 rollout。
-
-所以当前 Stage 3 先实现为单步 contextual bandit 形式的 PPO：
-
-- 每个样本对应一个 `snapshot_path`
-- 策略在该状态下采样一个相位
-- 用恢复后的 CityFlow 做短时仿真
-- 根据等待时间计算 reward
-
-这比强行拼长轨迹 PPO 更贴近当前数据结构，也更适合先在单卡 A800 上跑稳。
-
-## 新模块拆分
-
-### 1. `projection_train/action_space.py`
-
-职责：
-
-- 统一 4 个动作：
-  - `ETWT`
-  - `NTST`
-  - `ELWL`
-  - `NLSL`
-- 提供动作和索引互转
-- 提供 `<signal>...</signal>` tag 格式化
-
-作用：
-
-- Stage 2 / Stage 3 不再各自维护动作映射
-
-### 2. `projection_train/grouped_dataset.py`
-
-职责：
-
-- 按 `16` 行聚合 jsonl
-- 输出：
-  - `sequence`
-  - `raw_prompt`
-  - `expert_action`
-  - `clip_caption`
-  - `intersection_id`
-  - `snapshot_path`
-  - `traffic_file`
-  - `meta`
-
-关键点：
-
-- `traffic_file` 直接从 `snapshot_path` 反推
-- 为 Stage 3 环境恢复准备底层交通流文件名
-
-### 3. `projection_train/prefix_action_policy.py`
-
-这是本次重写的核心。
-
-职责：
-
-- 封装统一策略前向
-- 接收 `(sequence, prompt)`
-- 输出 4 个动作的 logits
-- 同时支持：
-  - Stage 2 的监督交叉熵
-  - Stage 3 的 PPO logprob / entropy / value
-
-内部结构：
-
-1. `TimeSeriesProjector`
-   - 调用 `ts_image_adapter`
-2. `Qwen3VLBackbone`
-   - 冻结 vision tower 和 LLM
-3. `VisionPrefixProjector`
-   - 把 vision pooled feature 投影到 prefix token
-4. `value_head`
-   - 仅 Stage 3 打开
-
-这个模块还负责：
-
-- 统一 action tag token 化
-- 从 `align_ckpt` / `best.pt` 加载 adapter 和 vision projector
-- 兼容 `module.`、`image_module.` 等 checkpoint 前缀
-
 ### 4. `projection_train/snapshot_env.py`
 
 职责：
@@ -191,39 +110,6 @@ LLM 本体和 vision tower 冻结。
 
 之所以保留 `macro_f1`，是因为动作分布不均衡，单看 accuracy 不够。
 
-## Stage 3 思路
-
-入口：
-
-- `projection_train/train_projection_ppo_qwen3_vl.py`
-
-训练流程：
-
-1. 从 grouped dataset 读取样本
-2. 当前策略在该状态下给出动作分布
-3. 采样一个动作
-4. 用 `snapshot_path` 恢复仿真
-5. 对这个动作做短时仿真，得到 reward
-6. 用 PPO 更新同一策略模型
-
-当前形式是单步 PPO，不做长序列 GAE rollout。
-
-原因：
-
-- 每个样本天然就是“一个可恢复状态”
-- 当前数据不适合强拼多步轨迹
-- 先把 reward 信号和在线仿真打通更重要
-
-PPO 更新对象：
-
-- policy 分布：4 动作 categorical
-- value head：标量状态价值
-
-PPO loss 由三部分组成：
-
-- policy loss
-- value loss
-- entropy bonus
 
 ## 为什么 Stage 2 和 Stage 3 现在是同构的
 
@@ -298,7 +184,7 @@ PPO loss 由三部分组成：
 - `projection_train/prefix_action_policy.py`
 - `projection_train/snapshot_env.py`
 - `projection_train/train_projection_bc.py`
-- `projection_train/train_projection_ppo_qwen3_vl.py`
+
 
 ## 推荐阅读顺序
 
@@ -308,6 +194,6 @@ PPO loss 由三部分组成：
 2. `prefix_action_policy.py`
 3. `train_projection_bc.py`
 4. `snapshot_env.py`
-5. `train_projection_ppo_qwen3_vl.py`
+
 
 这样最容易先把数据流看明白，再看监督和 RL 两个入口如何共享同一策略前向。
