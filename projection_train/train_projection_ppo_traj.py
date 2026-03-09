@@ -10,6 +10,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 
 _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
@@ -27,6 +28,72 @@ def seed_everything(seed: int) -> None:
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
+
+
+def init_distributed() -> tuple[bool, int, int, torch.device]:
+    if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
+        rank = int(os.environ["RANK"])
+        world_size = int(os.environ["WORLD_SIZE"])
+        local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        backend = "nccl" if torch.cuda.is_available() else "gloo"
+        if not dist.is_initialized():
+            dist.init_process_group(backend=backend, init_method="env://")
+        device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
+        if torch.cuda.is_available():
+            torch.cuda.set_device(device)
+        return True, rank, world_size, device
+    device = resolve_device("auto")
+    return False, 0, 1, device
+
+
+def is_main_process() -> bool:
+    return (not dist.is_available()) or (not dist.is_initialized()) or dist.get_rank() == 0
+
+
+def barrier() -> None:
+    if dist.is_available() and dist.is_initialized():
+        dist.barrier()
+
+
+def resolve_rank_work_dir(base_dir: str, rank: int) -> str:
+    text = str(base_dir or "").strip()
+    if not text:
+        return text
+    return os.path.join(text, f"rank{rank}")
+
+
+def sync_gradients(parameters: Sequence[torch.nn.Parameter]) -> None:
+    if not (dist.is_available() and dist.is_initialized()):
+        return
+    world_size = dist.get_world_size()
+    if world_size <= 1:
+        return
+    for param in parameters:
+        if param.grad is None:
+            continue
+        dist.all_reduce(param.grad, op=dist.ReduceOp.SUM)
+        param.grad.div_(world_size)
+
+
+def sync_metrics(
+    metrics: Dict[str, float],
+    device: torch.device,
+    sum_keys: Optional[Sequence[str]] = None,
+) -> Dict[str, float]:
+    if not metrics or not (dist.is_available() and dist.is_initialized()):
+        return dict(metrics)
+    keys = list(metrics.keys())
+    values = torch.tensor([float(metrics[key]) for key in keys], device=device, dtype=torch.float64)
+    dist.all_reduce(values, op=dist.ReduceOp.SUM)
+    sum_key_set = set(sum_keys or [])
+    world_size = dist.get_world_size()
+    resolved: Dict[str, float] = {}
+    for idx, key in enumerate(keys):
+        item = float(values[idx].item())
+        if key not in sum_key_set:
+            item /= max(1, world_size)
+        resolved[key] = item
+    return resolved
 
 
 def _dataset_spec(dataset: str) -> tuple[int, str, str]:
@@ -74,6 +141,7 @@ def _safe_positive_int(value: Any, default: int) -> int:
     if resolved <= 0:
         return _safe_int(default, 0)
     return resolved
+
 
 def _default_cuda_device() -> torch.device:
     local_rank = os.environ.get("LOCAL_RANK")
@@ -309,11 +377,13 @@ def ppo_update(
             if scaler is not None:
                 scaler.scale(loss).backward()
                 scaler.unscale_(optimizer)
+                sync_gradients(policy.trainable_parameters())
                 torch.nn.utils.clip_grad_norm_(policy.trainable_parameters(), args.max_grad_norm)
                 scaler.step(optimizer)
                 scaler.update()
             else:
                 loss.backward()
+                sync_gradients(policy.trainable_parameters())
                 torch.nn.utils.clip_grad_norm_(policy.trainable_parameters(), args.max_grad_norm)
                 optimizer.step()
 
@@ -457,7 +527,14 @@ def main() -> None:
     runtime = resolve_runtime(args)
     runtime["value_hidden_dim"] = int(args.value_hidden_dim)
 
-    device = resolve_device(args.device)
+    ddp, rank, world_size, device = init_distributed()
+    if str(args.device or "").strip().lower() not in {"", "auto"}:
+        requested_device = resolve_device(args.device)
+        if requested_device.type != device.type or requested_device.index != device.index:
+            raise ValueError(
+                f"--device={args.device} conflicts with distributed device assignment {device}. "
+                "Use --device auto when launching with torchrun."
+            )
     amp_dtype = resolve_amp_dtype(args, device)
     model_dtype = amp_dtype or (torch.bfloat16 if device.type == "cuda" else torch.float32)
     if device.type == "cuda":
@@ -469,7 +546,7 @@ def main() -> None:
         except Exception:
             pass
 
-    seed_everything(args.seed)
+    seed_everything(args.seed + rank)
 
     reward_info = {
         "queue_length": float(args.queue_reward_coef),
@@ -494,7 +571,7 @@ def main() -> None:
     train_env = TrajectoryCityFlowEnv(
         roadnet_path=roadnet_path,
         traffic_root=traffic_root,
-        work_root=os.path.join(args.work_root, "train"),
+        work_root=os.path.join(resolve_rank_work_dir(args.work_root, rank), "train"),
         default_traffic_file=args.traffic_file,
         seq_len=runtime["seq_len"],
         movement_keys=["NT", "NL", "ST", "SL", "ET", "EL", "WT", "WL"],
@@ -510,7 +587,7 @@ def main() -> None:
     eval_env = TrajectoryCityFlowEnv(
         roadnet_path=roadnet_path,
         traffic_root=traffic_root,
-        work_root=os.path.join(args.work_root, "eval"),
+        work_root=os.path.join(resolve_rank_work_dir(args.work_root, rank), "eval"),
         default_traffic_file=args.eval_traffic_file or args.traffic_file,
         seq_len=runtime["seq_len"],
         movement_keys=["NT", "NL", "ST", "SL", "ET", "EL", "WT", "WL"],
@@ -535,20 +612,29 @@ def main() -> None:
         )
         if len(snapshot_dataset) == 0:
             raise RuntimeError("snapshot_jsonl was provided but no valid snapshot seeds were loaded.")
-        print(f"Loaded snapshot seeds: {len(snapshot_dataset)}")
+        if is_main_process():
+            print(f"Loaded snapshot seeds: {len(snapshot_dataset)}")
 
-    os.makedirs(args.output_dir, exist_ok=True)
+    if is_main_process():
+        os.makedirs(args.output_dir, exist_ok=True)
+    barrier()
     best_metric = float("-inf")
     eval_traffic_file = args.eval_traffic_file or args.traffic_file
-    rng = random.Random(args.seed)
+    rng = random.Random(args.seed + rank)
+
+    if is_main_process():
+        print(f"[init] device={device} world_size={world_size} ddp={ddp}")
 
     for update_idx in range(1, args.num_updates + 1):
-        use_snapshot = snapshot_dataset is not None and rng.random() < args.snapshot_reset_prob
-        if use_snapshot:
-            seed_sample = snapshot_dataset.sample(rng=rng, traffic_file=args.snapshot_traffic_file)
-            train_env.reset_from_snapshot(seed_sample)
-        else:
-            train_env.reset(args.traffic_file)
+        # Keep rolling forward inside the same episode and only reset when an
+        # episode finishes. Otherwise, full-reset PPO keeps oversampling t=0.
+        if train_env.env is None or train_env.done:
+            use_snapshot = snapshot_dataset is not None and rng.random() < args.snapshot_reset_prob
+            if use_snapshot:
+                seed_sample = snapshot_dataset.sample(rng=rng, traffic_file=args.snapshot_traffic_file)
+                train_env.reset_from_snapshot(seed_sample)
+            else:
+                train_env.reset(args.traffic_file)
 
         rollout_buffer, rollout_metrics = rollout_once(
             policy=policy,
@@ -570,16 +656,23 @@ def main() -> None:
             scaler=scaler if amp_dtype == torch.float16 else None,
         )
 
-        merged_metrics = {**rollout_metrics, **update_metrics}
-        print(
-            f"[update {update_idx}/{args.num_updates}] "
-            f"mode={train_env.last_reset_mode} reward={merged_metrics['rollout_reward']:.4f} "
-            f"queue={merged_metrics['rollout_avg_queue']:.4f} wait={merged_metrics['rollout_avg_waiting']:.4f} "
-            f"policy={merged_metrics['policy_loss']:.4f} value={merged_metrics['value_loss']:.4f} "
-            f"entropy={merged_metrics['entropy']:.4f} kl={merged_metrics['kl']:.4f}"
+        merged_metrics = sync_metrics(
+            {**rollout_metrics, **update_metrics},
+            device=device,
+            sum_keys=("rollout_steps", "rollout_transitions"),
         )
+        if is_main_process():
+            print(
+                f"[update {update_idx}/{args.num_updates}] "
+                f"reward={merged_metrics['rollout_reward']:.4f} "
+                f"queue={merged_metrics['rollout_avg_queue']:.4f} wait={merged_metrics['rollout_avg_waiting']:.4f} "
+                f"policy={merged_metrics['policy_loss']:.4f} value={merged_metrics['value_loss']:.4f} "
+                f"entropy={merged_metrics['entropy']:.4f} kl={merged_metrics['kl']:.4f} "
+                f"transitions={merged_metrics['rollout_transitions']:.0f}"
+            )
 
-        if update_idx % args.save_every == 0 or update_idx == args.num_updates:
+        should_save = (args.save_every > 0 and update_idx % args.save_every == 0) or update_idx == args.num_updates
+        if should_save and is_main_process():
             save_checkpoint(
                 output_dir=args.output_dir,
                 filename="last.pt",
@@ -589,8 +682,10 @@ def main() -> None:
                 args=args,
                 metrics=merged_metrics,
             )
+        barrier()
 
-        if update_idx % args.eval_every == 0 or update_idx == args.num_updates:
+        should_eval = (args.eval_every > 0 and update_idx % args.eval_every == 0) or update_idx == args.num_updates
+        if should_eval and is_main_process():
             eval_metrics = evaluate_full_episode(
                 policy=policy,
                 env=eval_env,
@@ -622,8 +717,13 @@ def main() -> None:
                     args=args,
                     metrics=merged_metrics,
                 )
+        barrier()
+
+    if ddp:
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":
     main()
+
 
