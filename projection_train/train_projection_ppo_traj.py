@@ -75,12 +75,27 @@ def _safe_positive_int(value: Any, default: int) -> int:
         return _safe_int(default, 0)
     return resolved
 
+def _default_cuda_device() -> torch.device:
+    local_rank = os.environ.get("LOCAL_RANK")
+    if local_rank is not None:
+        try:
+            return torch.device(f"cuda:{int(local_rank)}")
+        except ValueError:
+            pass
+    try:
+        return torch.device(f"cuda:{torch.cuda.current_device()}")
+    except Exception:
+        return torch.device("cuda:0")
+
 
 def resolve_device(device_text: str) -> torch.device:
     text = str(device_text or "").strip().lower()
     if not text or text == "auto":
-        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    return torch.device(text)
+        return _default_cuda_device() if torch.cuda.is_available() else torch.device("cpu")
+    device = torch.device(text)
+    if device.type == "cuda" and device.index is None:
+        return _default_cuda_device()
+    return device
 
 
 def resolve_amp_dtype(args: argparse.Namespace, device: torch.device) -> torch.dtype | None:
