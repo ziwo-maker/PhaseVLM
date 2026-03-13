@@ -335,12 +335,27 @@ class PrefixActionPolicy(nn.Module):
         return (chosen * mask).sum(dim=1)
 
     def get_action_logits_from_prepared(self, prepared_batch: Dict[str, Any]) -> torch.Tensor:
-        all_scores = []
-        for action_idx in range(len(ACTION_LIST)):
-            actions = [action_idx] * prepared_batch["prefix_tokens"].shape[0]
-            score = self.action_tag_logprob_from_prepared(prepared_batch, actions)
-            all_scores.append(score)
-        return torch.stack(all_scores, dim=-1)
+        batch_size = int(prepared_batch["prefix_tokens"].shape[0])
+        num_actions = len(ACTION_LIST)
+        if batch_size == 0:
+            return torch.empty((0, num_actions), device=self.device)
+
+        sample_indices = torch.arange(batch_size, device=self.device).repeat_interleave(num_actions)
+        expanded_batch = {
+            "prefix_tokens": prepared_batch["prefix_tokens"].index_select(0, sample_indices),
+            "prompt_embeds": prepared_batch["prompt_embeds"].index_select(0, sample_indices),
+            "prompt_lengths": [
+                prepared_batch["prompt_lengths"][int(idx)]
+                for idx in sample_indices.detach().cpu().tolist()
+            ],
+        }
+        expanded_actions = [
+            action_idx
+            for _sample_idx in range(batch_size)
+            for action_idx in range(num_actions)
+        ]
+        scores = self.action_tag_logprob_from_prepared(expanded_batch, expanded_actions)
+        return scores.view(batch_size, num_actions)
 
     def get_action_logits(
         self,

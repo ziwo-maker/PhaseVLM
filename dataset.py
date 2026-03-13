@@ -1,4 +1,5 @@
 import json
+import os
 import random
 from dataclasses import dataclass
 from typing import Dict, Iterable, List, Optional, Sequence, Union
@@ -15,8 +16,29 @@ class TrafficClipSample:
     caption: str
     intersection_id: str
     meta: Dict
+    date: str = ""
+    traffic_file: str = ""
+    source_path: str = ""
     image_path: str = ""
     npy_path: str = ""
+
+
+def infer_traffic_file_from_snapshot_path(snapshot_path: str) -> str:
+    if not snapshot_path:
+        return ""
+    recorded_dir = ""
+    try:
+        recorded_dir = os.path.basename(os.path.dirname(os.path.dirname(snapshot_path)))
+    except Exception:
+        recorded_dir = ""
+    if not recorded_dir:
+        return ""
+    parts = recorded_dir.split("_")
+    for end in range(len(parts), 0, -1):
+        candidate = "_".join(parts[:end])
+        if candidate.endswith(".json"):
+            return candidate
+    return ""
 
 
 class TrafficClipJsonlDataset(Dataset):
@@ -69,6 +91,7 @@ class TrafficClipJsonlDataset(Dataset):
                     seq = self._build_sequence(history)
                     intersection_id = str(record.get("intersection_id") or record.get("road_id") or "")
                     meta = record.get("meta") or {}
+                    date = str(record.get("date") or "")
                     image_path = str(record.get("image_path") or record.get("snapshot_path") or "")
                     npy_path = str(record.get("npy_path") or record.get("image_npy_path") or record.get("tensor_path") or "")
                     self.samples.append(
@@ -77,6 +100,9 @@ class TrafficClipJsonlDataset(Dataset):
                             caption=str(clip_caption),
                             intersection_id=intersection_id,
                             meta=meta,
+                            date=date,
+                            traffic_file=infer_traffic_file_from_snapshot_path(image_path),
+                            source_path=str(path),
                             image_path=image_path,
                             npy_path=npy_path,
                         )
@@ -118,6 +144,9 @@ class TrafficClipJsonlDataset(Dataset):
             "caption": sample.caption,
             "intersection_id": sample.intersection_id,
             "meta": sample.meta,
+            "date": sample.date,
+            "traffic_file": sample.traffic_file,
+            "source_path": sample.source_path,
             "image_path": sample.image_path,
             "npy_path": sample.npy_path,
         }
@@ -128,6 +157,9 @@ def traffic_clip_collate(batch):
     captions = [item["caption"] for item in batch]
     meta = [item.get("meta", {}) for item in batch]
     intersection_ids = [item.get("intersection_id", "") for item in batch]
+    dates = [item.get("date", "") for item in batch]
+    traffic_files = [item.get("traffic_file", "") for item in batch]
+    source_paths = [item.get("source_path", "") for item in batch]
     image_paths = [item.get("image_path", "") for item in batch]
     npy_paths = [item.get("npy_path", "") for item in batch]
     return {
@@ -135,6 +167,9 @@ def traffic_clip_collate(batch):
         "caption": captions,
         "meta": meta,
         "intersection_id": intersection_ids,
+        "date": dates,
+        "traffic_file": traffic_files,
+        "source_path": source_paths,
         "image_path": image_paths,
         "npy_path": npy_paths,
     }

@@ -2,6 +2,8 @@
 
 本文记录我为 `projection_train/train_projection_bc.py` 与相关组件接入 **FSDP / DeepSpeed ZeRO‑3** 的设计思路与改动点，便于后续回溯与二次调整。
 
+> 注：本文档主要保留 2026-03-01 的历史设计背景。当前工作树中的 `projection_train/train_projection_bc.py` 已经切回更轻的主线版本，命令行不再暴露 `--llm_fsdp` / `--deepspeed_config`；以本文后面的“当前工作树推荐命令”为准。
+
 ## 背景与目标
 
 BC 训练的 OOM 主要来自 **8B 模型权重常驻 + 反向传播激活保留**。即使冻结 LLM，梯度仍需穿过 LLM 以更新 `ts_projector`，导致显存压力高。目标是：
@@ -70,17 +72,38 @@ BC 训练的 OOM 主要来自 **8B 模型权重常驻 + 反向传播激活保留
 
 ---
 
-## 启动建议（简要）
+## 当前工作树推荐命令
 
-### FSDP
+当前版本 BC 训练默认具备下面这些行为，不需要额外传参打开：
 
-- 继续使用 `torchrun --nproc_per_node=2`
-- 追加 `--llm_fsdp on` 即可
+- train/val 采用按流量文件分组、按时间尾块留出的 blocked split
+- 默认启用类平衡损失
+- 数据中若存在 `candidate_action_waits`，默认走 `mixed` soft target
 
-### DeepSpeed
+推荐命令如下：
 
-- 使用 `--deepspeed_config configs/deepspeed_zero3_bf16.json`
-- 同时 `--llm_fsdp off`
+```bash
+torchrun --nproc_per_node=4 projection_train/train_projection_bc.py \
+  --data_path data/recorded/align_train.cleaned.jsonl \
+  --llm_path /home/data/model/qwen-vl-8B/ \
+  --align_ckpt records/align/align_epoch_60.pt \
+  --output_dir records/projection_bc \
+  --batch_size 1 \
+  --seq_len 16 \
+  --epochs 10 \
+  --max_length 128 \
+  --prompt_mode image_only_short \
+  --lr 1e-4 \
+  --grad_accum_steps 4 \
+  --bf16 \
+  --image_size 224 \
+  --prefix_tokens 16 \
+  --prefix_mode prefix \
+  --target_mode mixed \
+  --soft_target_alpha 0.5 \
+  --soft_label_temperature 2.0 \
+  --min_action_margin 0.5
+```
 
 ---
 

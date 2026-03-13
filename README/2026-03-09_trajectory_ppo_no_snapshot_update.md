@@ -253,7 +253,7 @@
 
 这是可选的 snapshot 种子索引文件。它不是 CityFlow 的流量文件，而是以前记录下来的 `traffic_prompt_series_2s.jsonl`。
 
-如果不传，训练不会受影响。
+如果不传，当前代码会先尝试从 `stage2_ckpt` 里保存的 `data_path` 自动回退构建 `SnapshotSeedDataset`；只有 checkpoint 里也没有这些路径时，才会彻底退化成纯 `traffic_file` 在线训练。
 
 ### `snapshot_traffic_file`
 
@@ -273,14 +273,24 @@ python projection_train/train_projection_ppo_traj.py `
   --traffic_file anon_3_4_jinan_real.json `
   --roadnet_path data/Jinan/3_4/roadnet_3_4.json `
   --eval_traffic_file anon_3_4_jinan_real.json `
+  --output_dir records/projection_ppo_traj `
+  --work_root records/projection_ppo_traj/env_work `
+  --bf16 `
+  --device auto `
+  --llm_fsdp on `
+  --fsdp_sharding_strategy full_shard `
   --rollout_steps 8 `
-  --num_updates 100
+  --num_updates 100 `
+  --ppo_epochs 1 `
+  --mini_batch_size 16 `
+  --eval_every 10 `
+  --save_every 10
 ```
 
 这条命令的含义很明确：
 
 - 只使用 `anon_3_4_jinan_real.json`
-- 不依赖 snapshot 数据
+- 不强依赖手工传入 `snapshot_jsonl`
 - 让 PPO 在同一个 episode 里连续前进
 
 ## 当前边界

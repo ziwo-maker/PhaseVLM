@@ -177,6 +177,88 @@ LLM 本体和 vision tower 冻结。
 
 最后一点尤其重要：当前终端环境缺少 `torch` 运行依赖，所以这次只完成了代码重构和 `py_compile` 级别静态校验，还没有在这个 shell 内直接跑训练。
 
+## 当前推荐命令
+
+下面这组命令对应当前工作树的默认主线。实际 `--inputs` 请按你自己的 train/eval 划分填写。
+
+### 1. 清洗数据
+
+```bash
+python utils/clean_align_jsonl.py \
+  --inputs \
+    data/recorded/<train_file_a>/traffic_prompt_series_2s.jsonl \
+    data/recorded/<train_file_b>/traffic_prompt_series_2s.jsonl \
+  --output data/recorded/align_train.cleaned.jsonl \
+  --seq_len 16 \
+  --min_action_margin 0.5 \
+  --dedup_similar_captions
+```
+
+### 2. Alignment
+
+```bash
+torchrun --nproc_per_node=4 train_align.py \
+  --data_path data/recorded/align_train.cleaned.jsonl \
+  --model_path /home/data/model/qwen-vl-8B/ \
+  --batch_size 16 \
+  --grad_accum_steps 4 \
+  --bf16 \
+  --lr 2e-4 \
+  --temperature 0.07 \
+  --prefix_tokens 16 \
+  --prefix_mode prefix
+```
+
+### 3. Stage 2 BC
+
+```bash
+torchrun --nproc_per_node=4 projection_train/train_projection_bc.py \
+  --data_path data/recorded/align_train.cleaned.jsonl \
+  --llm_path /home/data/model/qwen-vl-8B/ \
+  --align_ckpt records/align/align_epoch_60.pt \
+  --output_dir records/projection_bc \
+  --batch_size 1 \
+  --seq_len 16 \
+  --epochs 10 \
+  --max_length 128 \
+  --prompt_mode image_only_short \
+  --lr 1e-4 \
+  --grad_accum_steps 4 \
+  --bf16 \
+  --image_size 224 \
+  --prefix_tokens 16 \
+  --prefix_mode prefix \
+  --target_mode mixed \
+  --soft_target_alpha 0.5 \
+  --soft_label_temperature 2.0 \
+  --min_action_margin 0.5
+```
+
+### 4. Stage 3 PPO
+
+```bash
+torchrun --standalone --nproc_per_node=4 projection_train/train_projection_ppo_traj.py \
+  --stage2_ckpt records/projection_bc/best.pt \
+  --dataset jinan \
+  --traffic_root data/Jinan/3_4 \
+  --traffic_file anon_3_4_jinan_real.json \
+  --roadnet_path data/Jinan/3_4/roadnet_3_4.json \
+  --eval_traffic_file anon_3_4_jinan_real.json \
+  --output_dir records/projection_ppo_traj \
+  --work_root records/projection_ppo_traj/env_work \
+  --bf16 \
+  --device auto \
+  --llm_fsdp on \
+  --fsdp_sharding_strategy full_shard \
+  --num_updates 100 \
+  --rollout_steps 8 \
+  --ppo_epochs 1 \
+  --mini_batch_size 16 \
+  --max_length 128 \
+  --eval_every 10 \
+  --save_every 10
+```
+
 ## 文件索引
 
 - `projection_train/action_space.py`

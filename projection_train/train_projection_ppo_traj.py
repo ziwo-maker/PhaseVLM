@@ -218,6 +218,20 @@ def resolve_runtime(args: argparse.Namespace) -> Dict[str, Any]:
     return runtime
 
 
+def resolve_snapshot_jsonl_paths(args: argparse.Namespace) -> List[str]:
+    if args.snapshot_jsonl:
+        return [str(item) for item in args.snapshot_jsonl if str(item).strip()]
+    ckpt_args = _load_checkpoint_args(args.stage2_ckpt)
+    raw_paths = ckpt_args.get("data_path")
+    if isinstance(raw_paths, str):
+        candidates = [raw_paths]
+    elif isinstance(raw_paths, (list, tuple)):
+        candidates = [str(item) for item in raw_paths]
+    else:
+        candidates = []
+    return [str(item) for item in candidates if str(item).strip()]
+
+
 def build_env_paths(args: argparse.Namespace) -> tuple[str, str, int]:
     default_count, road_net, template = _dataset_spec(args.dataset)
     traffic_root = args.traffic_root or os.path.join("data", template, road_net)
@@ -769,19 +783,20 @@ def main() -> None:
         run_counts=run_counts,
     )
 
+    snapshot_jsonl_paths = resolve_snapshot_jsonl_paths(args)
     snapshot_dataset = None
-    if args.snapshot_jsonl:
+    if snapshot_jsonl_paths:
         snapshot_dataset = SnapshotSeedDataset(
-            path=args.snapshot_jsonl,
+            path=snapshot_jsonl_paths,
             seq_len=runtime["seq_len"],
             movement_keys=["NT", "NL", "ST", "SL", "ET", "EL", "WT", "WL"],
             max_snapshots=args.snapshot_max_samples,
             min_intersections=1,
         )
         if len(snapshot_dataset) == 0:
-            raise RuntimeError("snapshot_jsonl was provided but no valid snapshot seeds were loaded.")
+            raise RuntimeError("No valid snapshot seeds were loaded from the resolved snapshot jsonl paths.")
         if is_main_process():
-            print(f"Loaded snapshot seeds: {len(snapshot_dataset)}")
+            print(f"Loaded snapshot seeds: {len(snapshot_dataset)} from {snapshot_jsonl_paths}")
 
     if is_main_process():
         os.makedirs(args.output_dir, exist_ok=True)

@@ -38,6 +38,10 @@ class TrafficActionSample:
     intersection_id: str
     snapshot_path: str
     traffic_file: str
+    source_path: str
+    candidate_action_waits: Dict[str, float]
+    expert_action_margin: Optional[float]
+    base_action: str
     meta: Dict
 
 
@@ -51,6 +55,7 @@ class GroupedTrafficActionDataset(Dataset):
         require_expert_action: bool = True,
         valid_actions: Optional[Iterable[str]] = ACTION_LIST,
         max_samples: Optional[int] = None,
+        min_action_margin: Optional[float] = None,
     ) -> None:
         self.paths = [str(item) for item in path] if isinstance(path, (list, tuple)) else [str(path)]
         self.seq_len = int(seq_len)
@@ -59,8 +64,34 @@ class GroupedTrafficActionDataset(Dataset):
         self.require_expert_action = bool(require_expert_action)
         self.valid_actions = set(valid_actions) if valid_actions is not None else None
         self.max_samples = max_samples
+        self.min_action_margin = None if min_action_margin is None else float(min_action_margin)
         self.samples: List[TrafficActionSample] = []
         self._load()
+
+    @staticmethod
+    def _parse_candidate_waits(raw_waits: object) -> Dict[str, float]:
+        if not isinstance(raw_waits, dict):
+            return {}
+        parsed: Dict[str, float] = {}
+        for key, value in raw_waits.items():
+            try:
+                parsed[str(key)] = float(value)
+            except (TypeError, ValueError):
+                continue
+        return parsed
+
+    @staticmethod
+    def _resolve_margin(record: Dict, candidate_waits: Dict[str, float]) -> Optional[float]:
+        explicit = record.get("expert_action_margin")
+        if explicit is not None:
+            try:
+                return float(explicit)
+            except (TypeError, ValueError):
+                return None
+        if len(candidate_waits) < 2:
+            return None
+        values = sorted(candidate_waits.values())
+        return float(values[1] - values[0])
 
     def _load(self) -> None:
         for path in self.paths:
@@ -81,6 +112,8 @@ class GroupedTrafficActionDataset(Dataset):
                     raw_prompt = str(record.get("prompt") or "")
                     expert_action = str(record.get("expert_action") or "")
                     clip_caption = str(record.get("clip_caption") or "")
+                    candidate_waits = self._parse_candidate_waits(record.get("candidate_action_waits"))
+                    action_margin = self._resolve_margin(record, candidate_waits)
                     if not (raw_prompt or expert_action or clip_caption):
                         continue
 
@@ -90,6 +123,10 @@ class GroupedTrafficActionDataset(Dataset):
                     if self.valid_actions is not None and expert_action and expert_action not in self.valid_actions:
                         history = []
                         continue
+                    if self.min_action_margin is not None:
+                        if action_margin is None or action_margin < self.min_action_margin:
+                            history = []
+                            continue
 
                     self.samples.append(
                         TrafficActionSample(
@@ -103,6 +140,10 @@ class GroupedTrafficActionDataset(Dataset):
                             traffic_file=infer_traffic_file_from_snapshot_path(
                                 str(record.get("snapshot_path") or "")
                             ),
+                            source_path=str(path),
+                            candidate_action_waits=candidate_waits,
+                            expert_action_margin=action_margin,
+                            base_action=str(record.get("base_action") or ""),
                             meta=record.get("meta") or {},
                         )
                     )
@@ -138,6 +179,10 @@ class GroupedTrafficActionDataset(Dataset):
             "intersection_id": sample.intersection_id,
             "snapshot_path": sample.snapshot_path,
             "traffic_file": sample.traffic_file,
+            "source_path": sample.source_path,
+            "candidate_action_waits": sample.candidate_action_waits,
+            "expert_action_margin": sample.expert_action_margin,
+            "base_action": sample.base_action,
             "meta": sample.meta,
         }
 
@@ -152,5 +197,9 @@ def grouped_action_collate(batch: Sequence[Dict]) -> Dict:
         "intersection_id": [item["intersection_id"] for item in batch],
         "snapshot_path": [item["snapshot_path"] for item in batch],
         "traffic_file": [item["traffic_file"] for item in batch],
+        "source_path": [item["source_path"] for item in batch],
+        "candidate_action_waits": [item["candidate_action_waits"] for item in batch],
+        "expert_action_margin": [item["expert_action_margin"] for item in batch],
+        "base_action": [item["base_action"] for item in batch],
         "meta": [item["meta"] for item in batch],
     }

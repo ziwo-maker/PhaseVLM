@@ -18,6 +18,7 @@ _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
+from data_split import blocked_group_subset
 from projection_train.action_space import ACTION_LIST, action_to_index
 from projection_train.grouped_dataset import GroupedTrafficActionDataset, grouped_action_collate
 from projection_train.prefix_action_policy import PrefixActionPolicy
@@ -57,20 +58,67 @@ def resolve_amp_dtype(args: argparse.Namespace, device: torch.device) -> torch.d
 
 
 def split_dataset(dataset, val_ratio: float, seed: int) -> Tuple[Subset, Subset | None]:
-    total = len(dataset)
-    if total == 0:
+    if len(dataset) == 0:
         raise RuntimeError("No grouped samples found for Stage 2 training.")
-    val_size = int(total * val_ratio)
-    if total > 1:
-        val_size = max(1, val_size) if val_ratio > 0 else 0
-        val_size = min(val_size, total - 1)
-    else:
-        val_size = 0
-    generator = torch.Generator().manual_seed(seed)
-    indices = torch.randperm(total, generator=generator).tolist()
-    val_indices = indices[:val_size]
-    train_indices = indices[val_size:]
-    return Subset(dataset, train_indices), (Subset(dataset, val_indices) if val_size > 0 else None)
+    return blocked_group_subset(dataset, val_ratio=val_ratio)
+
+
+def compute_class_weights(train_set: Subset) -> torch.Tensor:
+    dataset = train_set.dataset
+    counts = torch.zeros(len(ACTION_LIST), dtype=torch.float32)
+    for sample_idx in train_set.indices:
+        label = action_to_index(dataset.samples[int(sample_idx)].expert_action)
+        counts[label] += 1.0
+    counts = counts.clamp_min(1.0)
+    weights = counts.sum() / (counts * float(len(ACTION_LIST)))
+    return weights / weights.mean().clamp_min(1e-8)
+
+
+def build_soft_targets(
+    raw_waits_batch: Sequence[Dict[str, float]],
+    device: torch.device,
+    temperature: float,
+) -> Tuple[torch.Tensor | None, torch.Tensor | None]:
+    if not raw_waits_batch:
+        return None, None
+    wait_rows = []
+    valid_rows = []
+    for raw_waits in raw_waits_batch:
+        if not isinstance(raw_waits, dict) or not raw_waits:
+            wait_rows.append([0.0] * len(ACTION_LIST))
+            valid_rows.append(False)
+            continue
+        row = []
+        valid_count = 0
+        for action in ACTION_LIST:
+            value = raw_waits.get(action)
+            if value is None:
+                row.append(float("inf"))
+            else:
+                try:
+                    row.append(float(value))
+                    valid_count += 1
+                except (TypeError, ValueError):
+                    row.append(float("inf"))
+        wait_rows.append(row)
+        valid_rows.append(valid_count >= 2 and any(torch.isfinite(torch.tensor(row)).tolist()))
+    valid_mask = torch.tensor(valid_rows, device=device, dtype=torch.bool)
+    if not bool(valid_mask.any().item()):
+        return None, None
+    wait_tensor = torch.tensor(wait_rows, device=device, dtype=torch.float32)
+    finite_mask = torch.isfinite(wait_tensor)
+    safe_waits = wait_tensor.clone()
+    safe_waits[~finite_mask] = 0.0
+    min_waits = torch.where(
+        finite_mask,
+        wait_tensor,
+        torch.full_like(wait_tensor, float("inf")),
+    ).amin(dim=-1, keepdim=True)
+    min_waits = torch.where(torch.isfinite(min_waits), min_waits, torch.zeros_like(min_waits))
+    scaled = -(safe_waits - min_waits) / max(float(temperature), 1e-6)
+    scaled = scaled.masked_fill(~finite_mask, float("-inf"))
+    soft_targets = torch.softmax(scaled, dim=-1)
+    return soft_targets, valid_mask
 
 
 def format_prompts(raw_prompts: Sequence[str], prompt_mode: str) -> List[str]:
@@ -188,6 +236,7 @@ def run_epoch(
     ddp: bool,
     is_train: bool,
     rank: int,
+    class_weights: torch.Tensor | None,
 ) -> Tuple[Dict[str, float], int]:
     base_model: PrefixActionPolicy = model.module if hasattr(model, "module") else model
     base_model.backbone.model.eval()
@@ -229,7 +278,23 @@ def run_epoch(
             with torch.set_grad_enabled(is_train):
                 with torch.cuda.amp.autocast(enabled=amp_dtype is not None, dtype=amp_dtype):
                     logits = model(sequences, prompts)
-                    raw_loss = F.cross_entropy(logits, labels)
+                    hard_loss = F.cross_entropy(logits, labels, weight=class_weights)
+                    raw_loss = hard_loss
+                    if args.target_mode != "hard":
+                        soft_targets, soft_valid = build_soft_targets(
+                            batch["candidate_action_waits"],
+                            device=device,
+                            temperature=args.soft_label_temperature,
+                        )
+                        if soft_targets is not None and soft_valid is not None:
+                            log_probs = F.log_softmax(logits, dim=-1)
+                            soft_loss_all = -(soft_targets * log_probs).sum(dim=-1)
+                            soft_loss = soft_loss_all[soft_valid].mean()
+                            if args.target_mode == "soft":
+                                raw_loss = soft_loss
+                            else:
+                                alpha = float(args.soft_target_alpha)
+                                raw_loss = (1.0 - alpha) * hard_loss + alpha * soft_loss
                     loss = raw_loss / max(1, args.grad_accum_steps)
                 if is_train:
                     if scaler is not None:
@@ -318,11 +383,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--val_ratio", type=float, default=0.1)
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--max_samples", type=int, default=None)
+    parser.add_argument("--min_action_margin", type=float, default=None)
     parser.add_argument("--seed", type=int, default=2024)
     parser.add_argument("--bf16", action="store_true", default=False)
     parser.add_argument("--fp16", action="store_true", default=False)
     parser.add_argument("--log_interval", type=int, default=20)
     parser.add_argument("--save_every", type=int, default=1)
+    parser.add_argument(
+        "--target_mode",
+        type=str,
+        default="mixed",
+        choices=["hard", "soft", "mixed"],
+    )
+    parser.add_argument("--soft_target_alpha", type=float, default=0.5)
+    parser.add_argument("--soft_label_temperature", type=float, default=2.0)
+    parser.add_argument("--disable_class_balance", action="store_true", default=False)
     return parser.parse_args()
 
 
@@ -350,8 +425,12 @@ def main() -> None:
         require_expert_action=True,
         valid_actions=ACTION_LIST,
         max_samples=args.max_samples,
+        min_action_margin=args.min_action_margin,
     )
     train_set, val_set = split_dataset(dataset, args.val_ratio, args.seed)
+    class_weights = None
+    if not args.disable_class_balance:
+        class_weights = compute_class_weights(train_set)
 
     if ddp:
         train_sampler = DistributedSampler(train_set, num_replicas=world_size, rank=rank, shuffle=True)
@@ -429,6 +508,7 @@ def main() -> None:
             device_ids=[device.index] if device.type == "cuda" else None,
             find_unused_parameters=False,
         )
+    class_weights = class_weights.to(device) if class_weights is not None else None
 
     lr_scale_fn = build_lr_scheduler(args, max(1, math.ceil(len(train_loader) / max(1, args.grad_accum_steps))))
     best_metric = float("-inf")
@@ -451,6 +531,7 @@ def main() -> None:
             ddp=ddp,
             is_train=True,
             rank=rank,
+            class_weights=class_weights,
         )
 
         if rank == 0:
@@ -479,6 +560,7 @@ def main() -> None:
                     ddp=False,
                     is_train=False,
                     rank=rank,
+                    class_weights=class_weights,
                 )
             print(
                 f"[epoch {epoch + 1}] val_loss={val_metrics['loss']:.4f} "

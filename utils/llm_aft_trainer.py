@@ -1106,6 +1106,9 @@ class LLM_Inference_VLLM:
         prompts,
         expert_actions=None,
         snapshot_paths=None,
+        candidate_action_waits=None,
+        expert_action_margins=None,
+        base_actions=None,
     ):
         if not prompts:
             return
@@ -1125,6 +1128,12 @@ class LLM_Inference_VLLM:
             snapshot_paths = ["" for _ in range(len(prompts))]
         if expert_actions is None:
             expert_actions = ["" for _ in range(len(prompts))]
+        if candidate_action_waits is None:
+            candidate_action_waits = [{} for _ in range(len(prompts))]
+        if expert_action_margins is None:
+            expert_action_margins = [None for _ in range(len(prompts))]
+        if base_actions is None:
+            base_actions = ["" for _ in range(len(prompts))]
 
         _, output_keys = self._resolve_series_movement_keys()
         meta_payload = _build_clip_meta(
@@ -1167,6 +1176,19 @@ class LLM_Inference_VLLM:
             snapshot_path = (
                 snapshot_paths[idx] if idx < len(snapshot_paths) and snapshot_paths[idx] is not None else ""
             )
+            action_waits = (
+                candidate_action_waits[idx]
+                if idx < len(candidate_action_waits) and isinstance(candidate_action_waits[idx], dict)
+                else {}
+            )
+            action_margin = (
+                expert_action_margins[idx]
+                if idx < len(expert_action_margins)
+                else None
+            )
+            base_action = (
+                base_actions[idx] if idx < len(base_actions) and base_actions[idx] is not None else ""
+            )
             for hist_idx, entry in enumerate(history):
                 record = {
                     "date": entry.get("date"),
@@ -1179,6 +1201,14 @@ class LLM_Inference_VLLM:
                     record["clip_caption"] = clip_caption
                     record["expert_action"] = str(expert_action or "")
                     record["snapshot_path"] = str(snapshot_path or "")
+                    if action_waits:
+                        record["candidate_action_waits"] = {
+                            str(key): float(value) for key, value in action_waits.items()
+                        }
+                    if action_margin is not None:
+                        record["expert_action_margin"] = float(action_margin)
+                    if base_action:
+                        record["base_action"] = str(base_action)
                     record["meta"] = meta_payload
                 records.append(record)
         _append_jsonl_records(self._traffic_series_output_path, records)
@@ -1811,6 +1841,9 @@ class LLM_Inference:
         prompts,
         expert_actions=None,
         snapshot_paths=None,
+        candidate_action_waits=None,
+        expert_action_margins=None,
+        base_actions=None,
     ):
         if not prompts:
             return
@@ -1830,6 +1863,12 @@ class LLM_Inference:
             snapshot_paths = ["" for _ in range(len(prompts))]
         if expert_actions is None:
             expert_actions = ["" for _ in range(len(prompts))]
+        if candidate_action_waits is None:
+            candidate_action_waits = [{} for _ in range(len(prompts))]
+        if expert_action_margins is None:
+            expert_action_margins = [None for _ in range(len(prompts))]
+        if base_actions is None:
+            base_actions = ["" for _ in range(len(prompts))]
 
         _, output_keys = self._resolve_series_movement_keys()
         meta_payload = _build_clip_meta(
@@ -1856,6 +1895,19 @@ class LLM_Inference:
             snapshot_path = (
                 snapshot_paths[idx] if idx < len(snapshot_paths) and snapshot_paths[idx] is not None else ""
             )
+            action_waits = (
+                candidate_action_waits[idx]
+                if idx < len(candidate_action_waits) and isinstance(candidate_action_waits[idx], dict)
+                else {}
+            )
+            action_margin = (
+                expert_action_margins[idx]
+                if idx < len(expert_action_margins)
+                else None
+            )
+            base_action = (
+                base_actions[idx] if idx < len(base_actions) and base_actions[idx] is not None else ""
+            )
             for hist_idx, entry in enumerate(history):
                 record = {
                     "date": entry.get("date"),
@@ -1868,6 +1920,14 @@ class LLM_Inference:
                     record["clip_caption"] = clip_caption
                     record["expert_action"] = str(expert_action or "")
                     record["snapshot_path"] = str(snapshot_path or "")
+                    if action_waits:
+                        record["candidate_action_waits"] = {
+                            str(key): float(value) for key, value in action_waits.items()
+                        }
+                    if action_margin is not None:
+                        record["expert_action_margin"] = float(action_margin)
+                    if base_action:
+                        record["base_action"] = str(base_action)
                     record["meta"] = meta_payload
                 records.append(record)
         _append_jsonl_records(self._traffic_series_output_path, records)

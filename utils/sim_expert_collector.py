@@ -220,22 +220,35 @@ class SimExpertCollector(LLM_Inference_VLLM):
             base_actions = [self._base_action_for_intersection(inter) for inter in self.env.list_intersection]
             expert_actions = []
             action_list = []
+            candidate_waits_all = []
+            expert_action_margins = []
+            base_action_names = []
 
             if snapshot_path:
                 phase_snapshot = self._phase_state_snapshot()
                 for i in range(len(self.env.list_intersection)):
                     base_action = base_actions[i]
+                    base_action_names.append(code2action(base_action))
                     best_action = base_action
                     best_wait = None
+                    candidate_waits = {}
                     for cand in range(4):
                         avg_wait = self._simulate_candidate(
                             i, cand, base_actions, snapshot_path, phase_snapshot
                         )
+                        candidate_waits[code2action(cand)] = float(avg_wait)
                         if best_wait is None or avg_wait < best_wait:
                             best_wait = avg_wait
                             best_action = cand
                         elif abs(avg_wait - best_wait) < 1e-9 and cand == base_action:
                             best_action = cand
+                    sorted_waits = sorted(float(value) for value in candidate_waits.values())
+                    if len(sorted_waits) >= 2:
+                        action_margin = float(sorted_waits[1] - sorted_waits[0])
+                    else:
+                        action_margin = 0.0
+                    candidate_waits_all.append(candidate_waits)
+                    expert_action_margins.append(action_margin)
                     expert_actions.append(code2action(best_action))
                     action_list.append(best_action)
 
@@ -243,6 +256,9 @@ class SimExpertCollector(LLM_Inference_VLLM):
                 self._phase_state_restore(phase_snapshot)
             else:
                 for base_action in base_actions:
+                    base_action_names.append(code2action(base_action))
+                    candidate_waits_all.append({})
+                    expert_action_margins.append(0.0)
                     expert_actions.append(code2action(base_action))
                     action_list.append(base_action)
 
@@ -254,6 +270,9 @@ class SimExpertCollector(LLM_Inference_VLLM):
                 prompts,
                 expert_actions=expert_actions,
                 snapshot_paths=snapshot_paths,
+                candidate_action_waits=candidate_waits_all,
+                expert_action_margins=expert_action_margins,
+                base_actions=base_action_names,
             )
 
             next_state, _, done, _ = self.env.step(action_list)

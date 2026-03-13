@@ -10,6 +10,7 @@ import torch.distributed as dist
 from torch.utils.data import DataLoader, RandomSampler, Subset
 from torch.utils.data.distributed import DistributedSampler
 
+from data_split import blocked_group_subset
 from dataset import TrafficClipJsonlDataset, traffic_clip_collate
 from eval_retrieval import evaluate_retrieval
 from losses import clip_contrastive_loss
@@ -38,13 +39,10 @@ def init_distributed() -> Tuple[bool, int, int, torch.device]:
 
 
 def split_dataset(dataset, val_ratio: float, seed: int):
-    total = len(dataset)
-    val_size = max(1, int(total * val_ratio))
-    generator = torch.Generator().manual_seed(seed)
-    indices = torch.randperm(total, generator=generator).tolist()
-    val_indices = indices[:val_size]
-    train_indices = indices[val_size:]
-    return Subset(dataset, train_indices), Subset(dataset, val_indices)
+    train_set, val_set = blocked_group_subset(dataset, val_ratio=val_ratio)
+    if val_set is None:
+        return train_set, Subset(dataset, [])
+    return train_set, val_set
 
 
 def _parse_temperature_sweep(raw: Optional[str], default_value: float) -> list[float]:

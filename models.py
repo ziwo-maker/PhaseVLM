@@ -511,9 +511,27 @@ class Qwen3VLBackbone(nn.Module):
         input_ids = encoding["input_ids"].to(self.device)
         attention_mask = encoding["attention_mask"].to(self.device)
         with torch.no_grad():
-            token_embeds = self.text_embed(input_ids)
-        mask = attention_mask.unsqueeze(-1).float()
-        pooled = (token_embeds * mask).sum(dim=1) / mask.sum(dim=1).clamp_min(1.0)
+            try:
+                outputs = self.model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    output_hidden_states=True,
+                    return_dict=True,
+                    use_cache=False,
+                )
+                token_states = getattr(outputs, "last_hidden_state", None)
+                if token_states is None:
+                    hidden_states = getattr(outputs, "hidden_states", None)
+                    if hidden_states:
+                        token_states = hidden_states[-1]
+                if token_states is None and isinstance(outputs, (tuple, list)) and outputs:
+                    token_states = outputs[0]
+                if token_states is None:
+                    raise RuntimeError("Missing contextual text states from backbone forward.")
+            except Exception:
+                token_states = self.text_embed(input_ids)
+        mask = attention_mask.unsqueeze(-1).to(token_states.dtype)
+        pooled = (token_states * mask).sum(dim=1) / mask.sum(dim=1).clamp_min(1.0)
         return pooled
 
     def encode_vision_tokens(self, images: torch.Tensor) -> torch.Tensor:
