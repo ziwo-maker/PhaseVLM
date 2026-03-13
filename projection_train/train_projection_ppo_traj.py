@@ -52,7 +52,10 @@ def is_main_process() -> bool:
 
 def barrier() -> None:
     if dist.is_available() and dist.is_initialized():
-        dist.barrier()
+        if dist.get_backend() == "nccl" and torch.cuda.is_available():
+            dist.barrier(device_ids=[torch.cuda.current_device()])
+        else:
+            dist.barrier()
 
 
 def resolve_rank_work_dir(base_dir: str, rank: int) -> str:
@@ -143,6 +146,23 @@ def _safe_positive_int(value: Any, default: int) -> int:
     return resolved
 
 
+def _first_positive_int(*values: Any, fallback: int) -> int:
+    for value in values:
+        resolved = _safe_int(value, 0)
+        if resolved > 0:
+            return resolved
+    return _safe_positive_int(fallback, 1)
+
+
+def _str_to_bool(value: Any) -> bool:
+    text = str(value or "").strip().lower()
+    if text in {"1", "true", "yes", "y", "on"}:
+        return True
+    if text in {"0", "false", "no", "n", "off", ""}:
+        return False
+    raise ValueError(f"Unsupported boolean flag: {value!r}")
+
+
 def _default_cuda_device() -> torch.device:
     local_rank = os.environ.get("LOCAL_RANK")
     if local_rank is not None:
@@ -186,14 +206,14 @@ def resolve_runtime(args: argparse.Namespace) -> Dict[str, Any]:
 
     runtime = {
         "llm_path": llm_path,
-        "seq_len": _safe_positive_int(args.seq_len, ckpt_args.get("seq_len", 16)),
-        "image_size": _safe_positive_int(args.image_size, ckpt_args.get("image_size", 224)),
-        "periodicity": _safe_positive_int(args.periodicity, ckpt_args.get("periodicity", 16)),
-        "input_dim": _safe_positive_int(args.input_dim, ckpt_args.get("input_dim", 8)),
-        "hidden_dim": _safe_positive_int(args.hidden_dim, ckpt_args.get("hidden_dim", 64)),
-        "prefix_tokens": _safe_positive_int(args.prefix_tokens, ckpt_args.get("prefix_tokens", 16)),
+        "seq_len": _first_positive_int(args.seq_len, ckpt_args.get("seq_len"), fallback=16),
+        "image_size": _first_positive_int(args.image_size, ckpt_args.get("image_size"), fallback=224),
+        "periodicity": _first_positive_int(args.periodicity, ckpt_args.get("periodicity"), fallback=16),
+        "input_dim": _first_positive_int(args.input_dim, ckpt_args.get("input_dim"), fallback=8),
+        "hidden_dim": _first_positive_int(args.hidden_dim, ckpt_args.get("hidden_dim"), fallback=64),
+        "prefix_tokens": _first_positive_int(args.prefix_tokens, ckpt_args.get("prefix_tokens"), fallback=16),
         "prefix_mode": str(args.prefix_mode or ckpt_args.get("prefix_mode") or "prefix"),
-        "max_length": _safe_positive_int(args.max_length, ckpt_args.get("max_length", 128)),
+        "max_length": _first_positive_int(args.max_length, ckpt_args.get("max_length"), fallback=128),
     }
     return runtime
 
@@ -213,6 +233,9 @@ def build_policy(
     device: torch.device,
     torch_dtype: torch.dtype,
     with_value_head: bool,
+    llm_fsdp_enabled: bool = False,
+    fsdp_sharding_strategy: str = "full_shard",
+    backbone: Any = None,
 ) -> PrefixActionPolicy:
     return PrefixActionPolicy(
         model_path=runtime["llm_path"],
@@ -228,6 +251,9 @@ def build_policy(
         device=device,
         with_value_head=with_value_head,
         value_hidden_dim=runtime.get("value_hidden_dim", 512),
+        backbone=backbone,
+        backbone_fsdp_enabled=llm_fsdp_enabled,
+        backbone_fsdp_sharding_strategy=fsdp_sharding_strategy,
     )
 
 
@@ -247,18 +273,30 @@ def rollout_once(
     gamma: float,
     gae_lambda: float,
     sample_actions: bool,
+    reference_policy: PrefixActionPolicy | None = None,
 ) -> tuple[TrajectoryRolloutBuffer, Dict[str, float]]:
     buffer = TrajectoryRolloutBuffer(gamma=gamma, gae_lambda=gae_lambda)
+    set_policy_mode(policy, is_train=False)
+    if reference_policy is not None:
+        set_policy_mode(reference_policy, is_train=False)
     obs = env.observe()
     episode_reward = 0.0
     queue_trace: List[float] = []
     wait_trace: List[float] = []
+    active_trace: List[float] = []
+    departed_trace: List[float] = []
+    delta_queue_reward_trace: List[float] = []
+    delta_wait_reward_trace: List[float] = []
+    starvation_penalty_trace: List[float] = []
 
     for _ in range(int(rollout_steps)):
         seq_tensor = torch.tensor(obs["sequences"], dtype=torch.float32, device=device)
         prompts = obs["prompts"]
         with torch.no_grad():
             act_out = policy.act(seq_tensor, prompts, sample=sample_actions)
+            reference_logits = None
+            if reference_policy is not None:
+                reference_logits = reference_policy(seq_tensor, prompts).detach().cpu().float()
         actions = act_out["actions"]
         values = act_out["values"]
         if values is None:
@@ -274,10 +312,16 @@ def rollout_once(
             values=values,
             rewards=reward_tensor,
             dones=done_tensor,
+            reference_logits=reference_logits,
         )
         episode_reward += float(sum(rewards))
         queue_trace.append(float(info.get("queue_sum", 0.0)))
         wait_trace.append(float(info.get("waiting_time_mean", 0.0)))
+        active_trace.append(float(info.get("active_vehicle_count", 0.0)))
+        departed_trace.append(float(info.get("departed_vehicle_count", 0.0)))
+        delta_queue_reward_trace.append(float(info.get("delta_queue_reward_mean", 0.0)))
+        delta_wait_reward_trace.append(float(info.get("delta_wait_reward_mean", 0.0)))
+        starvation_penalty_trace.append(float(info.get("starvation_penalty_mean", 0.0)))
         obs = next_obs
         if done:
             break
@@ -294,6 +338,17 @@ def rollout_once(
         "rollout_reward": episode_reward,
         "rollout_avg_queue": float(np.mean(queue_trace) if queue_trace else 0.0),
         "rollout_avg_waiting": float(np.mean(wait_trace) if wait_trace else 0.0),
+        "rollout_avg_active_vehicles": float(np.mean(active_trace) if active_trace else 0.0),
+        "rollout_avg_departed_vehicles": float(np.mean(departed_trace) if departed_trace else 0.0),
+        "rollout_avg_delta_queue_reward": float(
+            np.mean(delta_queue_reward_trace) if delta_queue_reward_trace else 0.0
+        ),
+        "rollout_avg_delta_wait_reward": float(
+            np.mean(delta_wait_reward_trace) if delta_wait_reward_trace else 0.0
+        ),
+        "rollout_avg_starvation_penalty": float(
+            np.mean(starvation_penalty_trace) if starvation_penalty_trace else 0.0
+        ),
         "rollout_steps": float(buffer.num_steps),
         "rollout_transitions": float(buffer.num_transitions),
     }
@@ -302,7 +357,6 @@ def rollout_once(
 
 def ppo_update(
     policy: PrefixActionPolicy,
-    reference_policy: PrefixActionPolicy,
     optimizer: torch.optim.Optimizer,
     buffer: TrajectoryRolloutBuffer,
     device: torch.device,
@@ -311,7 +365,6 @@ def ppo_update(
     scaler: torch.cuda.amp.GradScaler | None,
 ) -> Dict[str, float]:
     set_policy_mode(policy, is_train=True)
-    set_policy_mode(reference_policy, is_train=False)
 
     stats = {
         "policy_loss": [],
@@ -324,7 +377,7 @@ def ppo_update(
     }
     def _autocast_context():
         if amp_dtype is not None and device.type == "cuda":
-            return torch.cuda.amp.autocast(dtype=amp_dtype)
+            return torch.amp.autocast("cuda", dtype=amp_dtype)
         return nullcontext()
 
     for _ in range(int(args.ppo_epochs)):
@@ -336,6 +389,9 @@ def ppo_update(
             old_values = batch["old_values"].to(device)
             advantages = batch["advantages"].to(device)
             returns = batch["returns"].to(device)
+            if "reference_logits" not in batch:
+                raise RuntimeError("PPO update requires cached reference_logits from rollout.")
+            reference_logits = batch["reference_logits"].to(device).float()
 
             optimizer.zero_grad(set_to_none=True)
             with _autocast_context():
@@ -360,8 +416,6 @@ def ppo_update(
                 value_loss_2 = (value_pred_clipped - returns).pow(2)
                 value_loss = 0.5 * torch.max(value_loss_1, value_loss_2).mean()
 
-                with torch.no_grad():
-                    reference_logits = reference_policy(sequences, prompts).float()
                 current_log_probs = F.log_softmax(logits, dim=-1)
                 reference_log_probs = F.log_softmax(reference_logits, dim=-1)
                 current_probs = current_log_probs.exp()
@@ -420,7 +474,8 @@ def evaluate_full_episode(
     while not done:
         sequences = torch.tensor(obs["sequences"], dtype=torch.float32, device=device)
         prompts = obs["prompts"]
-        act_out = policy.act(sequences, prompts, sample=False)
+        with torch.no_grad():
+            act_out = policy.act(sequences, prompts, sample=False)
         obs, rewards, done, info = env.step(act_out["actions"].tolist())
         total_reward += float(sum(rewards))
         queue_trace.append(float(info.get("queue_sum", 0.0)))
@@ -433,8 +488,66 @@ def evaluate_full_episode(
         "eval_reward": total_reward,
         "eval_avg_queue": float(np.mean(queue_trace) if queue_trace else 0.0),
         "eval_avg_waiting": float(np.mean(wait_trace) if wait_trace else 0.0),
+        "eval_avg_travel_time": float(env.episode_travel_time_mean(resolved_end_time=env.run_counts)),
         "eval_steps": float(step_count),
     }
+
+
+def _safe_metric_ratio(current: float, baseline: float) -> float:
+    current_value = float(current)
+    baseline_value = float(baseline)
+    if abs(baseline_value) < 1e-6:
+        return 1.0 if abs(current_value) < 1e-6 else 1.0 + abs(current_value)
+    return current_value / baseline_value
+
+
+def add_selection_metrics(
+    eval_metrics: Dict[str, float],
+    baseline_eval_metrics: Dict[str, float],
+    args: argparse.Namespace,
+) -> Dict[str, float]:
+    queue_ratio = _safe_metric_ratio(
+        eval_metrics.get("eval_avg_queue", 0.0),
+        baseline_eval_metrics.get("eval_avg_queue", 0.0),
+    )
+    wait_ratio = _safe_metric_ratio(
+        eval_metrics.get("eval_avg_waiting", 0.0),
+        baseline_eval_metrics.get("eval_avg_waiting", 0.0),
+    )
+    travel_ratio = _safe_metric_ratio(
+        eval_metrics.get("eval_avg_travel_time", 0.0),
+        baseline_eval_metrics.get("eval_avg_travel_time", 0.0),
+    )
+    weight_sum = max(
+        1e-6,
+        float(args.selection_queue_weight)
+        + float(args.selection_wait_weight)
+        + float(args.selection_travel_weight),
+    )
+    composite_score = -(
+        float(args.selection_queue_weight) * queue_ratio
+        + float(args.selection_wait_weight) * wait_ratio
+        + float(args.selection_travel_weight) * travel_ratio
+    ) / weight_sum
+    enriched = dict(eval_metrics)
+    enriched.update(
+        {
+            "eval_queue_ratio": float(queue_ratio),
+            "eval_wait_ratio": float(wait_ratio),
+            "eval_travel_ratio": float(travel_ratio),
+            "eval_composite_score": float(composite_score),
+            "eval_all_metrics_improved": float(
+                queue_ratio < 1.0 and wait_ratio < 1.0 and travel_ratio < 1.0
+            ),
+        }
+    )
+    return enriched
+
+
+def resolve_selection_score(eval_metrics: Dict[str, float], args: argparse.Namespace) -> float:
+    if args.model_selection_metric == "reward":
+        return float(eval_metrics.get("eval_reward", float("-inf")))
+    return float(eval_metrics.get("eval_composite_score", float("-inf")))
 
 
 def save_checkpoint(
@@ -483,7 +596,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--hidden_dim", type=int, default=0)
     parser.add_argument("--prefix_tokens", type=int, default=0)
     parser.add_argument("--prefix_mode", type=str, default="")
-    parser.add_argument("--max_length", type=int, default=0)
+    parser.add_argument("--max_length", type=int, default=128)
     parser.add_argument("--value_hidden_dim", type=int, default=512)
     parser.add_argument("--prompt_mode", type=str, default="image_only_short")
     parser.add_argument("--run_counts", type=int, default=0)
@@ -493,7 +606,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num_updates", type=int, default=100)
     parser.add_argument("--rollout_steps", type=int, default=8)
     parser.add_argument("--ppo_epochs", type=int, default=4)
-    parser.add_argument("--mini_batch_size", type=int, default=32)
+    parser.add_argument("--mini_batch_size", type=int, default=1)
     parser.add_argument("--lr", type=float, default=5e-5)
     parser.add_argument("--weight_decay", type=float, default=1e-4)
     parser.add_argument("--gamma", type=float, default=0.99)
@@ -507,10 +620,33 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--switch_penalty_beta", type=float, default=0.02)
     parser.add_argument("--queue_reward_coef", type=float, default=-0.25)
     parser.add_argument("--pressure_reward_coef", type=float, default=0.0)
+    parser.add_argument("--waiting_reward_coef", type=float, default=-0.02)
+    parser.add_argument("--system_vehicle_reward_coef", type=float, default=-0.01)
+    parser.add_argument("--throughput_reward_coef", type=float, default=0.02)
+    parser.add_argument("--starvation_penalty_coef", type=float, default=0.05)
+    parser.add_argument("--starvation_threshold_steps", type=int, default=2)
+    parser.add_argument("--starvation_queue_threshold", type=float, default=8.0)
+    parser.add_argument("--starvation_wait_threshold", type=float, default=45.0)
     parser.add_argument("--eval_every", type=int, default=10)
     parser.add_argument("--save_every", type=int, default=10)
+    parser.add_argument(
+        "--model_selection_metric",
+        type=str,
+        default="composite",
+        choices=["composite", "reward"],
+    )
+    parser.add_argument("--selection_queue_weight", type=float, default=1.0)
+    parser.add_argument("--selection_wait_weight", type=float, default=1.0)
+    parser.add_argument("--selection_travel_weight", type=float, default=1.0)
     parser.add_argument("--seed", type=int, default=2024)
     parser.add_argument("--device", type=str, default="auto")
+    parser.add_argument("--llm_fsdp", type=str, default="off", choices=["off", "on"])
+    parser.add_argument(
+        "--fsdp_sharding_strategy",
+        type=str,
+        default="full_shard",
+        choices=["full_shard", "shard_grad_op", "no_shard"],
+    )
     parser.add_argument("--bf16", action="store_true", default=False)
     parser.add_argument("--fp16", action="store_true", default=False)
     return parser.parse_args()
@@ -535,6 +671,11 @@ def main() -> None:
                 f"--device={args.device} conflicts with distributed device assignment {device}. "
                 "Use --device auto when launching with torchrun."
             )
+    llm_fsdp_enabled = _str_to_bool(args.llm_fsdp)
+    if llm_fsdp_enabled and not ddp:
+        raise ValueError("--llm_fsdp on requires distributed launch via torchrun.")
+    if llm_fsdp_enabled and device.type != "cuda":
+        raise ValueError("--llm_fsdp on requires CUDA devices.")
     amp_dtype = resolve_amp_dtype(args, device)
     model_dtype = amp_dtype or (torch.bfloat16 if device.type == "cuda" else torch.float32)
     if device.type == "cuda":
@@ -553,9 +694,22 @@ def main() -> None:
         "pressure": float(args.pressure_reward_coef),
     }
 
-    policy = build_policy(runtime, device, model_dtype, with_value_head=True)
+    policy = build_policy(
+        runtime,
+        device,
+        model_dtype,
+        with_value_head=True,
+        llm_fsdp_enabled=llm_fsdp_enabled,
+        fsdp_sharding_strategy=args.fsdp_sharding_strategy,
+    )
     policy.load_checkpoint(args.stage2_ckpt, load_value_head=False)
-    reference_policy = build_policy(runtime, device, model_dtype, with_value_head=False)
+    reference_policy = build_policy(
+        runtime,
+        device,
+        model_dtype,
+        with_value_head=False,
+        backbone=policy.backbone,
+    )
     reference_policy.load_checkpoint(args.stage2_ckpt, load_value_head=False)
     reference_policy.eval()
     for param in reference_policy.parameters():
@@ -581,6 +735,13 @@ def main() -> None:
         min_action_time=args.min_action_time,
         reward_alpha=args.reward_alpha,
         switch_penalty_beta=args.switch_penalty_beta,
+        waiting_reward_coef=args.waiting_reward_coef,
+        system_vehicle_reward_coef=args.system_vehicle_reward_coef,
+        throughput_reward_coef=args.throughput_reward_coef,
+        starvation_penalty_coef=args.starvation_penalty_coef,
+        starvation_threshold_steps=args.starvation_threshold_steps,
+        starvation_queue_threshold=args.starvation_queue_threshold,
+        starvation_wait_threshold=args.starvation_wait_threshold,
         reward_info=reward_info,
         run_counts=run_counts,
     )
@@ -597,6 +758,13 @@ def main() -> None:
         min_action_time=args.min_action_time,
         reward_alpha=args.reward_alpha,
         switch_penalty_beta=args.switch_penalty_beta,
+        waiting_reward_coef=args.waiting_reward_coef,
+        system_vehicle_reward_coef=args.system_vehicle_reward_coef,
+        throughput_reward_coef=args.throughput_reward_coef,
+        starvation_penalty_coef=args.starvation_penalty_coef,
+        starvation_threshold_steps=args.starvation_threshold_steps,
+        starvation_queue_threshold=args.starvation_queue_threshold,
+        starvation_wait_threshold=args.starvation_wait_threshold,
         reward_info=reward_info,
         run_counts=run_counts,
     )
@@ -623,7 +791,32 @@ def main() -> None:
     rng = random.Random(args.seed + rank)
 
     if is_main_process():
-        print(f"[init] device={device} world_size={world_size} ddp={ddp}")
+        print(
+            f"[init] device={device} world_size={world_size} ddp={ddp} "
+            f"llm_fsdp_requested={llm_fsdp_enabled} llm_fsdp_active={getattr(policy.backbone, 'is_fsdp', False)} "
+            "shared_reference_backbone=True"
+        )
+
+    baseline_eval_metrics = evaluate_full_episode(
+        policy=policy,
+        env=eval_env,
+        device=device,
+        traffic_file=eval_traffic_file,
+    )
+    baseline_eval_metrics = sync_metrics(baseline_eval_metrics, device=device)
+    baseline_eval_metrics = add_selection_metrics(
+        baseline_eval_metrics,
+        baseline_eval_metrics,
+        args,
+    )
+    if is_main_process():
+        print(
+            f"[eval 0] reward={baseline_eval_metrics['eval_reward']:.4f} "
+            f"avg_queue={baseline_eval_metrics['eval_avg_queue']:.4f} "
+            f"avg_wait={baseline_eval_metrics['eval_avg_waiting']:.4f} "
+            f"avg_travel={baseline_eval_metrics['eval_avg_travel_time']:.4f} "
+            f"score={resolve_selection_score(baseline_eval_metrics, args):.4f}"
+        )
 
     for update_idx in range(1, args.num_updates + 1):
         # Keep rolling forward inside the same episode and only reset when an
@@ -644,10 +837,10 @@ def main() -> None:
             gamma=args.gamma,
             gae_lambda=args.gae_lambda,
             sample_actions=True,
+            reference_policy=reference_policy,
         )
         update_metrics = ppo_update(
             policy=policy,
-            reference_policy=reference_policy,
             optimizer=optimizer,
             buffer=rollout_buffer,
             device=device,
@@ -666,6 +859,10 @@ def main() -> None:
                 f"[update {update_idx}/{args.num_updates}] "
                 f"reward={merged_metrics['rollout_reward']:.4f} "
                 f"queue={merged_metrics['rollout_avg_queue']:.4f} wait={merged_metrics['rollout_avg_waiting']:.4f} "
+                f"active={merged_metrics['rollout_avg_active_vehicles']:.4f} "
+                f"dq={merged_metrics['rollout_avg_delta_queue_reward']:.4f} "
+                f"dw={merged_metrics['rollout_avg_delta_wait_reward']:.4f} "
+                f"starve={merged_metrics['rollout_avg_starvation_penalty']:.4f} "
                 f"policy={merged_metrics['policy_loss']:.4f} value={merged_metrics['value_loss']:.4f} "
                 f"entropy={merged_metrics['entropy']:.4f} kl={merged_metrics['kl']:.4f} "
                 f"transitions={merged_metrics['rollout_transitions']:.0f}"
@@ -685,38 +882,45 @@ def main() -> None:
         barrier()
 
         should_eval = (args.eval_every > 0 and update_idx % args.eval_every == 0) or update_idx == args.num_updates
-        if should_eval and is_main_process():
+        if should_eval:
             eval_metrics = evaluate_full_episode(
                 policy=policy,
                 env=eval_env,
                 device=device,
                 traffic_file=eval_traffic_file,
             )
-            print(
-                f"[eval {update_idx}] reward={eval_metrics['eval_reward']:.4f} "
-                f"avg_queue={eval_metrics['eval_avg_queue']:.4f} avg_wait={eval_metrics['eval_avg_waiting']:.4f}"
-            )
+            eval_metrics = sync_metrics(eval_metrics, device=device)
+            eval_metrics = add_selection_metrics(eval_metrics, baseline_eval_metrics, args)
             merged_metrics.update(eval_metrics)
-            save_checkpoint(
-                output_dir=args.output_dir,
-                filename="last.pt",
-                policy=policy,
-                optimizer=optimizer,
-                update_idx=update_idx,
-                args=args,
-                metrics=merged_metrics,
-            )
-            if eval_metrics["eval_reward"] > best_metric:
-                best_metric = eval_metrics["eval_reward"]
+            if is_main_process():
+                print(
+                    f"[eval {update_idx}] reward={eval_metrics['eval_reward']:.4f} "
+                    f"avg_queue={eval_metrics['eval_avg_queue']:.4f} "
+                    f"avg_wait={eval_metrics['eval_avg_waiting']:.4f} "
+                    f"avg_travel={eval_metrics['eval_avg_travel_time']:.4f} "
+                    f"score={resolve_selection_score(eval_metrics, args):.4f}"
+                )
                 save_checkpoint(
                     output_dir=args.output_dir,
-                    filename="best.pt",
+                    filename="last.pt",
                     policy=policy,
                     optimizer=optimizer,
                     update_idx=update_idx,
                     args=args,
                     metrics=merged_metrics,
                 )
+                selection_score = resolve_selection_score(eval_metrics, args)
+                if selection_score > best_metric:
+                    best_metric = selection_score
+                    save_checkpoint(
+                        output_dir=args.output_dir,
+                        filename="best.pt",
+                        policy=policy,
+                        optimizer=optimizer,
+                        update_idx=update_idx,
+                        args=args,
+                        metrics=merged_metrics,
+                    )
         barrier()
 
     if ddp:
@@ -725,5 +929,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
-

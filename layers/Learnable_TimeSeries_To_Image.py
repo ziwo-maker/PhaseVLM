@@ -154,9 +154,19 @@ class LearnableTimeSeriesToImage_hot(nn.Module):
         trend_kernel: int = 5,  # trend 平滑核大小（建议 3/5/7）
     ):
         super().__init__()
-        self.input_dim = input_dim
-        self.hidden_dim = hidden_dim
-        self.image_size = image_size
+        self.input_dim = int(input_dim)
+        self.hidden_dim = int(hidden_dim)
+        self.image_size = int(image_size)
+
+        if self.input_dim <= 0:
+            raise ValueError(
+                f"input_dim must be a positive integer, but got {self.input_dim}. "
+                "This usually means the runtime/checkpoint saved an invalid movement dimension."
+            )
+        if self.hidden_dim < 2:
+            raise ValueError(f"hidden_dim must be >= 2, but got {self.hidden_dim}.")
+        if self.image_size <= 0:
+            raise ValueError(f"image_size must be a positive integer, but got {self.image_size}.")
 
         # ============================================================
         # ① 生成 3 通道特征图：raw / delta / trend
@@ -168,14 +178,16 @@ class LearnableTimeSeriesToImage_hot(nn.Module):
         # trend 用“可学习平滑”：深度可分离 1D 卷积（每条车道独立一个平滑核）
         # 输入 [B, D, L] -> 输出 [B, D, L]
         k = int(trend_kernel)
+        if k <= 0:
+            raise ValueError(f"trend_kernel must be a positive integer, but got {k}.")
         if k % 2 == 0:
             k += 1  # 确保是奇数，便于对称平滑
         self.trend_dw = nn.Conv1d(
-            in_channels=input_dim,
-            out_channels=input_dim,
+            in_channels=self.input_dim,
+            out_channels=self.input_dim,
             kernel_size=k,
             padding=k // 2,
-            groups=input_dim,   # depthwise：每个车道单独一组卷积核
+            groups=self.input_dim,   # depthwise：每个车道单独一组卷积核
             bias=False
         )
         # 初始化为“均值滤波”(moving average)：训练开始像移动平均，之后可自己学更合适的平滑方式
@@ -225,7 +237,8 @@ class LearnableTimeSeriesToImage_hot(nn.Module):
         eps = 1e-6
 
         # 强制该模块使用 float32 计算，避免 bf16 在部分设备/卷积核上不被支持。
-        with torch.cuda.amp.autocast(enabled=False):
+        autocast_device = "cuda" if x.is_cuda else "cpu"
+        with torch.amp.autocast(autocast_device, enabled=False):
             # ============================================================
             # 1) 三通道特征构造（只保留 raw / delta / trend）
             # ============================================================

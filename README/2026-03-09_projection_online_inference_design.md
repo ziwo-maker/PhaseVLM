@@ -1,330 +1,327 @@
 # 2026-03-09 Projection 在线推理脚本设计思路
 
-本文档记录 `projection_train/run_projection_online.py` 的设计思路，重点说明为什么它不再沿用 `run_open_LLM_with_vllm.py` 的生成式推理路线，而是直接接入 Stage 2 / Stage 3 训练好的 `PrefixActionPolicy`。
+本文档记录本次 projection 在线推理代码的实际修改思路。目标不是继续沿用 `run_open_LLM.py` / `run_open_LLM_with_vllm.py` 的生成式路线，而是把已经训练好的 Stage 2 / Stage 3 projection 直接接到 CityFlow 在线控制里，并补一个和旧入口风格更接近的顶层脚本。
 
-## 目标
+## 本次改动的最终落点
 
-当前要解决的问题不是“再写一个能跑的控制脚本”，而是把已经训练完成的 projection 真正接到在线仿真里，让线上动作选择和训练时的表示链路保持一致。
+这次不是只改一个文件，而是拆成两层：
 
-目标有三个：
+1. 顶层新增入口：`run_projection_LLM.py`
+2. 底层复用并扩展：`projection_train/run_projection_online.py`
+3. 共用 prompt 构造：`projection_train/prompt_utils.py`
+4. 共用领域提示词资源：`prompts/prompt_domain_knowledge.json`
 
-1. 直接复用 Stage 2 / Stage 3 训练好的 `ts_projector + vision_projector`
-2. 保证线上输入分布尽量贴近训练分布
-3. 保持 CityFlow 在线测试、日志输出、snapshot 记录这些已有能力
+这样拆的原因是：
 
-## 为什么不继续走 vLLM 生成
+- 用户希望有一个和 `run_open_LLM.py` 同级、调用习惯更接近旧脚本的入口
+- 但真正的 projection 在线推理逻辑已经沉淀在 `projection_train/run_projection_online.py`
+- 所以更合理的做法不是重复实现一套 runner，而是让顶层脚本只负责参数组织、数据集选择、配置拼接，然后复用 projection runner
 
-原始 `run_open_LLM_with_vllm.py` 的核心逻辑是：
+## 为什么新顶层入口不是继续走生成式回答
 
-`时间序列 -> 图像 -> 长文本 prompt -> vLLM 生成回答 -> 正则抽取 <signal>`
+原始 `run_open_LLM.py` / `run_open_LLM_with_vllm.py` 的核心路线是：
 
-这条路线适合通用生成式基座，但和当前 projection 训练后的真实策略并不完全一致。
+`交通状态 -> prompt -> LLM生成文本 -> 正则抽取 <signal>`
 
-现在 Stage 2 / Stage 3 学到的其实是：
+这条路线和当前 projection 训练后的真实策略并不一致。
+
+现在 Stage 2 / Stage 3 的真实链路是：
 
 `sequence -> ts_projector -> frozen vision tower -> vision_projector(prefix) -> frozen LLM -> 4动作 logits`
 
-所以如果线上还继续让模型自由生成长文本，就会出现两个问题：
+因此这次顶层脚本仍然明确保持：
 
-1. 训练时优化的是 4 动作打分，而不是自由生成整段分析文本
-2. 线上会重新暴露旧 prompt 的文本捷径，削弱 projection 本身的作用
+- 不做自由文本生成
+- 不依赖 vLLM
+- 直接输出 4 类动作 logits
+- 使用 `argmax` 作为部署阶段动作
 
-因此新脚本明确改成：
+这样做的原因有三个：
 
-- 不再依赖 `vllm`
-- 不再做开放式文本生成
-- 直接调用 `PrefixActionPolicy` 输出 4 类动作 logits
-- 用 `argmax` 作为线上控制动作
+1. 与训练时的动作头语义完全一致
+2. 避免重新暴露旧长 prompt 的文本捷径
+3. 线上评估更稳定，不引入采样方差
 
-这才是和当前训练链路一致的部署方式。
+## 为什么要同时保留“顶层旧风格入口”和“底层 projection runner”
 
-## 与原脚本的关系
+如果只保留 `projection_train/run_projection_online.py`，虽然逻辑上已经够用，但调用习惯更偏训练/实验目录，不够接近原来 `run_open_LLM.py` 的使用方式。
 
-新脚本不是去修改 `run_open_LLM_with_vllm.py`，而是在 `projection_train/` 下新增独立入口：
+因此本次新增：
 
-- `projection_train/run_projection_online.py`
+- `run_projection_LLM.py`
 
-这样做有两个原因：
+这个脚本的职责是：
 
-1. 原脚本仍然保留旧的 vLLM 生成式实验路径，不被破坏
-2. projection 部署逻辑和训练代码放在同一目录，更容易一起维护
+- 提供和旧入口接近的 CLI 风格
+- 根据 `dataset + traffic_file` 解析 roadnet/template
+- 从 checkpoint 和 CLI 恢复 projection runtime 配置
+- 复用 `utils/config.py` 中已有的红绿灯相位和时序参数
+- 调用 `ProjectionPolicyRunner` 启动测试
 
-## 核心设计判断
+底层 `projection_train/run_projection_online.py` 继续承担：
 
-### 1. 线上主模型应当是 `PrefixActionPolicy`
+- CityFlow 初始化
+- checkpoint 加载
+- movement history 构造
+- prompt 构造
+- 在线动作预测
+- 指标统计和日志输出
 
-新脚本的主策略类不是 `LLM_Inference_VLLM`，而是训练侧已经存在的：
+## 复用 `utils/config.py` 的原因
 
-- `projection_train/prefix_action_policy.py`
+用户明确要求不要在新脚本里重新发明一套红绿灯控制定义，而要复用 `utils/config.py` 里的现有配置。
 
-这样可以直接复用：
+因此顶层脚本在配置上采取下面的策略：
 
-- checkpoint 加载逻辑
-- BC / PPO 权重兼容逻辑
-- prompt 构造约束
-- 4 动作 logits 输出接口
+### 1. 复用四相位定义
 
-### 2. checkpoint 必须兼容 BC 和 PPO
+直接沿用 `dic_traffic_env_conf` 中已有的：
 
-线上部署不应该只绑定某一个阶段的产物。
+- `PHASE`
+- `PHASE_LIST`
+- `NUM_PHASES`
+- `YELLOW_TIME`
+- `ALL_RED_TIME`
 
-因此脚本设计为：
+这样可以保证 projection 在线脚本和项目里其它控制器看到的是同一套信号控制语义。
 
-- 统一使用 `--projection_ckpt`
-- 允许传入 BC checkpoint
-- 也允许传入 PPO checkpoint
+### 2. 复用动作时长相关默认值
 
-兼容方式很简单：
+直接沿用 `dic_traffic_env_conf` 中已有的：
 
-- 在线推理只需要 `ts_projector + vision_projector`
-- PPO 额外的 `value_head` 对纯部署不是必需
+- `MIN_ACTION_TIME`
+- `MEASURE_TIME`
 
-所以脚本统一按“只加载策略相关部分”处理，这样 BC / PPO 都能复用。
+并且从 `DIC_FIXEDTIME_AGENT_CONF` 里恢复默认 `FIXED_TIME`。如果固定时长配置缺失或长度不匹配，再回退成按 `MIN_ACTION_TIME` 自动展开为 4 个相位时长。
 
-### 3. 底座模型路径从 checkpoint 和 CLI 共同决定
+这样做的好处是：
 
-projection 权重和底座模型是强绑定的。
+- 新脚本不再把 30 秒写死在新文件里
+- 顶层入口和项目默认控制节奏一致
+- 后续如果全局信号控制时间调整，projection 脚本也能自动跟上
 
-所以新脚本的模型路径解析顺序是：
+## Prompt 为什么仍然挂在 `image_only_short`
 
-1. 优先使用 `--llm_path`
-2. 如果未传，则回退到 checkpoint 里保存的 `args.llm_path`
-3. 再不行则尝试 `args.model_path`
+用户要求“Prompt 添加在 `image_only_short`”，而不是新增一个独立 prompt mode。
 
-这样既支持显式覆盖，也支持直接从训练产物恢复部署配置。
+因此这次没有再引入新的 mode，而是直接扩展了：
 
-### 4. 线上输入必须对齐训练分布
+- `projection_train/prompt_utils.py` 中的 `image_only_short`
 
-这是这次设计里最重要的判断之一。
+修改后的 `image_only_short` 不再只是极短约束，而是包含四类信息：
 
-虽然旧脚本也会从仿真里取交通状态，但它取 history 的方式和 Stage 2 / Stage 3 训练数据并不一致。
+1. 领域 system prompt
+2. 车道定义
+3. 四相位定义
+4. 图像编码规则和决策约束
 
-训练侧真实使用的是：
+具体包括：
 
-- `2s` 间隔
-- `30s` 窗口
-- `seq_len=16`
-- movement 维度顺序与 grouped dataset 对齐
+- 说明 `ET/WT/NT/ST` 是直行，`EL/WL/NL/SL` 是左转
+- 解释 `ETWT / NTST / ELWL / NLSL` 各自放行哪些 movement
+- 明确图像才是唯一可靠观测
+- 说明图像的时间轴、车道轴、强度含义
+- 强调只能输出一个 `<signal>...</signal>` 标签
 
-所以新脚本在线构造输入时，不再复用旧的 `_get_traffic_history_until()` 风格，而是按训练录数逻辑对齐：
+这样处理的原因是：
 
-- 开启 `intersection_movement` traffic count
-- 使用 `TRAFFIC_SERIES_INTERVAL=2`
-- 使用 `TRAFFIC_SERIES_WINDOW`
-- 从 `traffic_counts_by_interval` 恢复每个路口最近窗口的 movement counts
-- 不足 `seq_len` 时向前补齐
+- 不改变训练和部署共用的 prompt mode 名称
+- 仍然保持“短 prompt 优先依赖 prefix 表示”的总体思路
+- 同时补足交通规则和车道语义，避免线上说明过于贫乏
 
-这样可以最大程度保证：
+## 为什么还要改 `prompts/prompt_domain_knowledge.json`
 
-线上策略看到的 `sequence`
+原先这个 JSON 里只有一句很短的 system prompt，不足以支撑新的 prompt 语义。
 
-和
+因此这次把它提升成更贴近 projection 部署的领域提示前缀，强调：
 
-训练时 grouped dataset 中的 `sequence`
+- traffic rules
+- lane geometry
+- protected movement definitions
+- short-horizon demand trends
 
-语义一致。
+然后由 `projection_train/prompt_utils.py` 在构造 `image_only_short` 时读取这个 JSON，作为共用的 system prompt 前缀。
 
-### 5. prompt 改成训练侧短 prompt
+这样做的好处是：
 
-原脚本主输入里有很长的文本状态说明。
+- 领域知识入口不再硬编码在多个脚本里
+- 后续如果继续调整全局 system prompt，只需要改 JSON
+- prompt 模板和知识前缀分离，更容易维护
 
-新的线上脚本保留了原始长 prompt 的生成能力，但用途变了：
+## 为什么顶层脚本默认禁用 snapshot 和 prompt-series
 
-- `raw_prompt` 只作为兼容记录和调试信息保留
-- 真正送进 policy 的 prompt，使用 `build_task_prompt(..., mode=image_only_short)`
+这是这次相对于最初设计文档最重要的一处调整。
+
+最开始的 runner 设计里倾向于保留：
+
+- snapshot
+- `traffic_prompt_series_*.jsonl`
+
+因为它们对后续回灌训练和离线诊断有价值。
+
+但用户这次明确要求：
+
+1. 不保留 snapshot 记录
+2. 不保留 prompt-series 记录
+
+因此实际落地时采用了“两层开关”的做法：
+
+### 1. 底层 runner 仍然保留能力
+
+`projection_train/run_projection_online.py` 没有把 snapshot / prompt-series 逻辑整体删掉，而是新增了三个控制开关：
+
+- `record_snapshots`
+- `record_traffic_series`
+- `dump_cityflow_env_args`
+
+默认值仍然是 `True`，这样原有实验型 runner 的功能不被破坏。
+
+### 2. 顶层部署入口默认关闭这些记录
+
+`run_projection_LLM.py` 在构造 `ProjectionPolicyRunner` 时显式传入：
+
+- `record_snapshots=False`
+- `record_traffic_series=False`
+- `dump_cityflow_env_args=False`
+
+这样顶层脚本的行为就符合本次用户需求：
+
+- 不写 snapshot 文件
+- 不写 `traffic_prompt_series_*.jsonl`
+- 不额外导出 `cityflow_env_init`
+
+### 3. `state_action.json` 仍然保留必要调试信息
+
+虽然 snapshot / prompt-series 关闭了，但仍然保留 `state_action.json` 中这些字段：
+
+- `raw_prompt`
+- `policy_prompt`
+- `action_logits`
+- `action_probs`
+- `response`
+- `action`
+
+只有 `snapshot_path` 改成在关闭 snapshot 时不再写入。
+
+这样做的平衡点是：
+
+- 减少不需要的重日志
+- 保留线上动作可解释性
+- 便于之后排查“某一步为什么选了这个相位”
+
+## 为什么对 `ProjectionPolicyRunner` 做的是“参数化扩展”而不是重写
+
+虽然用户最终主要使用的是新顶层脚本，但底层 runner 仍然是更稳的复用点。
+
+因此本次没有复制一份新的 online runner，而是只对现有 `ProjectionPolicyRunner` 做最小必要扩展：
+
+1. 为 snapshot / traffic-series / cityflow init dump 增加开关
+2. 在关闭 snapshot 时不再写 `snapshot_path`
+3. 保持其余 sequence 构造、checkpoint 加载、动作预测逻辑不变
 
 这样做的原因是：
 
-1. 训练默认就是 `image_only_short`
-2. 短 prompt 更符合“让模型依赖 prefix 图像表示”的目标
-3. 线上和训练的 prompt 分布更一致
+- 避免复制出第二套几乎相同的在线推理主循环
+- 保持 BC / PPO checkpoint 兼容逻辑仍然只有一处
+- 未来如果再改 projection runner，不需要同步改两套实现
 
-## 新脚本的主要结构
+## 顶层脚本为什么不用 `utils.utils.merge`
 
-### 1. 轻量独立入口
+一个额外的实现细节是：
 
-新脚本没有直接继承 `LLM_Inference_VLLM`。
+- 顶层 `run_projection_LLM.py` 没有复用 `utils.utils.merge`
+- 而是在脚本内部写了一个轻量 `merge`
 
-原因不是功能上不能继承，而是当前工程里 `LLM_Inference_VLLM` 会把：
+原因不是功能问题，而是依赖边界问题。
 
-- `vllm`
-- `transformers`
-- 部分额外依赖
+`utils.utils` 会连带导入更重的 pipeline / transformers 相关模块，在当前环境里容易过早触发 `numpy / scipy / sklearn` 的兼容问题。
 
-一并拉进来，运行环境更脆弱。
+因此顶层脚本只保留最小依赖：
 
-因此新脚本选择：
+- `torch`
+- `projection_train.run_projection_online`
+- `utils.config`
 
-- 直接使用 `CityFlowEnv`
-- 只复用轻量工具函数
-- 自己维护部署所需的最小逻辑
+这样能让入口层本身尽量轻，真正的重模型依赖只在 projection policy 初始化时触发。
 
-这样依赖边界更清楚，也避免部署脚本被生成式推理栈绑死。
+## 在线推理的实际控制流程
 
-### 2. `ProjectionRuntimeConfig`
+当前实际线上流程是：
 
-这个数据结构负责承接部署时真正需要的 projection 配置：
+1. 顶层脚本解析 `dataset / traffic_file / checkpoint`
+2. 从 checkpoint 和 CLI 恢复 `ProjectionRuntimeConfig`
+3. 复用 `utils/config.py` 中的四相位与时序配置
+4. 初始化 `ProjectionPolicyRunner`
+5. 在每个控制步读取当前路口统计状态
+6. 从 traffic counter 恢复最近窗口的 movement history
+7. 补齐到固定长度 `seq_len`
+8. 用扩展后的 `image_only_short` 构造 policy prompt
+9. 调用 `PrefixActionPolicy` 输出 4 类 logits
+10. 对 logits 做 `argmax`
+11. 执行 `env.step(action_list)`
+12. 记录指标和 `state_action.json`
 
-- `llm_path`
-- `seq_len`
-- `image_size`
-- `periodicity`
-- `input_dim`
-- `hidden_dim`
-- `prefix_tokens`
-- `prefix_mode`
-- `max_length`
+其中最关键的变化是：
 
-作用是把“checkpoint 中保存的训练参数”和“CLI 临时覆盖参数”统一收口。
+- 线上不再“生成一段分析文本再抽动作”
+- 而是“直接做动作分类并执行”
 
-### 3. `ProjectionPolicyRunner`
+## 当前实现后的文件分工
 
-这是新脚本的主运行器。
+### 1. `run_projection_LLM.py`
 
-职责包括：
+负责：
 
-- 初始化 `CityFlowEnv`
-- 初始化 traffic-series 记录配置
-- 加载 `PrefixActionPolicy`
-- 在线构造 `sequence + prompt`
-- 输出动作并推进仿真
-- 保存日志和统计结果
+- 提供顶层 CLI 入口
+- 对齐 `run_open_LLM.py` 的使用习惯
+- 组织 dataset / roadnet / runtime / config
+- 默认关闭 snapshot / prompt-series
 
-它本质上就是一个“projection 版的在线测试 runner”。
+### 2. `projection_train/run_projection_online.py`
 
-## 在线决策流程
+负责：
 
-每个控制步主要做下面几件事：
+- 复用 projection checkpoint 推理主逻辑
+- 在线构造 sequence
+- 调用 policy 输出动作
+- 统计 reward / queue / travel time
+- 在需要时仍支持 snapshot / prompt-series
 
-1. 从 `CityFlowEnv` 读取当前每个路口状态
-2. 为每个路口恢复最近一段 movement history
-3. 把 history 变成固定长度的 `sequence`
-4. 用 `image_only_short` 构造 policy prompt
-5. 调用 `PrefixActionPolicy` 得到 4 动作 logits
-6. 取 `argmax` 作为当前动作
-7. 执行 `env.step(action_list)`
-8. 记录 reward、queue、travel time、state_action 日志
+### 3. `projection_train/prompt_utils.py`
 
-这里最关键的变化是：
+负责：
 
-- 不再“生成一段回答再抽动作”
-- 而是“直接预测动作”
+- 统一管理 projection 训练/部署使用的 prompt mode
+- 将更完整的交通规则说明注入 `image_only_short`
 
-## 为什么仍然保留 snapshot 和 prompt-series 记录
+### 4. `prompts/prompt_domain_knowledge.json`
 
-即使线上动作已经不是自由生成，snapshot 和 series 记录仍然有价值。
+负责：
 
-保留这部分的原因有三个：
+- 提供可维护的领域 system prompt 前缀
 
-1. 便于后续把线上运行样本重新回灌成训练/诊断数据
-2. 便于离线复盘某个时间点 policy 到底看到了什么输入
-3. 便于和 Stage 3 的 snapshot 仿真逻辑形成统一的数据接口
+## 和最初设计文档相比，哪些判断被修正了
 
-所以新脚本仍然会：
+本次实现落地后，相比最初版本设计，有三处关键修正：
 
-- 周期性写 snapshot
-- 记录 `traffic_prompt_series_*.jsonl`
-- 在 `state_action.json` 里保存：
-  - `raw_prompt`
-  - `policy_prompt`
-  - `action_logits`
-  - `action_probs`
-  - `snapshot_path`
-
-这样线上行为就不只是“给出一个动作”，而是能完整追溯。
-
-## 为什么日志里同时保留 `raw_prompt` 和 `policy_prompt`
-
-这是为了区分两层语义：
-
-- `raw_prompt`
-  - 代表旧系统中面向 LLM 的原始文本描述
-  - 方便和历史日志对齐
-- `policy_prompt`
-  - 代表当前 projection 真正消费的 prompt
-  - 方便排查部署是否真的按 `image_only_short` 生效
-
-这两个字段同时存在，有利于后续分析“文本描述变化”和“真实部署输入”之间的差别。
-
-## 与动作空间的关系
-
-新脚本明确只支持四相位：
-
-- `ETWT`
-- `NTST`
-- `ELWL`
-- `NLSL`
-
-因此 `--eightphase` 在这个脚本里被直接禁止。
-
-原因很直接：
-
-1. Stage 2 / Stage 3 的训练动作空间就是固定四类
-2. checkpoint 输出头维度也是 4
-3. 如果线上放开八相位，只会让部署语义和训练语义错位
-
-## 为什么使用贪心动作而不是采样
-
-当前脚本在线推理选择 `argmax`，而不是从 categorical 分布里采样。
-
-这是部署阶段更合理的默认设置，因为：
-
-1. 在线测试目标是稳定评估当前策略质量
-2. 采样会引入额外方差，影响结果比较
-3. PPO 的采样需求属于训练阶段，不属于部署阶段
-
-如果后续确实需要做 exploration 测试，再单独扩展 `--sample_action` 会更清楚。
-
-## 当前实现的边界
-
-当前脚本已经实现：
-
-- projection checkpoint 的在线加载
-- BC / PPO checkpoint 兼容
-- 训练分布对齐的序列构造
-- projection prompt 线上替换
-- CityFlow 在线仿真接入
-- state / prompt / logits / snapshot 日志记录
-
-当前没有实现：
-
-- 八相位 projection 部署
-- 多种部署策略切换（如温度采样、top-k）
-- 更复杂的线上 ensemble
-
-## 环境层面的注意事项
-
-这次脚本刻意把重型依赖延后到真正加载 `PrefixActionPolicy` 时再触发，并且先设置：
-
-- `TRANSFORMERS_NO_TF=1`
-- `USE_TF=0`
-
-原因是当前项目环境里存在：
-
-- `numpy`
-- `scipy`
-- `transformers`
-
-之间的二进制兼容风险。
-
-这不是这份设计文档的重点，但部署时需要意识到：
-
-- 脚本入口可以轻量工作
-- 真正模型加载仍然依赖一套和训练时一致的可用环境
+1. 不再只有 `projection_train/run_projection_online.py` 一个入口，而是额外补了顶层 `run_projection_LLM.py`
+2. 不再把 snapshot / prompt-series 当作部署默认，而是只保留为 runner 的可选能力
+3. `image_only_short` 不再是极短约束，而是被扩展成“短但信息足够”的规则化 prompt
 
 ## 总结
 
-这次在线脚本的核心不是“把旧的 vLLM 推理代码改一改”，而是把部署语义彻底改成与 Stage 2 / Stage 3 一致的策略前向：
+这次修改的核心，不是简单把旧 `run_open_LLM.py` 替换成另一个脚本，而是把 projection 在线部署真正收敛到和训练一致的动作决策链路上，同时满足用户对工程接口和日志行为的具体要求。
 
-`traffic series -> projection policy -> 4动作 -> CityFlow`
+最终形成的方案是：
 
-这样做的结果是：
+`run_projection_LLM.py -> ProjectionPolicyRunner -> PrefixActionPolicy -> 4动作argmax -> CityFlow`
 
-1. 训练和部署共享同一条动作决策链路
-2. prompt、输入分布、动作头语义都尽量一致
-3. projection 不再只是训练产物，而是真正进入在线仿真闭环
+并且同时满足：
 
-这也更符合原始目标：
+1. 顶层入口风格接近旧脚本
+2. 底层决策语义与 Stage 2 / Stage 3 保持一致
+3. Prompt 在 `image_only_short` 内补充了完整车道/规则说明
+4. 红绿灯相位与时间参数复用了 `utils/config.py`
+5. snapshot 和 prompt-series 在顶层默认关闭
 
-- 把信号控制和在线仿真真正打通
-- 而不是继续停留在“图像 + 长文本 + 生成式抽取动作”的过渡方案
+这样 projection 不再只是训练产物，而是真正以当前项目的既有控制配置接入到在线仿真闭环中。

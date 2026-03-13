@@ -293,6 +293,14 @@ def _safe_positive_int(value: Any, default: int) -> int:
     return resolved
 
 
+def _first_positive_int(*values: Any, fallback: int) -> int:
+    for value in values:
+        resolved = _safe_int(value, 0)
+        if resolved > 0:
+            return resolved
+    return _safe_positive_int(fallback, 1)
+
+
 def _default_cuda_device() -> torch.device:
     local_rank = os.environ.get("LOCAL_RANK")
     if local_rank is not None:
@@ -359,14 +367,18 @@ def _resolve_projection_runtime(args: argparse.Namespace) -> tuple[ProjectionRun
 
     runtime = ProjectionRuntimeConfig(
         llm_path=llm_path,
-        seq_len=_safe_positive_int(args.seq_len, ckpt_args.get("seq_len", 16)),
-        image_size=_safe_positive_int(args.image_size, ckpt_args.get("image_size", 224)),
-        periodicity=_safe_positive_int(args.periodicity, ckpt_args.get("periodicity", 16)),
-        input_dim=_safe_positive_int(args.input_dim, ckpt_args.get("input_dim", len(location_direction_dict))),
-        hidden_dim=_safe_positive_int(args.hidden_dim, ckpt_args.get("hidden_dim", 64)),
-        prefix_tokens=_safe_positive_int(args.prefix_tokens, ckpt_args.get("prefix_tokens", 16)),
+        seq_len=_first_positive_int(args.seq_len, ckpt_args.get("seq_len"), fallback=16),
+        image_size=_first_positive_int(args.image_size, ckpt_args.get("image_size"), fallback=224),
+        periodicity=_first_positive_int(args.periodicity, ckpt_args.get("periodicity"), fallback=16),
+        input_dim=_first_positive_int(
+            args.input_dim,
+            ckpt_args.get("input_dim"),
+            fallback=len(location_direction_dict),
+        ),
+        hidden_dim=_first_positive_int(args.hidden_dim, ckpt_args.get("hidden_dim"), fallback=64),
+        prefix_tokens=_first_positive_int(args.prefix_tokens, ckpt_args.get("prefix_tokens"), fallback=16),
         prefix_mode=str(args.prefix_mode or ckpt_args.get("prefix_mode") or "prefix"),
-        max_length=_safe_positive_int(args.max_length, ckpt_args.get("max_length", 128)),
+        max_length=_first_positive_int(args.max_length, ckpt_args.get("max_length"), fallback=128),
     )
     prompt_mode = str(args.prompt_mode or ckpt_args.get("prompt_mode") or "image_only_short")
     return runtime, prompt_mode
@@ -424,6 +436,9 @@ class ProjectionPolicyRunner:
         device: torch.device,
         torch_dtype: torch.dtype,
         use_wandb: bool,
+        record_snapshots: bool = True,
+        record_traffic_series: bool = True,
+        dump_cityflow_env_args: bool = True,
     ) -> None:
         self.dic_agent_conf = dic_agent_conf
         self.dic_traffic_env_conf = dic_traffic_env_conf_local
@@ -436,6 +451,9 @@ class ProjectionPolicyRunner:
         self.device = device
         self.torch_dtype = torch_dtype
         self.use_wandb = use_wandb
+        self.record_snapshots = bool(record_snapshots)
+        self.record_traffic_series = bool(record_traffic_series)
+        self.dump_cityflow_env_args = bool(dump_cityflow_env_args)
         self.env: Optional[CityFlowEnv] = None
         self.policy = None
         self.tokenizer = None
@@ -454,6 +472,7 @@ class ProjectionPolicyRunner:
         self._traffic_series_intersection_index = None
         self._traffic_series_movement_keys = None
         self._traffic_series_last_written_bin = -1
+        self._snapshot_last_written_bin = -1
         self._traffic_series_base_dt = None
 
         self.fail_logs: list[dict[str, Any]] = []
@@ -470,8 +489,10 @@ class ProjectionPolicyRunner:
         path_check(self.dic_path)
         copy_conf_file(self.dic_path, self.dic_agent_conf, self.dic_traffic_env_conf)
         copy_cityflow_file(self.dic_path, self.dic_traffic_env_conf)
-        self._dump_cityflow_env_args()
-        self._ensure_traffic_series_config()
+        if self.dump_cityflow_env_args:
+            self._dump_cityflow_env_args()
+        if self.record_traffic_series:
+            self._ensure_traffic_series_config()
 
         self.env = CityFlowEnv(
             path_to_log=self.dic_path["PATH_TO_WORK_DIRECTORY"],
@@ -540,6 +561,8 @@ class ProjectionPolicyRunner:
         return run_tag
 
     def _ensure_traffic_series_config(self) -> None:
+        if not self.record_traffic_series:
+            return
         if self._traffic_series_initialized:
             return
         base_dir = str(self.dic_agent_conf.get("TRAFFIC_SERIES_OUTPUT_DIR", "")).strip() or os.path.join(
@@ -633,6 +656,8 @@ class ProjectionPolicyRunner:
         predicted_actions: Sequence[str],
         snapshot_paths: Sequence[str],
     ) -> None:
+        if not self.record_traffic_series:
+            return
         if not prompts:
             return
         current_bin = int(current_time_s) // int(self.dic_agent_conf["TRAFFIC_SERIES_INTERVAL"])
@@ -681,9 +706,11 @@ class ProjectionPolicyRunner:
         self._traffic_series_last_written_bin = current_bin
 
     def _maybe_take_snapshot(self, current_time_s: float) -> Optional[str]:
+        if not self.record_snapshots:
+            return None
         interval = int(self.dic_agent_conf["TRAFFIC_SERIES_INTERVAL"])
         current_bin = int(current_time_s) // interval
-        if current_bin <= self._traffic_series_last_written_bin:
+        if current_bin <= self._snapshot_last_written_bin:
             return None
         if self.env is None:
             return None
@@ -696,6 +723,7 @@ class ProjectionPolicyRunner:
         snapshot_path = os.path.join(snapshot_dir, snapshot_name)
         archive = self.env.eng.snapshot()
         archive.dump(snapshot_path)
+        self._snapshot_last_written_bin = current_bin
         # self.env.eng.load_from_file(snapshot_path)
         return snapshot_path
 
@@ -800,6 +828,7 @@ class ProjectionPolicyRunner:
         self._traffic_series_movement_keys = None
         self._traffic_series_base_dt = None
         self._traffic_series_last_written_bin = -1
+        self._snapshot_last_written_bin = -1
         self._load_traffic_series()
         total_reward = 0.0
         queue_length_episode: list[float] = []
@@ -845,7 +874,8 @@ class ProjectionPolicyRunner:
                 state_action_log[idx][-1]["raw_prompt"] = raw_prompts[idx]
                 state_action_log[idx][-1]["action_logits"] = logits_payload[idx]
                 state_action_log[idx][-1]["action_probs"] = probs_payload[idx]
-                state_action_log[idx][-1]["snapshot_path"] = snapshot_paths[idx]
+                if self.record_snapshots and snapshot_paths[idx]:
+                    state_action_log[idx][-1]["snapshot_path"] = snapshot_paths[idx]
 
             self._record_traffic_prompt_series(
                 current_time_s=current_time,

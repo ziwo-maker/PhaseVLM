@@ -97,6 +97,13 @@ class TrajectoryCityFlowEnv:
         interval: float = 1.0,
         reward_alpha: float = 0.1,
         switch_penalty_beta: float = 0.02,
+        waiting_reward_coef: float = -0.02,
+        system_vehicle_reward_coef: float = -0.01,
+        throughput_reward_coef: float = 0.02,
+        starvation_penalty_coef: float = 0.05,
+        starvation_threshold_steps: int = 2,
+        starvation_queue_threshold: float = 8.0,
+        starvation_wait_threshold: float = 45.0,
         reward_info: Optional[Dict[str, float]] = None,
         run_counts: int = 3600,
     ) -> None:
@@ -114,6 +121,13 @@ class TrajectoryCityFlowEnv:
         self.interval = float(interval)
         self.reward_alpha = float(reward_alpha)
         self.switch_penalty_beta = float(switch_penalty_beta)
+        self.waiting_reward_coef = float(waiting_reward_coef)
+        self.system_vehicle_reward_coef = float(system_vehicle_reward_coef)
+        self.throughput_reward_coef = float(throughput_reward_coef)
+        self.starvation_penalty_coef = float(starvation_penalty_coef)
+        self.starvation_threshold_steps = max(1, int(starvation_threshold_steps))
+        self.starvation_queue_threshold = max(1e-6, float(starvation_queue_threshold))
+        self.starvation_wait_threshold = max(1e-6, float(starvation_wait_threshold))
         self.reward_info = dict(reward_info or {"queue_length": -0.25})
         self.run_counts = int(run_counts)
 
@@ -129,6 +143,13 @@ class TrajectoryCityFlowEnv:
         self.current_time_s: float = 0.0
         self.done: bool = False
         self.last_reset_mode: str = "full"
+        self.active_vehicle_ids: set[str] = set()
+        self.movement_lanes_by_intersection: Dict[str, Dict[str, List[str]]] = {}
+        self.phase_lanes_by_intersection: Dict[str, Dict[int, List[str]]] = {}
+        self.enter_lane_to_intersection: Dict[str, str] = {}
+        self.enter_lane_to_phase_indices: Dict[str, List[int]] = {}
+        self.starvation_counters: Dict[str, List[int]] = {}
+        self.prev_local_metrics_by_intersection: Dict[str, Dict[str, Any]] = {}
         self.policy_prompt = build_task_prompt("", mode=self.prompt_mode, action_tags=ACTION_LIST)
 
     def _prepare_env_workspace(self, traffic_file: str) -> Tuple[str, str]:
@@ -300,14 +321,227 @@ class TrajectoryCityFlowEnv:
             for bin_idx in range(prev_bin + 1, current_bin + 1):
                 history.append(self._read_bin_counts(env, inter_id, bin_idx))
 
+    def _collect_active_vehicle_ids(self, env: Optional[CityFlowEnv] = None) -> set[str]:
+        current_env = env or self.env
+        if current_env is None:
+            return set()
+        lane_vehicles = (getattr(current_env, "system_states", {}) or {}).get("get_lane_vehicles", {}) or {}
+        vehicle_ids: set[str] = set()
+        for items in lane_vehicles.values():
+            for veh in items or []:
+                if "shadow" not in str(veh):
+                    vehicle_ids.add(str(veh))
+        return vehicle_ids
+
+    @staticmethod
+    def _action_movement_keys(action_idx: int) -> tuple[str, str]:
+        action_idx = int(action_idx)
+        if action_idx == 0:
+            return ("ET", "WT")
+        if action_idx == 1:
+            return ("NT", "ST")
+        if action_idx == 2:
+            return ("EL", "WL")
+        if action_idx == 3:
+            return ("NL", "SL")
+        return ("ET", "WT")
+
+    @staticmethod
+    def _location_to_prefix(location: str) -> str:
+        text = str(location or "").strip().lower()
+        mapping = {
+            "north": "N",
+            "south": "S",
+            "east": "E",
+            "west": "W",
+        }
+        return mapping.get(text, "")
+
+    def _ensure_intersection_topology(self, env: CityFlowEnv) -> None:
+        current_ids = [inter.inter_name for inter in env.list_intersection]
+        if (
+            self.movement_lanes_by_intersection
+            and set(self.movement_lanes_by_intersection.keys()) == set(current_ids)
+            and self.phase_lanes_by_intersection
+        ):
+            return
+        if env.intersection_dict is None:
+            env.create_intersection_dict()
+
+        movement_lanes_by_intersection: Dict[str, Dict[str, List[str]]] = {}
+        phase_lanes_by_intersection: Dict[str, Dict[int, List[str]]] = {}
+        enter_lane_to_intersection: Dict[str, str] = {}
+        enter_lane_to_phase_indices: Dict[str, List[int]] = {}
+
+        for inter in env.list_intersection:
+            inter_id = inter.inter_name
+            roads = ((env.intersection_dict or {}).get(inter_id) or {}).get("roads") or {}
+            movement_lanes = {key: [] for key in self.movement_keys}
+            for road_id, road_info in roads.items():
+                prefix = self._location_to_prefix(road_info.get("location"))
+                if not prefix:
+                    continue
+                lanes = road_info.get("lanes") or {}
+                for lane_idx in lanes.get("go_straight", []) or []:
+                    lane_id = f"{road_id}_{int(lane_idx)}"
+                    movement_key = f"{prefix}T"
+                    if movement_key in movement_lanes:
+                        movement_lanes[movement_key].append(lane_id)
+                for lane_idx in lanes.get("turn_left", []) or []:
+                    lane_id = f"{road_id}_{int(lane_idx)}"
+                    movement_key = f"{prefix}L"
+                    if movement_key in movement_lanes:
+                        movement_lanes[movement_key].append(lane_id)
+            for movement_key in movement_lanes:
+                movement_lanes[movement_key] = sorted(set(movement_lanes[movement_key]))
+
+            phase_lanes: Dict[int, List[str]] = {}
+            for action_idx in range(len(ACTION_LIST)):
+                lane_ids: List[str] = []
+                for movement_key in self._action_movement_keys(action_idx):
+                    lane_ids.extend(movement_lanes.get(movement_key, []) or [])
+                deduped_lane_ids = sorted(set(lane_ids))
+                phase_lanes[action_idx] = deduped_lane_ids
+                for lane_id in deduped_lane_ids:
+                    enter_lane_to_phase_indices.setdefault(lane_id, []).append(action_idx)
+
+            movement_lanes_by_intersection[inter_id] = movement_lanes
+            phase_lanes_by_intersection[inter_id] = phase_lanes
+            for lane_id in inter.list_entering_lanes:
+                enter_lane_to_intersection[lane_id] = inter_id
+
+        self.movement_lanes_by_intersection = movement_lanes_by_intersection
+        self.phase_lanes_by_intersection = phase_lanes_by_intersection
+        self.enter_lane_to_intersection = enter_lane_to_intersection
+        self.enter_lane_to_phase_indices = enter_lane_to_phase_indices
+
+    def _collect_local_metrics(self, env: Optional[CityFlowEnv] = None) -> Dict[str, Dict[str, Any]]:
+        current_env = env or self.env
+        if current_env is None:
+            return {}
+        self._ensure_intersection_topology(current_env)
+
+        waiting_values_by_intersection = {inter_id: [] for inter_id in self.intersection_ids}
+        waiting_values_by_phase = {
+            inter_id: {action_idx: [] for action_idx in range(len(ACTION_LIST))}
+            for inter_id in self.intersection_ids
+        }
+        for vehicle_info in (current_env.waiting_vehicle_list or {}).values():
+            lane_id = str(vehicle_info.get("link") or "")
+            inter_id = self.enter_lane_to_intersection.get(lane_id)
+            if inter_id is None:
+                continue
+            wait_time = float(vehicle_info.get("time") or 0.0)
+            waiting_values_by_intersection.setdefault(inter_id, []).append(wait_time)
+            for action_idx in self.enter_lane_to_phase_indices.get(lane_id, []):
+                waiting_values_by_phase.setdefault(inter_id, {}).setdefault(action_idx, []).append(wait_time)
+
+        lane_waiting = ((getattr(current_env, "system_states", {}) or {}).get("get_lane_waiting_vehicle_count", {})) or {}
+        local_metrics: Dict[str, Dict[str, Any]] = {}
+        for inter in current_env.list_intersection:
+            inter_id = inter.inter_name
+            phase_queue_sums: Dict[int, float] = {}
+            phase_wait_means: Dict[int, float] = {}
+            for action_idx in range(len(ACTION_LIST)):
+                lane_ids = self.phase_lanes_by_intersection.get(inter_id, {}).get(action_idx, []) or []
+                phase_queue_sums[action_idx] = float(
+                    sum(float(lane_waiting.get(lane_id, 0.0) or 0.0) for lane_id in lane_ids)
+                )
+                phase_waits = waiting_values_by_phase.get(inter_id, {}).get(action_idx, [])
+                phase_wait_means[action_idx] = float(np.mean(phase_waits) if phase_waits else 0.0)
+            inter_waits = waiting_values_by_intersection.get(inter_id, [])
+            local_metrics[inter_id] = {
+                "queue_sum": float(
+                    sum((inter.dic_feature or {}).get("lane_num_waiting_vehicle_in", []) or [])
+                ),
+                "waiting_time_mean": float(np.mean(inter_waits) if inter_waits else 0.0),
+                "phase_queue_sums": phase_queue_sums,
+                "phase_wait_means": phase_wait_means,
+            }
+        return local_metrics
+
+    def _phase_demand_scale(self, local_metrics: Dict[str, Any], action_idx: int) -> float:
+        phase_queue = float((local_metrics.get("phase_queue_sums") or {}).get(int(action_idx), 0.0))
+        phase_wait = float((local_metrics.get("phase_wait_means") or {}).get(int(action_idx), 0.0))
+        queue_scale = phase_queue / self.starvation_queue_threshold if phase_queue >= self.starvation_queue_threshold else 0.0
+        wait_scale = phase_wait / self.starvation_wait_threshold if phase_wait >= self.starvation_wait_threshold else 0.0
+        return float(max(queue_scale, wait_scale))
+
+    def _update_starvation_penalty(
+        self,
+        intersection_id: str,
+        selected_action: int,
+        local_metrics: Dict[str, Any],
+    ) -> tuple[float, List[int], Dict[int, float]]:
+        counters = list(self.starvation_counters.get(intersection_id, [0] * len(ACTION_LIST)))
+        demand_scales: Dict[int, float] = {}
+        starvation_penalty = 0.0
+        selected_action = int(selected_action)
+
+        for action_idx in range(len(ACTION_LIST)):
+            demand_scale = self._phase_demand_scale(local_metrics, action_idx)
+            demand_scales[action_idx] = demand_scale
+            if action_idx == selected_action:
+                counters[action_idx] = 0
+                continue
+            if demand_scale > 0.0:
+                counters[action_idx] += 1
+            else:
+                counters[action_idx] = 0
+            overdue_steps = max(0, counters[action_idx] - self.starvation_threshold_steps + 1)
+            if overdue_steps > 0 and demand_scale > 0.0:
+                starvation_penalty = max(
+                    starvation_penalty,
+                    self.starvation_penalty_coef * demand_scale * float(overdue_steps),
+                )
+
+        self.starvation_counters[intersection_id] = counters
+        return float(starvation_penalty), counters, demand_scales
+
+    def _vehicle_travel_time_sums(self, resolved_end_time: Optional[float] = None) -> Dict[str, float]:
+        if self.env is None:
+            return {}
+        fallback_time = float(
+            self.current_time_s if resolved_end_time is None else resolved_end_time
+        )
+        vehicle_travel_times: Dict[str, float] = {}
+        for inter in self.env.list_intersection:
+            arrive_left_times = getattr(inter, "dic_vehicle_arrive_leave_time", {}) or {}
+            for veh, times in arrive_left_times.items():
+                if "shadow" in str(veh):
+                    continue
+                enter_time = times.get("enter_time")
+                leave_time = times.get("leave_time")
+                if enter_time is None or np.isnan(enter_time):
+                    continue
+                resolved_leave = leave_time if leave_time is not None and not np.isnan(leave_time) else fallback_time
+                vehicle_travel_times[str(veh)] = vehicle_travel_times.get(str(veh), 0.0) + max(
+                    0.0,
+                    float(resolved_leave) - float(enter_time),
+                )
+        return vehicle_travel_times
+
+    def episode_travel_time_mean(self, resolved_end_time: Optional[float] = None) -> float:
+        vehicle_travel_times = self._vehicle_travel_time_sums(resolved_end_time=resolved_end_time)
+        if not vehicle_travel_times:
+            return 0.0
+        return float(np.mean(list(vehicle_travel_times.values())))
+
     def _set_runtime_state(self, env: CityFlowEnv, traffic_file: str, reset_mode: str) -> None:
         self.env = env
         self.current_traffic_file = traffic_file
         self.intersection_ids = [inter.inter_name for inter in env.list_intersection]
+        self._ensure_intersection_topology(env)
         self.prev_actions = [self._base_action_for_intersection(inter) for inter in env.list_intersection]
         self.current_time_s = float(env.get_current_time())
         self.done = False
         self.last_reset_mode = reset_mode
+        self.active_vehicle_ids = self._collect_active_vehicle_ids(env)
+        self.starvation_counters = {
+            inter_id: [0 for _ in range(len(ACTION_LIST))]
+            for inter_id in self.intersection_ids
+        }
+        self.prev_local_metrics_by_intersection = self._collect_local_metrics(env)
 
     def reset(self, traffic_file: str = "") -> Dict[str, Any]:
         resolved_traffic_file = str(traffic_file or self.default_traffic_file)
@@ -343,7 +577,7 @@ class TrajectoryCityFlowEnv:
 
     def current_metrics(self) -> Dict[str, float]:
         if self.env is None:
-            return {"queue_sum": 0.0, "waiting_time_mean": 0.0}
+            return {"queue_sum": 0.0, "waiting_time_mean": 0.0, "active_vehicle_count": 0.0}
         queue_sum = float(
             sum(
                 sum((inter.dic_feature or {}).get("lane_num_waiting_vehicle_in", []) or [])
@@ -352,34 +586,85 @@ class TrajectoryCityFlowEnv:
         )
         waiting_times = [self.env.waiting_vehicle_list[veh]["time"] for veh in self.env.waiting_vehicle_list]
         waiting_time_mean = float(np.mean(waiting_times) if waiting_times else 0.0)
+        active_vehicle_count = float(len(self._collect_active_vehicle_ids(self.env)))
         return {
             "queue_sum": queue_sum,
             "waiting_time_mean": waiting_time_mean,
+            "active_vehicle_count": active_vehicle_count,
         }
 
     def step(self, actions: Sequence[int]) -> Tuple[Dict[str, Any], List[float], bool, Dict[str, Any]]:
         if self.env is None:
             raise RuntimeError("TrajectoryCityFlowEnv is not reset.")
+        if not self.prev_local_metrics_by_intersection:
+            self.prev_local_metrics_by_intersection = self._collect_local_metrics(self.env)
+        prev_active_vehicle_ids = set(self.active_vehicle_ids)
         prev_time_s = float(self.env.get_current_time())
         _, _, done, avg_rewards = self.env.step(list(actions))
         current_time_s = float(self.env.get_current_time())
         self._append_env_history(self.env, prev_time_s=prev_time_s, current_time_s=current_time_s)
 
-        local_rewards = np.asarray(avg_rewards, dtype=np.float32)
-        global_mean_reward = float(local_rewards.mean()) if local_rewards.size > 0 else 0.0
         prev_actions = np.asarray(self.prev_actions, dtype=np.int64)
         action_arr = np.asarray(actions, dtype=np.int64)
         switch_penalty = (action_arr != prev_actions).astype(np.float32)
-        shaped_rewards = local_rewards + self.reward_alpha * global_mean_reward - self.switch_penalty_beta * switch_penalty
+        previous_local_metrics = self.prev_local_metrics_by_intersection
+        current_local_metrics = self._collect_local_metrics(self.env)
+        current_metrics = self.current_metrics()
+        current_active_vehicle_ids = self._collect_active_vehicle_ids(self.env)
+        departed_vehicle_count = float(len(prev_active_vehicle_ids - current_active_vehicle_ids))
+        queue_reward_gain = abs(float(self.reward_info.get("queue_length", -0.25)))
+        wait_reward_gain = abs(float(self.waiting_reward_coef))
+
+        delta_queue_rewards: List[float] = []
+        delta_wait_rewards: List[float] = []
+        starvation_penalties: List[float] = []
+        starvation_counter_list: List[List[int]] = []
+        starvation_demand_scales: List[Dict[int, float]] = []
+        shaped_rewards: List[float] = []
+        for idx, inter_id in enumerate(self.intersection_ids):
+            prev_metric = previous_local_metrics.get(inter_id, {})
+            current_metric = current_local_metrics.get(inter_id, {})
+            delta_queue = float(prev_metric.get("queue_sum", 0.0)) - float(current_metric.get("queue_sum", 0.0))
+            delta_wait = float(prev_metric.get("waiting_time_mean", 0.0)) - float(
+                current_metric.get("waiting_time_mean", 0.0)
+            )
+            delta_queue_reward = queue_reward_gain * delta_queue
+            delta_wait_reward = wait_reward_gain * delta_wait
+            starvation_penalty, starvation_counters, demand_scales = self._update_starvation_penalty(
+                intersection_id=inter_id,
+                selected_action=int(action_arr[idx]),
+                local_metrics=current_metric,
+            )
+            reward = (
+                delta_queue_reward
+                + delta_wait_reward
+                - float(self.switch_penalty_beta) * float(switch_penalty[idx])
+                - starvation_penalty
+            )
+            delta_queue_rewards.append(float(delta_queue_reward))
+            delta_wait_rewards.append(float(delta_wait_reward))
+            starvation_penalties.append(float(starvation_penalty))
+            starvation_counter_list.append(list(starvation_counters))
+            starvation_demand_scales.append(dict(demand_scales))
+            shaped_rewards.append(float(reward))
 
         self.prev_actions = [int(item) for item in action_arr.tolist()]
         self.current_time_s = current_time_s
         self.done = bool(done or current_time_s >= self.run_counts)
+        self.active_vehicle_ids = current_active_vehicle_ids
+        self.prev_local_metrics_by_intersection = current_local_metrics
         info = {
-            "local_rewards": local_rewards.tolist(),
-            "global_mean_reward": global_mean_reward,
+            "base_rewards": np.asarray(avg_rewards, dtype=np.float32).tolist(),
             "switch_penalty": switch_penalty.tolist(),
-            **self.current_metrics(),
+            "delta_queue_rewards": delta_queue_rewards,
+            "delta_wait_rewards": delta_wait_rewards,
+            "starvation_penalties": starvation_penalties,
+            "starvation_counters": starvation_counter_list,
+            "starvation_demand_scales": starvation_demand_scales,
+            "delta_queue_reward_mean": float(np.mean(delta_queue_rewards) if delta_queue_rewards else 0.0),
+            "delta_wait_reward_mean": float(np.mean(delta_wait_rewards) if delta_wait_rewards else 0.0),
+            "starvation_penalty_mean": float(np.mean(starvation_penalties) if starvation_penalties else 0.0),
+            "departed_vehicle_count": departed_vehicle_count,
+            **current_metrics,
         }
-        return self.observe(), shaped_rewards.tolist(), self.done, info
-
+        return self.observe(), shaped_rewards, self.done, info

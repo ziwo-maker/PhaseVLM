@@ -73,6 +73,9 @@ class PrefixActionPolicy(nn.Module):
         device: Optional[torch.device | str] = None,
         with_value_head: bool = False,
         value_hidden_dim: int = 512,
+        backbone: Optional[Qwen3VLBackbone] = None,
+        backbone_fsdp_enabled: bool = False,
+        backbone_fsdp_sharding_strategy: str = "full_shard",
     ) -> None:
         super().__init__()
         self.device = _resolve_device(device)
@@ -81,12 +84,17 @@ class PrefixActionPolicy(nn.Module):
         self.input_dim = int(input_dim)
         self.with_value_head = bool(with_value_head)
 
-        self.backbone = Qwen3VLBackbone(
-            model_path=model_path,
-            torch_dtype=torch_dtype,
-            device=self.device,
-            max_length=self.max_length,
-        )
+        if backbone is None:
+            self.backbone = Qwen3VLBackbone(
+                model_path=model_path,
+                torch_dtype=torch_dtype,
+                device=self.device,
+                max_length=self.max_length,
+                fsdp_enabled=bool(backbone_fsdp_enabled),
+                fsdp_sharding_strategy=str(backbone_fsdp_sharding_strategy or "full_shard"),
+            )
+        else:
+            self.backbone = backbone
         self.ts_projector = TimeSeriesProjector(
             seq_len=seq_len,
             image_size=image_size,
@@ -132,7 +140,8 @@ class PrefixActionPolicy(nn.Module):
                 nn.Linear(int(value_hidden_dim), 1),
             ).to(self.device)
 
-        self.to(self.device)
+        if backbone is None:
+            self.to(self.device)
 
     def _model_dtype(self) -> torch.dtype:
         return getattr(self.backbone.model, "dtype", torch.float32)

@@ -208,6 +208,177 @@ reference policy 直接来自 Stage 2 checkpoint，对应你的“不要把 Stag
 - 切相不是免费的
 - 局部动作不能完全忽略全局状态
 
+## 2026-03-13 补充：reward 改造成局部 delta-queue + delta-wait + starvation penalty
+
+上面这一节描述的是 2026-03-09 第一版 trajectory PPO 的 reward 设计。后续根据实际训练日志和在线回放结果，这个设计已经被更新；如果你现在在看当前代码，reward 部分请以后面这节为准。
+
+### 为什么要改
+
+第一版 reward 的问题不是“PPO 不收敛”，而是“优化方向和最终评估不够一致”：
+
+- `local_reward_i` 本质上仍然来自 `CityFlowEnv` 的绝对 queue 长度
+- `global_mean_reward` / waiting / throughput 这些 shaping 里有不少是全局共享信号
+- 在多路口共享策略训练下，这类共享信号会弱化单路口 credit assignment
+- 实际日志里出现了相位偏科：主干相位占比过高、左转相位长期饥饿
+- 结果就是 `queue` 或 `travel` 有时变好，但 `avg_wait` 被持续做坏
+
+因此这次改动的核心目标不是“再加几个 reward 项”，而是把 reward 从“状态有多差”改成“这个动作是否让本路口状态变好”。
+
+### 新 reward 的定义
+
+当前 `projection_train/trajectory_env.py` 里，PPO 实际使用的 reward 已改成按路口计算：
+
+`r_i = w_q * (queue_prev_i - queue_now_i) + w_w * (wait_prev_i - wait_now_i) - w_s * starvation_i - w_sw * switch_penalty_i`
+
+对应含义：
+
+- `delta-queue`
+  - 看这个路口这一步把排队减少了多少
+  - 如果 queue 从 20 降到 12，就是正奖励
+  - 如果 queue 从 20 升到 28，就是负奖励
+- `delta-wait`
+  - 看这个路口这一步把等待时间拉低了多少
+  - 这样 reward 会更直接对齐 `avg_wait`
+- `starvation penalty`
+  - 如果某个相位对应的 demand 明明持续存在，但连续多个决策周期都没被服务，就额外扣分
+  - 它是专门用来抑制“只顾主干道、把某些 movement 长期饿死”的
+- `switch_penalty`
+  - 保留一个很小的切相代价，避免为了追逐局部 delta 而出现无意义抖动
+
+### 这次具体改了什么
+
+#### 1. 在 `trajectory_env.py` 里新增了按路口、按相位的拓扑与局部统计
+
+为了把 starvation penalty 写对，不能只知道“这个路口现在总 queue 多大”，还必须知道：
+
+- 哪些 lane 属于 `ETWT`
+- 哪些 lane 属于 `NTST`
+- 哪些 lane 属于 `ELWL`
+- 哪些 lane 属于 `NLSL`
+
+所以这次在环境层新增了：
+
+- 路口 -> movement -> lane 的映射
+- 路口 -> phase -> lane 的映射
+- lane -> intersection / phase 的反查表
+
+有了这些表之后，才可以在每一步里真正计算：
+
+- 每个路口自己的 `queue_sum`
+- 每个路口自己的 `waiting_time_mean`
+- 每个 phase 当前对应的 `phase_queue_sums`
+- 每个 phase 当前对应的 `phase_wait_means`
+
+这也是为什么这次 reward 改造是放在 `trajectory_env.py`，而不是直接去改 `CityFlowEnv.get_reward()`。
+
+#### 2. PPO 不再直接吃 `CityFlowEnv` 返回的绝对 queue reward
+
+底层 `CityFlowEnv.step()` 依然会返回原来的 reward，但在当前实现里它只保留为诊断信息：
+
+- `base_rewards`
+
+真正写入 PPO buffer 的已经是新的 shaped reward：
+
+- `delta_queue_reward`
+- `delta_wait_reward`
+- `starvation_penalty`
+- `switch_penalty`
+
+也就是说，现在 Stage 3 的 trajectory PPO 已经不再由“绝对 queue 长度”主导。
+
+#### 3. starvation 被做成显式状态，而不是一次性惩罚
+
+这次不是简单写一个：
+
+- “左转 queue 大就罚”
+
+而是维护了每个路口、每个 phase 的 starvation counter：
+
+- 如果该 phase 当前 demand 不明显，counter 清零
+- 如果该 phase 有 demand，但这一步没被选，counter 增加
+- 超过阈值后，开始按 demand 强度和 overdue 步数扣分
+
+这样做的原因是：
+
+- 不是所有没选中的 phase 都算 starvation
+- 只有“长期不服务且确实有需求”的 phase 才应该被惩罚
+
+### 新增超参
+
+这次在 `train_projection_ppo_traj.py` 里新增了下面这些 starvation 相关参数：
+
+- `--starvation_penalty_coef`
+- `--starvation_threshold_steps`
+- `--starvation_queue_threshold`
+- `--starvation_wait_threshold`
+
+默认值分别是：
+
+- `0.05`
+- `2`
+- `8.0`
+- `45.0`
+
+另外，`queue_reward_coef` 和 `waiting_reward_coef` 现在在 trajectory PPO reward 里按“幅度”使用，也就是只取绝对值。
+
+### 这次改动对命令行参数的影响
+
+当前 reward 主公式里，真正影响 PPO 的主要是：
+
+- `queue_reward_coef`
+- `waiting_reward_coef`
+- `switch_penalty_beta`
+- 四个 starvation 参数
+
+而下面这些旧参数虽然接口还保留着，但已经不再主导 PPO reward：
+
+- `reward_alpha`
+- `system_vehicle_reward_coef`
+- `throughput_reward_coef`
+
+保留这些参数的原因主要是向后兼容，避免旧脚本直接报错；但如果是新一轮 trajectory PPO 实验，应该优先调的是 delta reward 和 starvation 相关参数。
+
+### 训练日志也跟着更新了
+
+为了让 reward 改造后的训练更容易读，这次 rollout 日志里额外加入了三项：
+
+- `dq`
+  - 平均 `delta_queue_reward`
+- `dw`
+  - 平均 `delta_wait_reward`
+- `starve`
+  - 平均 starvation penalty
+
+因此你在训练时，除了继续看：
+
+- `reward`
+- `queue`
+- `wait`
+- `policy`
+- `value`
+- `kl`
+
+还应该特别看：
+
+- `dq` 是否大多数时间为正
+- `dw` 是否不是长期为负
+- `starve` 是否长期居高不下
+
+### 这次改动后的验证状态
+
+相对于 2026-03-09 第一版“只有结构检查”的状态，这次 reward 改造已经额外完成了：
+
+- `projection_train/trajectory_env.py`
+  - 可以独立 import
+- `projection_train/trajectory_env.py`
+  - 通过 `py_compile`
+- `projection_train/train_projection_ppo_traj.py`
+  - 通过 `py_compile`
+
+但完整 import `train_projection_ppo_traj.py` 时，当前 `.venv` 仍然会碰到现有的 `tensorflow / numpy` 兼容问题。
+
+这个问题不是这次 reward 改动引入的，而是当前运行环境本身的问题；如果要真正开始训练，仍然应该使用之前已经跑通过 trajectory PPO 的那套 Python 环境。
+
 ## 为什么 prompt 继续保持 `image_only_short`
 
 trajectory PPO 里我没有把原始长 prompt 重新拉回来，而是继续用：

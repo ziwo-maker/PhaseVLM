@@ -117,19 +117,19 @@ dic_traffic_env_conf = {
     "OBS_LENGTH": 167,
 
     # 最小动作持续时间：一次决策（一次相位设置/切换）至少保持多少秒
-    "MIN_ACTION_TIME": 60,    # 决策时间/控制步长
+    "MIN_ACTION_TIME": 30,    # 决策时间/控制步长
 
     # 统计/评估时间窗口：用于计算reward或统计交通指标的时间粒度（常与 MIN_ACTION_TIME 一致）
-    "MEASURE_TIME": 60,
+    "MEASURE_TIME": 30,
 
     # 是否对相位进行二进制展开（如 one-hot / binary 编码），用于状态表示或模型输入
     "BINARY_PHASE_EXPANSION": True,
 
     # 黄灯持续时间（秒）
-    "YELLOW_TIME": 5,
+    "YELLOW_TIME": 3,
 
     # 全红持续时间（秒），用于相位切换安全过渡（有的仿真为0）
-    "ALL_RED_TIME": 0,
+    "ALL_RED_TIME": 2,
 
     # 相位数量（这里为4相位控制）
     "NUM_PHASES": 4,

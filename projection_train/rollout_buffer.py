@@ -18,6 +18,7 @@ class TrajectoryRolloutBuffer:
         self.actions: List[torch.Tensor] = []
         self.log_probs: List[torch.Tensor] = []
         self.values: List[torch.Tensor] = []
+        self.reference_logits: List[torch.Tensor] = []
         self.rewards: List[torch.Tensor] = []
         self.dones: List[torch.Tensor] = []
         self.advantages: torch.Tensor | None = None
@@ -32,12 +33,15 @@ class TrajectoryRolloutBuffer:
         values: torch.Tensor,
         rewards: torch.Tensor,
         dones: torch.Tensor,
+        reference_logits: torch.Tensor | None = None,
     ) -> None:
         self.sequences.append(sequences.detach().cpu())
         self.prompts.append([str(item) for item in prompts])
         self.actions.append(actions.detach().cpu())
         self.log_probs.append(log_probs.detach().cpu())
         self.values.append(values.detach().cpu())
+        if reference_logits is not None:
+            self.reference_logits.append(reference_logits.detach().cpu())
         self.rewards.append(rewards.detach().cpu())
         self.dones.append(dones.detach().cpu())
 
@@ -87,6 +91,9 @@ class TrajectoryRolloutBuffer:
         actions = torch.cat(self.actions, dim=0).long()
         log_probs = torch.cat(self.log_probs, dim=0).float()
         values = torch.cat(self.values, dim=0).float()
+        reference_logits = None
+        if self.reference_logits:
+            reference_logits = torch.cat(self.reference_logits, dim=0).float()
         advantages = self.advantages.reshape(-1)
         returns = self.returns.reshape(-1)
         advantages = (advantages - advantages.mean()) / advantages.std(unbiased=False).clamp_min(1e-8)
@@ -95,7 +102,7 @@ class TrajectoryRolloutBuffer:
         for items in self.prompts:
             prompts.extend(items)
 
-        return {
+        flat = {
             "sequences": sequences,
             "prompts": prompts,
             "actions": actions,
@@ -104,6 +111,9 @@ class TrajectoryRolloutBuffer:
             "advantages": advantages,
             "returns": returns,
         }
+        if reference_logits is not None:
+            flat["reference_logits"] = reference_logits
+        return flat
 
     def mini_batches(
         self,
@@ -118,7 +128,7 @@ class TrajectoryRolloutBuffer:
         batch_size = max(1, int(mini_batch_size))
         for start in range(0, total, batch_size):
             batch_idx = indices[start : start + batch_size]
-            yield {
+            batch = {
                 "sequences": flat["sequences"][batch_idx],
                 "prompts": [flat["prompts"][idx] for idx in batch_idx],
                 "actions": flat["actions"][batch_idx],
@@ -127,3 +137,6 @@ class TrajectoryRolloutBuffer:
                 "advantages": flat["advantages"][batch_idx],
                 "returns": flat["returns"][batch_idx],
             }
+            if "reference_logits" in flat:
+                batch["reference_logits"] = flat["reference_logits"][batch_idx]
+            yield batch
