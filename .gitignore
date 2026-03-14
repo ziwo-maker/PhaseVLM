@@ -1,5 +1,6 @@
 records/**/*replayLogFile.txt
 records/
+model/
 results/
 data/
 wandb/*

@@ -322,7 +322,7 @@ def main():
         default="cosine",
         choices=["cosine", "linear", "constant"],
     )
-    parser.add_argument("--epochs", type=int, default=80)
+    parser.add_argument("--epochs", type=int, default=60)
     parser.add_argument("--grad_accum_steps", type=int, default=2)
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--val_ratio", type=float, default=0.1)
