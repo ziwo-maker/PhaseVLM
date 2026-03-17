@@ -11,7 +11,7 @@ import sys
 import time
 import uuid
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Sequence
 
@@ -985,6 +985,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--traffic_series_interval", type=int, default=2)
     parser.add_argument("--traffic_series_window", type=int, default=0)
     parser.add_argument("--traffic_series_output_dir", type=str, default="")
+    parser.add_argument("--result_json", type=str, default="")
     parser.add_argument("--bf16", action="store_true", default=False)
     parser.add_argument("--fp16", action="store_true", default=False)
     parser.add_argument("--use_wandb", action="store_true", default=False)
@@ -992,7 +993,18 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def main(args: argparse.Namespace) -> None:
+def _write_result_json(path: str, payload: Dict[str, Any]) -> None:
+    target = str(path or "").strip()
+    if not target:
+        return
+    output_dir = os.path.dirname(target)
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
+    with open(target, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2, ensure_ascii=False)
+
+
+def main(args: argparse.Namespace) -> Dict[str, Any]:
     if args.fp16 and args.bf16:
         raise ValueError("Choose only one of --fp16 or --bf16.")
     if args.eightphase:
@@ -1098,7 +1110,18 @@ def main(args: argparse.Namespace) -> None:
         torch_dtype=torch_dtype,
         use_wandb=args.use_wandb,
     )
-    runner.train_test()
+    results = runner.train_test()
+    payload = {
+        "results": results,
+        "args": vars(args),
+        "runtime": asdict(runtime),
+        "prompt_mode": prompt_mode,
+        "work_dir": runner.dic_path["PATH_TO_WORK_DIRECTORY"],
+        "model_dir": runner.dic_path["PATH_TO_MODEL"],
+        "data_dir": runner.dic_path["PATH_TO_DATA"],
+    }
+    _write_result_json(args.result_json, payload)
+    return payload
 
 
 if __name__ == "__main__":
