@@ -12,6 +12,7 @@ import numpy as np
 
 from projection_train.action_space import ACTION_LIST
 from projection_train.prompt_utils import build_task_prompt
+from projection_train.reward_shaping import compute_local_shaped_reward, resolve_objective_weights
 from projection_train.snapshot_seed_dataset import SnapshotSeedSample
 from utils.cityflow_env import CityFlowEnv
 from utils.config import dic_traffic_env_conf
@@ -104,6 +105,9 @@ class TrajectoryCityFlowEnv:
         starvation_threshold_steps: int = 2,
         starvation_queue_threshold: float = 8.0,
         starvation_wait_threshold: float = 45.0,
+        selection_queue_weight: float = 1.0,
+        selection_wait_weight: float = 1.0,
+        selection_travel_weight: float = 1.0,
         reward_info: Optional[Dict[str, float]] = None,
         run_counts: int = 3600,
     ) -> None:
@@ -128,6 +132,11 @@ class TrajectoryCityFlowEnv:
         self.starvation_threshold_steps = max(1, int(starvation_threshold_steps))
         self.starvation_queue_threshold = max(1e-6, float(starvation_queue_threshold))
         self.starvation_wait_threshold = max(1e-6, float(starvation_wait_threshold))
+        self.objective_weights = resolve_objective_weights(
+            queue_weight=selection_queue_weight,
+            wait_weight=selection_wait_weight,
+            travel_weight=selection_travel_weight,
+        )
         self.reward_info = dict(reward_info or {"queue_length": -0.25})
         self.run_counts = int(run_counts)
 
@@ -426,6 +435,7 @@ class TrajectoryCityFlowEnv:
             inter_id: {action_idx: [] for action_idx in range(len(ACTION_LIST))}
             for inter_id in self.intersection_ids
         }
+        active_vehicle_ids_by_intersection = {inter_id: set() for inter_id in self.intersection_ids}
         for vehicle_info in (current_env.waiting_vehicle_list or {}).values():
             lane_id = str(vehicle_info.get("link") or "")
             inter_id = self.enter_lane_to_intersection.get(lane_id)
@@ -437,6 +447,7 @@ class TrajectoryCityFlowEnv:
                 waiting_values_by_phase.setdefault(inter_id, {}).setdefault(action_idx, []).append(wait_time)
 
         lane_waiting = ((getattr(current_env, "system_states", {}) or {}).get("get_lane_waiting_vehicle_count", {})) or {}
+        lane_vehicles = ((getattr(current_env, "system_states", {}) or {}).get("get_lane_vehicles", {})) or {}
         local_metrics: Dict[str, Dict[str, Any]] = {}
         for inter in current_env.list_intersection:
             inter_id = inter.inter_name
@@ -449,12 +460,20 @@ class TrajectoryCityFlowEnv:
                 )
                 phase_waits = waiting_values_by_phase.get(inter_id, {}).get(action_idx, [])
                 phase_wait_means[action_idx] = float(np.mean(phase_waits) if phase_waits else 0.0)
+            for lane_id in inter.list_entering_lanes:
+                for veh in lane_vehicles.get(lane_id, []) or []:
+                    if "shadow" in str(veh):
+                        continue
+                    active_vehicle_ids_by_intersection.setdefault(inter_id, set()).add(str(veh))
             inter_waits = waiting_values_by_intersection.get(inter_id, [])
+            active_vehicle_ids = set(active_vehicle_ids_by_intersection.get(inter_id, set()))
             local_metrics[inter_id] = {
                 "queue_sum": float(
                     sum((inter.dic_feature or {}).get("lane_num_waiting_vehicle_in", []) or [])
                 ),
                 "waiting_time_mean": float(np.mean(inter_waits) if inter_waits else 0.0),
+                "active_vehicle_count": float(len(active_vehicle_ids)),
+                "active_vehicle_ids": active_vehicle_ids,
                 "phase_queue_sums": phase_queue_sums,
                 "phase_wait_means": phase_wait_means,
             }
@@ -612,11 +631,14 @@ class TrajectoryCityFlowEnv:
         current_metrics = self.current_metrics()
         current_active_vehicle_ids = self._collect_active_vehicle_ids(self.env)
         departed_vehicle_count = float(len(prev_active_vehicle_ids - current_active_vehicle_ids))
-        queue_reward_gain = abs(float(self.reward_info.get("queue_length", -0.25)))
-        wait_reward_gain = abs(float(self.waiting_reward_coef))
 
         delta_queue_rewards: List[float] = []
         delta_wait_rewards: List[float] = []
+        system_vehicle_rewards: List[float] = []
+        throughput_rewards: List[float] = []
+        travel_rewards: List[float] = []
+        delta_active_vehicle_counts: List[float] = []
+        local_throughput_counts: List[float] = []
         starvation_penalties: List[float] = []
         starvation_counter_list: List[List[int]] = []
         starvation_demand_scales: List[Dict[int, float]] = []
@@ -624,29 +646,45 @@ class TrajectoryCityFlowEnv:
         for idx, inter_id in enumerate(self.intersection_ids):
             prev_metric = previous_local_metrics.get(inter_id, {})
             current_metric = current_local_metrics.get(inter_id, {})
-            delta_queue = float(prev_metric.get("queue_sum", 0.0)) - float(current_metric.get("queue_sum", 0.0))
-            delta_wait = float(prev_metric.get("waiting_time_mean", 0.0)) - float(
-                current_metric.get("waiting_time_mean", 0.0)
+            delta_queue = float(current_metric.get("queue_sum", 0.0)) - float(prev_metric.get("queue_sum", 0.0))
+            delta_wait = float(current_metric.get("waiting_time_mean", 0.0)) - float(
+                prev_metric.get("waiting_time_mean", 0.0)
             )
-            delta_queue_reward = queue_reward_gain * delta_queue
-            delta_wait_reward = wait_reward_gain * delta_wait
+            delta_active_vehicle_count = float(current_metric.get("active_vehicle_count", 0.0)) - float(
+                prev_metric.get("active_vehicle_count", 0.0)
+            )
+            prev_local_active_vehicle_ids = set(prev_metric.get("active_vehicle_ids") or set())
+            current_local_active_vehicle_ids = set(current_metric.get("active_vehicle_ids") or set())
+            local_throughput_count = float(len(prev_local_active_vehicle_ids - current_local_active_vehicle_ids))
             starvation_penalty, starvation_counters, demand_scales = self._update_starvation_penalty(
                 intersection_id=inter_id,
                 selected_action=int(action_arr[idx]),
                 local_metrics=current_metric,
             )
-            reward = (
-                delta_queue_reward
-                + delta_wait_reward
-                - float(self.switch_penalty_beta) * float(switch_penalty[idx])
-                - starvation_penalty
+            reward_terms = compute_local_shaped_reward(
+                queue_delta=delta_queue,
+                wait_delta=delta_wait,
+                active_vehicle_delta=delta_active_vehicle_count,
+                throughput_count=local_throughput_count,
+                queue_reward_coef=float(self.reward_info.get("queue_length", -0.25)),
+                waiting_reward_coef=self.waiting_reward_coef,
+                system_vehicle_reward_coef=self.system_vehicle_reward_coef,
+                throughput_reward_coef=self.throughput_reward_coef,
+                switch_penalty=float(self.switch_penalty_beta) * float(switch_penalty[idx]),
+                starvation_penalty=starvation_penalty,
+                objective_weights=self.objective_weights,
             )
-            delta_queue_rewards.append(float(delta_queue_reward))
-            delta_wait_rewards.append(float(delta_wait_reward))
+            delta_queue_rewards.append(float(reward_terms["queue_reward"]))
+            delta_wait_rewards.append(float(reward_terms["wait_reward"]))
+            system_vehicle_rewards.append(float(reward_terms["system_vehicle_reward"]))
+            throughput_rewards.append(float(reward_terms["throughput_reward"]))
+            travel_rewards.append(float(reward_terms["travel_reward"]))
+            delta_active_vehicle_counts.append(float(delta_active_vehicle_count))
+            local_throughput_counts.append(float(local_throughput_count))
             starvation_penalties.append(float(starvation_penalty))
             starvation_counter_list.append(list(starvation_counters))
             starvation_demand_scales.append(dict(demand_scales))
-            shaped_rewards.append(float(reward))
+            shaped_rewards.append(float(reward_terms["reward"]))
 
         self.prev_actions = [int(item) for item in action_arr.tolist()]
         self.current_time_s = current_time_s
@@ -658,13 +696,28 @@ class TrajectoryCityFlowEnv:
             "switch_penalty": switch_penalty.tolist(),
             "delta_queue_rewards": delta_queue_rewards,
             "delta_wait_rewards": delta_wait_rewards,
+            "system_vehicle_rewards": system_vehicle_rewards,
+            "throughput_rewards": throughput_rewards,
+            "travel_rewards": travel_rewards,
+            "delta_active_vehicle_counts": delta_active_vehicle_counts,
+            "local_throughput_counts": local_throughput_counts,
             "starvation_penalties": starvation_penalties,
             "starvation_counters": starvation_counter_list,
             "starvation_demand_scales": starvation_demand_scales,
             "delta_queue_reward_mean": float(np.mean(delta_queue_rewards) if delta_queue_rewards else 0.0),
             "delta_wait_reward_mean": float(np.mean(delta_wait_rewards) if delta_wait_rewards else 0.0),
+            "system_vehicle_reward_mean": float(np.mean(system_vehicle_rewards) if system_vehicle_rewards else 0.0),
+            "throughput_reward_mean": float(np.mean(throughput_rewards) if throughput_rewards else 0.0),
+            "travel_reward_mean": float(np.mean(travel_rewards) if travel_rewards else 0.0),
+            "delta_active_vehicle_count_mean": float(
+                np.mean(delta_active_vehicle_counts) if delta_active_vehicle_counts else 0.0
+            ),
+            "local_throughput_count_mean": float(
+                np.mean(local_throughput_counts) if local_throughput_counts else 0.0
+            ),
             "starvation_penalty_mean": float(np.mean(starvation_penalties) if starvation_penalties else 0.0),
             "departed_vehicle_count": departed_vehicle_count,
+            "objective_weights": dict(self.objective_weights),
             **current_metrics,
         }
         return self.observe(), shaped_rewards, self.done, info

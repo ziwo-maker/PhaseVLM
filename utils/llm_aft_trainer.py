@@ -972,6 +972,10 @@ class LLM_Inference_VLLM:
             f"Write in {language}. Output one sentence with no quotes."
         )
 
+    def _use_llm_clip_caption(self):
+        mode = str(self.clip_caption_mode or "").strip().lower()
+        return mode in ("prompt_llm", "prompt", "llm", "prompt_caption")
+
     def _summarize_history_for_caption(self, history, movement_keys, interval_s, window_s):
         if not history:
             return "No observations."
@@ -1086,6 +1090,8 @@ class LLM_Inference_VLLM:
     def _build_clip_caption_from_prompts(self, prompts):
         if not prompts:
             return []
+        if not self._use_llm_clip_caption():
+            return ["" for _ in prompts]
         instruction = self._clip_caption_instruction()
         caption_prompts = [f"{instruction}\n\nPrompt:\n{prompt}\n\nCaption:" for prompt in prompts]
         return self._generate_clip_captions(caption_prompts)
@@ -1093,6 +1099,8 @@ class LLM_Inference_VLLM:
     def _build_clip_caption_from_history(self, histories, movement_keys, interval_s, window_s):
         if not histories:
             return []
+        if not self._use_llm_clip_caption():
+            return ["" for _ in histories]
         instruction = self._clip_caption_instruction_series()
         caption_prompts = []
         for history in histories:
@@ -1107,6 +1115,7 @@ class LLM_Inference_VLLM:
         expert_actions=None,
         snapshot_paths=None,
         candidate_action_waits=None,
+        candidate_action_metrics=None,
         expert_action_margins=None,
         base_actions=None,
     ):
@@ -1130,6 +1139,8 @@ class LLM_Inference_VLLM:
             expert_actions = ["" for _ in range(len(prompts))]
         if candidate_action_waits is None:
             candidate_action_waits = [{} for _ in range(len(prompts))]
+        if candidate_action_metrics is None:
+            candidate_action_metrics = [{} for _ in range(len(prompts))]
         if expert_action_margins is None:
             expert_action_margins = [None for _ in range(len(prompts))]
         if base_actions is None:
@@ -1181,6 +1192,11 @@ class LLM_Inference_VLLM:
                 if idx < len(candidate_action_waits) and isinstance(candidate_action_waits[idx], dict)
                 else {}
             )
+            action_metrics = (
+                candidate_action_metrics[idx]
+                if idx < len(candidate_action_metrics) and isinstance(candidate_action_metrics[idx], dict)
+                else {}
+            )
             action_margin = (
                 expert_action_margins[idx]
                 if idx < len(expert_action_margins)
@@ -1205,6 +1221,8 @@ class LLM_Inference_VLLM:
                         record["candidate_action_waits"] = {
                             str(key): float(value) for key, value in action_waits.items()
                         }
+                    if action_metrics:
+                        record["candidate_action_metrics"] = action_metrics
                     if action_margin is not None:
                         record["expert_action_margin"] = float(action_margin)
                     if base_action:
@@ -1842,6 +1860,7 @@ class LLM_Inference:
         expert_actions=None,
         snapshot_paths=None,
         candidate_action_waits=None,
+        candidate_action_metrics=None,
         expert_action_margins=None,
         base_actions=None,
     ):
@@ -1865,6 +1884,8 @@ class LLM_Inference:
             expert_actions = ["" for _ in range(len(prompts))]
         if candidate_action_waits is None:
             candidate_action_waits = [{} for _ in range(len(prompts))]
+        if candidate_action_metrics is None:
+            candidate_action_metrics = [{} for _ in range(len(prompts))]
         if expert_action_margins is None:
             expert_action_margins = [None for _ in range(len(prompts))]
         if base_actions is None:
@@ -1900,6 +1921,11 @@ class LLM_Inference:
                 if idx < len(candidate_action_waits) and isinstance(candidate_action_waits[idx], dict)
                 else {}
             )
+            action_metrics = (
+                candidate_action_metrics[idx]
+                if idx < len(candidate_action_metrics) and isinstance(candidate_action_metrics[idx], dict)
+                else {}
+            )
             action_margin = (
                 expert_action_margins[idx]
                 if idx < len(expert_action_margins)
@@ -1924,6 +1950,8 @@ class LLM_Inference:
                         record["candidate_action_waits"] = {
                             str(key): float(value) for key, value in action_waits.items()
                         }
+                    if action_metrics:
+                        record["candidate_action_metrics"] = action_metrics
                     if action_margin is not None:
                         record["expert_action_margin"] = float(action_margin)
                     if base_action:

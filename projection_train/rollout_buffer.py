@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import random
-from typing import Dict, Generator, List, Sequence
+from typing import Dict, Generator, List, Optional, Sequence
 
 import torch
 
@@ -83,7 +83,7 @@ class TrajectoryRolloutBuffer:
         self.advantages = advantages
         self.returns = advantages + values
 
-    def flattened(self) -> Dict[str, torch.Tensor | List[str]]:
+    def flattened(self, max_items: Optional[int] = None) -> Dict[str, torch.Tensor | List[str]]:
         if self.advantages is None or self.returns is None:
             raise RuntimeError("Call compute_returns_and_advantages() before flattening the buffer.")
 
@@ -96,11 +96,24 @@ class TrajectoryRolloutBuffer:
             reference_logits = torch.cat(self.reference_logits, dim=0).float()
         advantages = self.advantages.reshape(-1)
         returns = self.returns.reshape(-1)
-        advantages = (advantages - advantages.mean()) / advantages.std(unbiased=False).clamp_min(1e-8)
 
         prompts: List[str] = []
         for items in self.prompts:
             prompts.extend(items)
+
+        if max_items is not None:
+            limit = max(0, min(int(max_items), int(actions.shape[0])))
+            sequences = sequences[:limit]
+            actions = actions[:limit]
+            log_probs = log_probs[:limit]
+            values = values[:limit]
+            advantages = advantages[:limit]
+            returns = returns[:limit]
+            prompts = prompts[:limit]
+            if reference_logits is not None:
+                reference_logits = reference_logits[:limit]
+
+        advantages = (advantages - advantages.mean()) / advantages.std(unbiased=False).clamp_min(1e-8)
 
         flat = {
             "sequences": sequences,
@@ -119,8 +132,9 @@ class TrajectoryRolloutBuffer:
         self,
         mini_batch_size: int,
         shuffle: bool = True,
+        max_items: Optional[int] = None,
     ) -> Generator[Dict[str, torch.Tensor | List[str]], None, None]:
-        flat = self.flattened()
+        flat = self.flattened(max_items=max_items)
         total = int(flat["actions"].shape[0])
         indices = list(range(total))
         if shuffle:

@@ -1,26 +1,78 @@
 from __future__ import annotations
 
 import argparse
+import logging
 import math
 import os
 import random
 import sys
 from contextlib import nullcontext
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
+from torch.distributed.elastic.multiprocessing.errors import record
 
 _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
 from projection_train.prefix_action_policy import PrefixActionPolicy
+from projection_train.reward_shaping import resolve_objective_weights
 from projection_train.rollout_buffer import TrajectoryRolloutBuffer
 from projection_train.snapshot_seed_dataset import SnapshotSeedDataset
 from projection_train.trajectory_env import TrajectoryCityFlowEnv
+
+_CURRENT_LOGGER: logging.Logger | None = None
+
+
+def configure_stdio() -> None:
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if callable(reconfigure):
+            try:
+                reconfigure(line_buffering=True, write_through=True)
+            except TypeError:
+                reconfigure(line_buffering=True)
+
+
+def setup_logger(output_dir: str, rank: int) -> logging.Logger:
+    run_tag = os.path.basename(os.path.normpath(str(output_dir or ""))) or "stage3_ppo"
+    logger = logging.getLogger(f"projection_train.ppo.{run_tag}.rank{rank}")
+    if logger.handlers:
+        return logger
+
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+    formatter = logging.Formatter(
+        fmt="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+
+    if rank == 0:
+        stream_handler = logging.StreamHandler(sys.stdout)
+        stream_handler.setFormatter(formatter)
+        logger.addHandler(stream_handler)
+
+    os.makedirs(output_dir, exist_ok=True)
+    log_name = "train_progress.log" if rank == 0 else f"train_progress.rank{rank}.log"
+    file_handler = logging.FileHandler(os.path.join(output_dir, log_name), encoding="utf-8")
+    file_handler.setFormatter(formatter)
+    logger.addHandler(file_handler)
+    return logger
+
+
+def set_current_logger(logger: logging.Logger) -> None:
+    global _CURRENT_LOGGER
+    _CURRENT_LOGGER = logger
+
+
+def get_logger() -> logging.Logger:
+    if _CURRENT_LOGGER is not None:
+        return _CURRENT_LOGGER
+    return logging.getLogger("projection_train.ppo")
 
 
 def seed_everything(seed: int) -> None:
@@ -97,6 +149,23 @@ def sync_metrics(
             item /= max(1, world_size)
         resolved[key] = item
     return resolved
+
+
+def resolve_shared_transition_count(local_count: int, device: torch.device) -> int:
+    resolved_local = max(0, int(local_count))
+    if not (dist.is_available() and dist.is_initialized()):
+        return resolved_local
+    min_count = torch.tensor(resolved_local, device=device, dtype=torch.long)
+    max_count = torch.tensor(resolved_local, device=device, dtype=torch.long)
+    dist.all_reduce(min_count, op=dist.ReduceOp.MIN)
+    dist.all_reduce(max_count, op=dist.ReduceOp.MAX)
+    shared_count = int(min_count.item())
+    if int(max_count.item()) != shared_count and is_main_process():
+        get_logger().warning(
+            f"[warn] rank-local PPO transition counts diverged across workers; "
+            f"trimming each rank to the shared minimum {shared_count}."
+        )
+    return shared_count
 
 
 def _dataset_spec(dataset: str) -> tuple[int, str, str]:
@@ -288,6 +357,7 @@ def rollout_once(
     gae_lambda: float,
     sample_actions: bool,
     reference_policy: PrefixActionPolicy | None = None,
+    episode_reset_fn: Callable[[], Dict[str, Any]] | None = None,
 ) -> tuple[TrajectoryRolloutBuffer, Dict[str, float]]:
     buffer = TrajectoryRolloutBuffer(gamma=gamma, gae_lambda=gae_lambda)
     set_policy_mode(policy, is_train=False)
@@ -301,9 +371,12 @@ def rollout_once(
     departed_trace: List[float] = []
     delta_queue_reward_trace: List[float] = []
     delta_wait_reward_trace: List[float] = []
+    system_vehicle_reward_trace: List[float] = []
+    throughput_reward_trace: List[float] = []
+    travel_reward_trace: List[float] = []
     starvation_penalty_trace: List[float] = []
 
-    for _ in range(int(rollout_steps)):
+    for step_idx in range(int(rollout_steps)):
         seq_tensor = torch.tensor(obs["sequences"], dtype=torch.float32, device=device)
         prompts = obs["prompts"]
         with torch.no_grad():
@@ -335,10 +408,16 @@ def rollout_once(
         departed_trace.append(float(info.get("departed_vehicle_count", 0.0)))
         delta_queue_reward_trace.append(float(info.get("delta_queue_reward_mean", 0.0)))
         delta_wait_reward_trace.append(float(info.get("delta_wait_reward_mean", 0.0)))
+        system_vehicle_reward_trace.append(float(info.get("system_vehicle_reward_mean", 0.0)))
+        throughput_reward_trace.append(float(info.get("throughput_reward_mean", 0.0)))
+        travel_reward_trace.append(float(info.get("travel_reward_mean", 0.0)))
         starvation_penalty_trace.append(float(info.get("starvation_penalty_mean", 0.0)))
         obs = next_obs
-        if done:
-            break
+        if done and step_idx + 1 < int(rollout_steps):
+            if episode_reset_fn is not None:
+                obs = episode_reset_fn()
+            else:
+                obs = env.reset(env.current_traffic_file)
 
     if env.done:
         last_values = torch.zeros((len(env.intersection_ids),), dtype=torch.float32)
@@ -360,6 +439,13 @@ def rollout_once(
         "rollout_avg_delta_wait_reward": float(
             np.mean(delta_wait_reward_trace) if delta_wait_reward_trace else 0.0
         ),
+        "rollout_avg_system_vehicle_reward": float(
+            np.mean(system_vehicle_reward_trace) if system_vehicle_reward_trace else 0.0
+        ),
+        "rollout_avg_throughput_reward": float(
+            np.mean(throughput_reward_trace) if throughput_reward_trace else 0.0
+        ),
+        "rollout_avg_travel_reward": float(np.mean(travel_reward_trace) if travel_reward_trace else 0.0),
         "rollout_avg_starvation_penalty": float(
             np.mean(starvation_penalty_trace) if starvation_penalty_trace else 0.0
         ),
@@ -394,8 +480,16 @@ def ppo_update(
             return torch.amp.autocast("cuda", dtype=amp_dtype)
         return nullcontext()
 
+    shared_transition_count = resolve_shared_transition_count(buffer.num_transitions, device=device)
+    if shared_transition_count <= 0:
+        raise RuntimeError("Resolved zero shared transitions for PPO update.")
+
     for _ in range(int(args.ppo_epochs)):
-        for batch in buffer.mini_batches(args.mini_batch_size, shuffle=True):
+        for batch in buffer.mini_batches(
+            args.mini_batch_size,
+            shuffle=True,
+            max_items=shared_transition_count,
+        ):
             sequences = batch["sequences"].to(device)
             prompts = batch["prompts"]
             actions = batch["actions"].to(device)
@@ -632,11 +726,31 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max_grad_norm", type=float, default=1.0)
     parser.add_argument("--reward_alpha", type=float, default=0.1)
     parser.add_argument("--switch_penalty_beta", type=float, default=0.02)
-    parser.add_argument("--queue_reward_coef", type=float, default=-0.25)
+    parser.add_argument(
+        "--queue_reward_coef",
+        type=float,
+        default=-0.25,
+        help="Coefficient on queue change (current - previous). Negative values reward queue reductions.",
+    )
     parser.add_argument("--pressure_reward_coef", type=float, default=0.0)
-    parser.add_argument("--waiting_reward_coef", type=float, default=-0.02)
-    parser.add_argument("--system_vehicle_reward_coef", type=float, default=-0.01)
-    parser.add_argument("--throughput_reward_coef", type=float, default=0.02)
+    parser.add_argument(
+        "--waiting_reward_coef",
+        type=float,
+        default=-0.02,
+        help="Coefficient on waiting-time change (current - previous). Negative values reward waiting-time reductions.",
+    )
+    parser.add_argument(
+        "--system_vehicle_reward_coef",
+        type=float,
+        default=-0.01,
+        help="Coefficient on local active-vehicle-count change (current - previous). Negative values reward clearing vehicles.",
+    )
+    parser.add_argument(
+        "--throughput_reward_coef",
+        type=float,
+        default=0.02,
+        help="Coefficient on local throughput count. Positive values reward vehicles clearing the controlled approaches.",
+    )
     parser.add_argument("--starvation_penalty_coef", type=float, default=0.05)
     parser.add_argument("--starvation_threshold_steps", type=int, default=2)
     parser.add_argument("--starvation_queue_threshold", type=float, default=8.0)
@@ -649,9 +763,24 @@ def parse_args() -> argparse.Namespace:
         default="composite",
         choices=["composite", "reward"],
     )
-    parser.add_argument("--selection_queue_weight", type=float, default=1.0)
-    parser.add_argument("--selection_wait_weight", type=float, default=1.0)
-    parser.add_argument("--selection_travel_weight", type=float, default=1.0)
+    parser.add_argument(
+        "--selection_queue_weight",
+        type=float,
+        default=1.0,
+        help="Relative queue objective weight used in PPO reward shaping and composite checkpoint selection.",
+    )
+    parser.add_argument(
+        "--selection_wait_weight",
+        type=float,
+        default=1.0,
+        help="Relative waiting-time objective weight used in PPO reward shaping and composite checkpoint selection.",
+    )
+    parser.add_argument(
+        "--selection_travel_weight",
+        type=float,
+        default=1.0,
+        help="Relative travel proxy weight used in PPO reward shaping and composite checkpoint selection.",
+    )
     parser.add_argument("--seed", type=int, default=2024)
     parser.add_argument("--device", type=str, default="auto")
     parser.add_argument("--llm_fsdp", type=str, default="off", choices=["off", "on"])
@@ -666,18 +795,27 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+@record
 def main() -> None:
+    configure_stdio()
     args = parse_args()
     if args.fp16 and args.bf16:
         raise ValueError("Choose only one of --fp16 or --bf16.")
     if not (0.0 <= args.snapshot_reset_prob <= 1.0):
         raise ValueError("--snapshot_reset_prob must be within [0, 1].")
+    objective_weights = resolve_objective_weights(
+        queue_weight=args.selection_queue_weight,
+        wait_weight=args.selection_wait_weight,
+        travel_weight=args.selection_travel_weight,
+    )
 
     roadnet_path, traffic_root, run_counts = build_env_paths(args)
     runtime = resolve_runtime(args)
     runtime["value_hidden_dim"] = int(args.value_hidden_dim)
 
     ddp, rank, world_size, device = init_distributed()
+    logger = setup_logger(args.output_dir, rank)
+    set_current_logger(logger)
     if str(args.device or "").strip().lower() not in {"", "auto"}:
         requested_device = resolve_device(args.device)
         if requested_device.type != device.type or requested_device.index != device.index:
@@ -702,6 +840,16 @@ def main() -> None:
             pass
 
     seed_everything(args.seed + rank)
+    logger.info(
+        "Starting Stage 3 PPO training: rank=%d world_size=%d device=%s output_dir=%s",
+        rank,
+        world_size,
+        device,
+        args.output_dir,
+    )
+    logger.info("Training arguments: %s", vars(args))
+    logger.info("Resolved runtime: %s", runtime)
+    logger.info("Resolved PPO objective weights: %s", objective_weights)
 
     reward_info = {
         "queue_length": float(args.queue_reward_coef),
@@ -756,6 +904,9 @@ def main() -> None:
         starvation_threshold_steps=args.starvation_threshold_steps,
         starvation_queue_threshold=args.starvation_queue_threshold,
         starvation_wait_threshold=args.starvation_wait_threshold,
+        selection_queue_weight=args.selection_queue_weight,
+        selection_wait_weight=args.selection_wait_weight,
+        selection_travel_weight=args.selection_travel_weight,
         reward_info=reward_info,
         run_counts=run_counts,
     )
@@ -779,6 +930,9 @@ def main() -> None:
         starvation_threshold_steps=args.starvation_threshold_steps,
         starvation_queue_threshold=args.starvation_queue_threshold,
         starvation_wait_threshold=args.starvation_wait_threshold,
+        selection_queue_weight=args.selection_queue_weight,
+        selection_wait_weight=args.selection_wait_weight,
+        selection_travel_weight=args.selection_travel_weight,
         reward_info=reward_info,
         run_counts=run_counts,
     )
@@ -796,7 +950,7 @@ def main() -> None:
         if len(snapshot_dataset) == 0:
             raise RuntimeError("No valid snapshot seeds were loaded from the resolved snapshot jsonl paths.")
         if is_main_process():
-            print(f"Loaded snapshot seeds: {len(snapshot_dataset)} from {snapshot_jsonl_paths}")
+            logger.info("Loaded snapshot seeds: %d from %s", len(snapshot_dataset), snapshot_jsonl_paths)
 
     if is_main_process():
         os.makedirs(args.output_dir, exist_ok=True)
@@ -806,10 +960,14 @@ def main() -> None:
     rng = random.Random(args.seed + rank)
 
     if is_main_process():
-        print(
-            f"[init] device={device} world_size={world_size} ddp={ddp} "
-            f"llm_fsdp_requested={llm_fsdp_enabled} llm_fsdp_active={getattr(policy.backbone, 'is_fsdp', False)} "
-            "shared_reference_backbone=True"
+        logger.info(
+            "[init] device=%s world_size=%d ddp=%s llm_fsdp_requested=%s "
+            "llm_fsdp_active=%s shared_reference_backbone=True",
+            device,
+            world_size,
+            ddp,
+            llm_fsdp_enabled,
+            getattr(policy.backbone, "is_fsdp", False),
         )
 
     baseline_eval_metrics = evaluate_full_episode(
@@ -825,24 +983,27 @@ def main() -> None:
         args,
     )
     if is_main_process():
-        print(
-            f"[eval 0] reward={baseline_eval_metrics['eval_reward']:.4f} "
-            f"avg_queue={baseline_eval_metrics['eval_avg_queue']:.4f} "
-            f"avg_wait={baseline_eval_metrics['eval_avg_waiting']:.4f} "
-            f"avg_travel={baseline_eval_metrics['eval_avg_travel_time']:.4f} "
-            f"score={resolve_selection_score(baseline_eval_metrics, args):.4f}"
+        logger.info(
+            "[eval 0] reward=%.4f avg_queue=%.4f avg_wait=%.4f avg_travel=%.4f score=%.4f",
+            baseline_eval_metrics["eval_reward"],
+            baseline_eval_metrics["eval_avg_queue"],
+            baseline_eval_metrics["eval_avg_waiting"],
+            baseline_eval_metrics["eval_avg_travel_time"],
+            resolve_selection_score(baseline_eval_metrics, args),
         )
+
+    def _reset_train_env() -> Dict[str, Any]:
+        use_snapshot = snapshot_dataset is not None and rng.random() < args.snapshot_reset_prob
+        if use_snapshot:
+            seed_sample = snapshot_dataset.sample(rng=rng, traffic_file=args.snapshot_traffic_file)
+            return train_env.reset_from_snapshot(seed_sample)
+        return train_env.reset(args.traffic_file)
 
     for update_idx in range(1, args.num_updates + 1):
         # Keep rolling forward inside the same episode and only reset when an
         # episode finishes. Otherwise, full-reset PPO keeps oversampling t=0.
         if train_env.env is None or train_env.done:
-            use_snapshot = snapshot_dataset is not None and rng.random() < args.snapshot_reset_prob
-            if use_snapshot:
-                seed_sample = snapshot_dataset.sample(rng=rng, traffic_file=args.snapshot_traffic_file)
-                train_env.reset_from_snapshot(seed_sample)
-            else:
-                train_env.reset(args.traffic_file)
+            _reset_train_env()
 
         rollout_buffer, rollout_metrics = rollout_once(
             policy=policy,
@@ -853,6 +1014,7 @@ def main() -> None:
             gae_lambda=args.gae_lambda,
             sample_actions=True,
             reference_policy=reference_policy,
+            episode_reset_fn=_reset_train_env,
         )
         update_metrics = ppo_update(
             policy=policy,
@@ -870,17 +1032,28 @@ def main() -> None:
             sum_keys=("rollout_steps", "rollout_transitions"),
         )
         if is_main_process():
-            print(
-                f"[update {update_idx}/{args.num_updates}] "
-                f"reward={merged_metrics['rollout_reward']:.4f} "
-                f"queue={merged_metrics['rollout_avg_queue']:.4f} wait={merged_metrics['rollout_avg_waiting']:.4f} "
-                f"active={merged_metrics['rollout_avg_active_vehicles']:.4f} "
-                f"dq={merged_metrics['rollout_avg_delta_queue_reward']:.4f} "
-                f"dw={merged_metrics['rollout_avg_delta_wait_reward']:.4f} "
-                f"starve={merged_metrics['rollout_avg_starvation_penalty']:.4f} "
-                f"policy={merged_metrics['policy_loss']:.4f} value={merged_metrics['value_loss']:.4f} "
-                f"entropy={merged_metrics['entropy']:.4f} kl={merged_metrics['kl']:.4f} "
-                f"transitions={merged_metrics['rollout_transitions']:.0f}"
+            logger.info(
+                "[update %d/%d] reward=%.4f queue=%.4f wait=%.4f active=%.4f "
+                "dq=%.4f dw=%.4f sv=%.4f thr=%.4f trv=%.4f starve=%.4f "
+                "policy=%.4f value=%.4f entropy=%.4f kl=%.4f "
+                "transitions=%.0f",
+                update_idx,
+                args.num_updates,
+                merged_metrics["rollout_reward"],
+                merged_metrics["rollout_avg_queue"],
+                merged_metrics["rollout_avg_waiting"],
+                merged_metrics["rollout_avg_active_vehicles"],
+                merged_metrics["rollout_avg_delta_queue_reward"],
+                merged_metrics["rollout_avg_delta_wait_reward"],
+                merged_metrics["rollout_avg_system_vehicle_reward"],
+                merged_metrics["rollout_avg_throughput_reward"],
+                merged_metrics["rollout_avg_travel_reward"],
+                merged_metrics["rollout_avg_starvation_penalty"],
+                merged_metrics["policy_loss"],
+                merged_metrics["value_loss"],
+                merged_metrics["entropy"],
+                merged_metrics["kl"],
+                merged_metrics["rollout_transitions"],
             )
 
         should_save = (args.save_every > 0 and update_idx % args.save_every == 0) or update_idx == args.num_updates
@@ -908,12 +1081,14 @@ def main() -> None:
             eval_metrics = add_selection_metrics(eval_metrics, baseline_eval_metrics, args)
             merged_metrics.update(eval_metrics)
             if is_main_process():
-                print(
-                    f"[eval {update_idx}] reward={eval_metrics['eval_reward']:.4f} "
-                    f"avg_queue={eval_metrics['eval_avg_queue']:.4f} "
-                    f"avg_wait={eval_metrics['eval_avg_waiting']:.4f} "
-                    f"avg_travel={eval_metrics['eval_avg_travel_time']:.4f} "
-                    f"score={resolve_selection_score(eval_metrics, args):.4f}"
+                logger.info(
+                    "[eval %d] reward=%.4f avg_queue=%.4f avg_wait=%.4f avg_travel=%.4f score=%.4f",
+                    update_idx,
+                    eval_metrics["eval_reward"],
+                    eval_metrics["eval_avg_queue"],
+                    eval_metrics["eval_avg_waiting"],
+                    eval_metrics["eval_avg_travel_time"],
+                    resolve_selection_score(eval_metrics, args),
                 )
                 save_checkpoint(
                     output_dir=args.output_dir,

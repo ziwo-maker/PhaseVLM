@@ -9,6 +9,7 @@ import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
+from time import perf_counter
 from typing import Any, Dict, List, Sequence
 
 import torch
@@ -16,6 +17,16 @@ import torch
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 RECORDS_ROOT = (REPO_ROOT / "records").resolve()
+
+
+def _configure_stdio() -> None:
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if callable(reconfigure):
+            try:
+                reconfigure(line_buffering=True, write_through=True)
+            except TypeError:
+                reconfigure(line_buffering=True)
 
 
 def _default_python_bin() -> str:
@@ -126,21 +137,49 @@ def _write_text(path: Path, text: str) -> None:
     path.write_text(text, encoding="utf-8")
 
 
+def _append_text(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(text)
+
+
 def _write_json(path: Path, payload: Any) -> None:
     _write_text(path, _json_text(payload) + "\n")
 
 
+def _format_timestamp(value: datetime) -> str:
+    return value.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _render_log_block(title: str, payload: Any) -> str:
+    lines = [f"\n===== {title} =====\n"]
+    if isinstance(payload, str):
+        lines.append(payload)
+        if not payload.endswith("\n"):
+            lines.append("\n")
+    else:
+        lines.append(_json_text(payload))
+        lines.append("\n")
+    return "".join(lines)
+
+
 def _append_log_block(log_path: Path, title: str, payload: Any) -> None:
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-    with log_path.open("a", encoding="utf-8") as handle:
-        handle.write(f"\n===== {title} =====\n")
-        if isinstance(payload, str):
-            handle.write(payload)
-            if not payload.endswith("\n"):
-                handle.write("\n")
-        else:
-            handle.write(_json_text(payload))
-            handle.write("\n")
+    _append_text(log_path, _render_log_block(title, payload))
+
+
+def _emit_live_text(text: str, *log_paths: Path) -> None:
+    sys.stdout.write(text)
+    sys.stdout.flush()
+    seen: set[Path] = set()
+    for log_path in log_paths:
+        if log_path in seen:
+            continue
+        seen.add(log_path)
+        _append_text(log_path, text)
+
+
+def _emit_live_block(title: str, payload: Any, *log_paths: Path) -> None:
+    _emit_live_text(_render_log_block(title, payload), *log_paths)
 
 
 def _write_command_script(path: Path, env_overrides: Dict[str, str], command: Sequence[str]) -> None:
@@ -158,12 +197,15 @@ def _run_command_logged(
     env: Dict[str, str],
     log_path: Path,
     step_name: str,
-) -> int:
+) -> Dict[str, Any]:
     log_path.parent.mkdir(parents=True, exist_ok=True)
+    started_at = datetime.now()
+    started_clock = perf_counter()
     with log_path.open("a", encoding="utf-8") as log_handle:
-        log_handle.write(
-            f"\n===== START {step_name} {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} =====\n"
-        )
+        start_line = f"===== START {step_name} {_format_timestamp(started_at)} ====="
+        sys.stdout.write(f"{start_line}\n")
+        sys.stdout.flush()
+        log_handle.write(f"\n{start_line}\n")
         log_handle.flush()
         process = subprocess.Popen(
             [str(item) for item in command],
@@ -177,13 +219,27 @@ def _run_command_logged(
         assert process.stdout is not None
         for line in process.stdout:
             sys.stdout.write(line)
+            sys.stdout.flush()
             log_handle.write(line)
+            log_handle.flush()
         return_code = process.wait()
-        log_handle.write(
-            f"===== END {step_name} rc={return_code} {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} =====\n"
+        ended_at = datetime.now()
+        duration_seconds = perf_counter() - started_clock
+        end_line = (
+            f"===== END {step_name} rc={return_code} {_format_timestamp(ended_at)} "
+            f"duration={_format_duration(duration_seconds)} ({duration_seconds:.1f}s) ====="
         )
+        sys.stdout.write(f"{end_line}\n")
+        sys.stdout.flush()
+        log_handle.write(f"{end_line}\n")
         log_handle.flush()
-        return return_code
+        return {
+            "return_code": return_code,
+            "started_at": started_at,
+            "ended_at": ended_at,
+            "duration_seconds": duration_seconds,
+            "duration": _format_duration(duration_seconds),
+        }
 
 
 def _load_checkpoint_payload(path: Path) -> Dict[str, Any]:
@@ -309,6 +365,22 @@ def _format_duration(seconds: float) -> str:
     return f"{hours:02d}:{minutes:02d}:{secs:02d}"
 
 
+def _timing_fields(prefix: str, timing: Dict[str, Any] | None) -> Dict[str, Any]:
+    if not timing:
+        return {
+            f"{prefix}_started_at": "",
+            f"{prefix}_ended_at": "",
+            f"{prefix}_duration": "",
+            f"{prefix}_duration_seconds": 0.0,
+        }
+    return {
+        f"{prefix}_started_at": _format_timestamp(timing["started_at"]),
+        f"{prefix}_ended_at": _format_timestamp(timing["ended_at"]),
+        f"{prefix}_duration": str(timing["duration"]),
+        f"{prefix}_duration_seconds": round(float(timing["duration_seconds"]), 3),
+    }
+
+
 def _append_report(report_path: Path, payload: Dict[str, Any]) -> None:
     report_path.parent.mkdir(parents=True, exist_ok=True)
     if not report_path.exists():
@@ -322,6 +394,15 @@ def _append_report(report_path: Path, payload: Dict[str, Any]) -> None:
         f"- started_at: `{payload['started_at']}`",
         f"- ended_at: `{payload['ended_at']}`",
         f"- duration: `{payload['duration']}`",
+        f"- duration_seconds: `{payload.get('duration_seconds', 0.0)}`",
+        f"- train_started_at: `{payload.get('train_started_at', '')}`",
+        f"- train_ended_at: `{payload.get('train_ended_at', '')}`",
+        f"- train_duration: `{payload.get('train_duration', '')}`",
+        f"- train_duration_seconds: `{payload.get('train_duration_seconds', 0.0)}`",
+        f"- test_started_at: `{payload.get('test_started_at', '')}`",
+        f"- test_ended_at: `{payload.get('test_ended_at', '')}`",
+        f"- test_duration: `{payload.get('test_duration', '')}`",
+        f"- test_duration_seconds: `{payload.get('test_duration_seconds', 0.0)}`",
         f"- train_log: `{payload['train_log']}`",
         f"- test_log: `{payload['test_log']}`",
         f"- checkpoint: `{payload.get('checkpoint_path', '')}`",
@@ -384,6 +465,70 @@ def _common_stage_dirs(stage_root: Path) -> Dict[str, Path]:
     }
 
 
+def _wrapper_option_names(stage: str) -> set[str]:
+    option_names = {
+        "--stage_root",
+        "--report_md",
+        "--python_bin",
+        "--torchrun_bin",
+        "--nproc_per_node",
+        "--cuda_visible_devices",
+        "--test_dataset",
+        "--test_traffic_file",
+        "--test_device",
+        "--test_num_rounds",
+        "--test_proj_name",
+        "--test_run_counts",
+        "--test_precision",
+    }
+    if stage == "stage3":
+        option_names.add("--pytorch_cuda_alloc_conf")
+    return option_names
+
+
+def _split_wrapper_and_train_args(argv: Sequence[str]) -> tuple[List[str], List[str]]:
+    values = list(argv)
+    if not values:
+        return [], []
+
+    stage = values[0]
+    if stage not in {"stage2", "stage3"}:
+        return values, []
+
+    wrapper_args = [stage]
+    train_args: List[str] = []
+    option_names = _wrapper_option_names(stage)
+    idx = 1
+
+    while idx < len(values):
+        token = values[idx]
+        if token == "--":
+            train_args.extend(values[idx + 1 :])
+            break
+        if token in {"-h", "--help"}:
+            wrapper_args.append(token)
+            idx += 1
+            continue
+
+        matched = next(
+            (name for name in option_names if token == name or token.startswith(f"{name}=")),
+            None,
+        )
+        if matched is None:
+            train_args.extend(values[idx:])
+            break
+
+        wrapper_args.append(token)
+        if token == matched:
+            idx += 1
+            if idx >= len(values):
+                raise SystemExit(f"Missing value for {matched}")
+            wrapper_args.append(values[idx])
+        idx += 1
+
+    return wrapper_args, train_args
+
+
 def _run_stage(stage_name: str, args: argparse.Namespace) -> int:
     stage_root = _resolve_stage_root(args.stage_root)
     stage_root.mkdir(parents=True, exist_ok=True)
@@ -397,12 +542,13 @@ def _run_stage(stage_name: str, args: argparse.Namespace) -> int:
     test_command_path = dirs["commands_dir"] / "test.sh"
     train_summary_path = dirs["artifacts_dir"] / "train_summary.json"
     test_summary_path = dirs["artifacts_dir"] / "test_summary.json"
+    stage_summary_path = dirs["artifacts_dir"] / "stage_summary.json"
     test_result_json = dirs["artifacts_dir"] / "test_result.json"
     report_path = _abs_path(args.report_md).resolve()
 
     raw_train_args = _strip_remainder(args.train_args)
     if not raw_train_args:
-        raise SystemExit("Train args are required after `--`.")
+        raise SystemExit("Training arguments are required.")
 
     output_dir_default = stage_root / "checkpoints"
     _ensure_option(raw_train_args, "--output_dir", [str(output_dir_default)])
@@ -422,6 +568,8 @@ def _run_stage(stage_name: str, args: argparse.Namespace) -> int:
     if args.stage == "stage3" and str(args.pytorch_cuda_alloc_conf or "").strip():
         train_env["PYTORCH_CUDA_ALLOC_CONF"] = str(args.pytorch_cuda_alloc_conf).strip()
         env_summary["PYTORCH_CUDA_ALLOC_CONF"] = train_env["PYTORCH_CUDA_ALLOC_CONF"]
+    train_env.setdefault("PYTHONUNBUFFERED", "1")
+    env_summary["PYTHONUNBUFFERED"] = train_env["PYTHONUNBUFFERED"]
 
     train_command: List[str] = [str(args.torchrun_bin)]
     if args.stage == "stage3":
@@ -451,6 +599,7 @@ def _run_stage(stage_name: str, args: argparse.Namespace) -> int:
     _write_command_script(train_command_path, env_summary, train_command)
 
     started_at = datetime.now()
+    started_clock = perf_counter()
     status = "train_failed"
     checkpoint_path = ""
     checkpoint_selected = ""
@@ -460,19 +609,37 @@ def _run_stage(stage_name: str, args: argparse.Namespace) -> int:
     training_metrics: Dict[str, Any] = {}
     test_args: Dict[str, Any] = {}
     test_results: Dict[str, Any] = {}
+    train_timing: Dict[str, Any] | None = None
+    test_timing: Dict[str, Any] | None = None
 
-    train_rc = _run_command_logged(train_command, train_env, train_log, "train")
+    train_timing = _run_command_logged(train_command, train_env, train_log, "train")
+    train_rc = int(train_timing["return_code"])
     if train_rc != 0:
         ended_at = datetime.now()
+        duration_seconds = perf_counter() - started_clock
+        stage_summary = {
+            "stage_name": stage_name,
+            "status": status,
+            "stage_root": str(stage_root),
+            "started_at": _format_timestamp(started_at),
+            "ended_at": _format_timestamp(ended_at),
+            "duration": _format_duration(duration_seconds),
+            "duration_seconds": round(duration_seconds, 3),
+            **_timing_fields("train", train_timing),
+            **_timing_fields("test", test_timing),
+        }
+        _write_json(stage_summary_path, stage_summary)
+        _emit_live_block("Stage Timing Summary", stage_summary, train_log)
         _append_report(
             report_path,
             {
                 "stage_name": stage_name,
                 "status": status,
                 "stage_root": str(stage_root),
-                "started_at": started_at.strftime("%Y-%m-%d %H:%M:%S"),
-                "ended_at": ended_at.strftime("%Y-%m-%d %H:%M:%S"),
-                "duration": _format_duration((ended_at - started_at).total_seconds()),
+                "started_at": _format_timestamp(started_at),
+                "ended_at": _format_timestamp(ended_at),
+                "duration": _format_duration(duration_seconds),
+                "duration_seconds": round(duration_seconds, 3),
                 "train_log": str(train_log),
                 "test_log": str(test_log),
                 "train_command": shlex.join(train_command),
@@ -482,6 +649,8 @@ def _run_stage(stage_name: str, args: argparse.Namespace) -> int:
                 "training_metrics": {},
                 "test_args": {},
                 "test_results": {},
+                **_timing_fields("train", train_timing),
+                **_timing_fields("test", test_timing),
             },
         )
         return train_rc
@@ -584,7 +753,8 @@ def _run_stage(stage_name: str, args: argparse.Namespace) -> int:
     )
     _write_command_script(test_command_path, env_summary, test_command)
 
-    test_rc = _run_command_logged(test_command, test_env, test_log, "test")
+    test_timing = _run_command_logged(test_command, test_env, test_log, "test")
+    test_rc = int(test_timing["return_code"])
     if test_rc == 0 and test_result_json.is_file():
         test_payload = json.loads(test_result_json.read_text(encoding="utf-8"))
         test_results = test_payload.get("results") or {}
@@ -596,15 +766,30 @@ def _run_stage(stage_name: str, args: argparse.Namespace) -> int:
         status = "test_failed"
 
     ended_at = datetime.now()
+    duration_seconds = perf_counter() - started_clock
+    stage_summary = {
+        "stage_name": stage_name,
+        "status": status,
+        "stage_root": str(stage_root),
+        "started_at": _format_timestamp(started_at),
+        "ended_at": _format_timestamp(ended_at),
+        "duration": _format_duration(duration_seconds),
+        "duration_seconds": round(duration_seconds, 3),
+        **_timing_fields("train", train_timing),
+        **_timing_fields("test", test_timing),
+    }
+    _write_json(stage_summary_path, stage_summary)
+    _emit_live_block("Stage Timing Summary", stage_summary, train_log, test_log)
     _append_report(
         report_path,
         {
             "stage_name": stage_name,
             "status": status,
             "stage_root": str(stage_root),
-            "started_at": started_at.strftime("%Y-%m-%d %H:%M:%S"),
-            "ended_at": ended_at.strftime("%Y-%m-%d %H:%M:%S"),
-            "duration": _format_duration((ended_at - started_at).total_seconds()),
+            "started_at": _format_timestamp(started_at),
+            "ended_at": _format_timestamp(ended_at),
+            "duration": _format_duration(duration_seconds),
+            "duration_seconds": round(duration_seconds, 3),
             "train_log": str(train_log),
             "test_log": str(test_log),
             "checkpoint_path": checkpoint_path,
@@ -617,6 +802,8 @@ def _run_stage(stage_name: str, args: argparse.Namespace) -> int:
             "training_metrics": training_metrics,
             "test_args": test_args,
             "test_results": test_results,
+            **_timing_fields("train", train_timing),
+            **_timing_fields("test", test_timing),
         },
     )
     return test_rc if test_rc != 0 else 0
@@ -664,8 +851,11 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> int:
+    _configure_stdio()
+    wrapper_argv, train_args = _split_wrapper_and_train_args(sys.argv[1:])
     parser = _build_parser()
-    args = parser.parse_args()
+    args = parser.parse_args(wrapper_argv)
+    args.train_args = list(getattr(args, "train_args", [])) + train_args
     stage_name = "Stage 2 BC" if args.stage == "stage2" else "Stage 3 PPO"
     return _run_stage(stage_name, args)
 

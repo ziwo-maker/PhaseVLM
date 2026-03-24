@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import argparse
+import logging
 import math
 import os
 import random
 import sys
+import time
 from contextlib import nullcontext
 from typing import Dict, List, Sequence, Tuple
 
@@ -23,6 +25,44 @@ from projection_train.action_space import ACTION_LIST, action_to_index
 from projection_train.grouped_dataset import GroupedTrafficActionDataset, grouped_action_collate
 from projection_train.prefix_action_policy import PrefixActionPolicy
 from projection_train.prompt_utils import build_task_prompt
+
+
+def configure_stdio() -> None:
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if callable(reconfigure):
+            try:
+                reconfigure(line_buffering=True, write_through=True)
+            except TypeError:
+                reconfigure(line_buffering=True)
+
+
+def setup_logger(output_dir: str, rank: int) -> logging.Logger:
+    logger = logging.getLogger(f"projection_train.bc.rank{rank}")
+    if logger.handlers:
+        return logger
+
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+    formatter = logging.Formatter(
+        fmt="%(asctime)s | %(levelname)s | %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+
+    stream_handler = logging.StreamHandler(sys.stdout)
+    stream_handler.setFormatter(formatter)
+    logger.addHandler(stream_handler)
+
+    if rank == 0:
+        os.makedirs(output_dir, exist_ok=True)
+        file_handler = logging.FileHandler(
+            os.path.join(output_dir, "train_progress.log"),
+            encoding="utf-8",
+        )
+        file_handler.setFormatter(formatter)
+        logger.addHandler(file_handler)
+
+    return logger
 
 
 def seed_everything(seed: int) -> None:
@@ -233,10 +273,12 @@ def run_epoch(
     scaler: torch.cuda.amp.GradScaler | None,
     lr_scale_fn,
     global_step_start: int,
+    epoch: int,
     ddp: bool,
     is_train: bool,
     rank: int,
     class_weights: torch.Tensor | None,
+    logger: logging.Logger | None,
 ) -> Tuple[Dict[str, float], int]:
     base_model: PrefixActionPolicy = model.module if hasattr(model, "module") else model
     base_model.backbone.model.eval()
@@ -254,6 +296,8 @@ def run_epoch(
     class_total = torch.zeros(len(ACTION_LIST), dtype=torch.long)
     class_pred_total = torch.zeros(len(ACTION_LIST), dtype=torch.long)
     global_step = global_step_start
+    num_batches = len(loader)
+    epoch_started_at = time.time()
 
     if is_train:
         optimizer.zero_grad(set_to_none=True)
@@ -324,12 +368,30 @@ def run_epoch(
             total_count += int(labels.size(0))
             update_class_stats(preds, labels, class_correct, class_total, class_pred_total)
 
-        if rank == 0 and is_train and args.log_interval > 0 and (step + 1) % args.log_interval == 0:
+        should_log_step = (
+            rank == 0
+            and is_train
+            and logger is not None
+            and (
+                step == 0
+                or (args.log_interval > 0 and (step + 1) % args.log_interval == 0)
+                or (step + 1 == num_batches)
+            )
+        )
+        if should_log_step:
             avg_loss = total_loss / max(1, total_count)
             avg_acc = total_correct / max(1, total_count)
-            print(
-                f"[train step {step + 1}/{len(loader)}] "
-                f"loss={avg_loss:.4f} acc={avg_acc:.4f} lr={current_lr(optimizer):.6g}"
+            logger.info(
+                "[train epoch %d] step %d/%d (%.1f%%) loss=%.4f acc=%.4f lr=%.6g elapsed=%.1fs global_step=%d",
+                epoch,
+                step + 1,
+                num_batches,
+                100.0 * float(step + 1) / max(1, num_batches),
+                avg_loss,
+                avg_acc,
+                current_lr(optimizer),
+                time.time() - epoch_started_at,
+                global_step,
             )
 
     total_loss, total_correct, total_count, class_correct, class_total, class_pred_total = sync_epoch_stats(
@@ -396,12 +458,13 @@ def parse_args() -> argparse.Namespace:
         choices=["hard", "soft", "mixed"],
     )
     parser.add_argument("--soft_target_alpha", type=float, default=0.5)
-    parser.add_argument("--soft_label_temperature", type=float, default=2.0)
+    parser.add_argument("--soft_label_temperature", type=float, default=0.5)
     parser.add_argument("--disable_class_balance", action="store_true", default=False)
     return parser.parse_args()
 
 
 def main() -> None:
+    configure_stdio()
     args = parse_args()
     if args.fp16 and args.bf16:
         raise ValueError("Choose only one of --fp16 or --bf16")
@@ -409,6 +472,8 @@ def main() -> None:
         raise ValueError("--min_lr must be within [0, lr]")
 
     ddp, rank, world_size, device = init_distributed()
+    os.makedirs(args.output_dir, exist_ok=True)
+    logger = setup_logger(args.output_dir, rank)
     seed_everything(args.seed + rank)
     if device.type == "cuda":
         torch.backends.cudnn.benchmark = True
@@ -417,6 +482,17 @@ def main() -> None:
             torch.set_float32_matmul_precision("high")
         except Exception:
             pass
+
+    if rank == 0:
+        logger.info(
+            "Stage 2 BC start: device=%s world_size=%d output_dir=%s log_interval=%d grad_accum_steps=%d",
+            device,
+            world_size,
+            args.output_dir,
+            args.log_interval,
+            args.grad_accum_steps,
+        )
+        logger.info("Loading grouped dataset from: %s", ", ".join(args.data_path))
 
     dataset = GroupedTrafficActionDataset(
         path=args.data_path,
@@ -427,6 +503,8 @@ def main() -> None:
         max_samples=args.max_samples,
         min_action_margin=args.min_action_margin,
     )
+    if rank == 0:
+        logger.info("Loaded dataset with %d samples before split.", len(dataset))
     train_set, val_set = split_dataset(dataset, args.val_ratio, args.seed)
     class_weights = None
     if not args.disable_class_balance:
@@ -478,8 +556,26 @@ def main() -> None:
             else None
         )
 
+    if rank == 0:
+        logger.info(
+            "Prepared dataloaders: train_samples=%d val_samples=%d train_batches=%d val_batches=%d batch_size=%d num_workers=%d",
+            len(train_set),
+            len(val_set) if val_set is not None else 0,
+            len(train_loader),
+            len(val_loader) if val_loader is not None else 0,
+            args.batch_size,
+            args.num_workers,
+        )
+
     amp_dtype = resolve_amp_dtype(args, device)
     torch_dtype = amp_dtype or (torch.bfloat16 if device.type == "cuda" else torch.float32)
+    if rank == 0:
+        logger.info(
+            "Building PrefixActionPolicy from llm_path=%s align_ckpt=%s amp_dtype=%s",
+            args.llm_path,
+            args.align_ckpt,
+            amp_dtype,
+        )
     model = PrefixActionPolicy(
         model_path=args.llm_path,
         seq_len=args.seq_len,
@@ -495,6 +591,8 @@ def main() -> None:
         with_value_head=False,
     )
     model.load_checkpoint(args.align_ckpt, load_value_head=False)
+    if rank == 0:
+        logger.info("Loaded alignment checkpoint and initialized trainable projectors.")
 
     optimizer = torch.optim.AdamW(
         model.trainable_parameters(),
@@ -518,6 +616,9 @@ def main() -> None:
         if ddp:
             train_loader.sampler.set_epoch(epoch)
 
+        if rank == 0:
+            logger.info("Epoch %d/%d started.", epoch + 1, args.epochs)
+
         train_metrics, global_step = run_epoch(
             model=model,
             loader=train_loader,
@@ -528,16 +629,21 @@ def main() -> None:
             scaler=scaler if amp_dtype == torch.float16 else None,
             lr_scale_fn=lr_scale_fn,
             global_step_start=global_step,
+            epoch=epoch + 1,
             ddp=ddp,
             is_train=True,
             rank=rank,
             class_weights=class_weights,
+            logger=logger,
         )
 
         if rank == 0:
-            print(
-                f"[epoch {epoch + 1}] train_loss={train_metrics['loss']:.4f} "
-                f"train_acc={train_metrics['acc']:.4f} train_f1={train_metrics['macro_f1']:.4f}"
+            logger.info(
+                "[epoch %d] train_loss=%.4f train_acc=%.4f train_f1=%.4f",
+                epoch + 1,
+                train_metrics["loss"],
+                train_metrics["acc"],
+                train_metrics["macro_f1"],
             )
 
         if ddp:
@@ -545,6 +651,7 @@ def main() -> None:
 
         val_metrics = None
         if rank == 0 and val_loader is not None:
+            logger.info("Epoch %d/%d validation started.", epoch + 1, args.epochs)
             eval_model: PrefixActionPolicy = model.module if hasattr(model, "module") else model
             with torch.no_grad():
                 val_metrics, _ = run_epoch(
@@ -557,14 +664,19 @@ def main() -> None:
                     scaler=None,
                     lr_scale_fn=lr_scale_fn,
                     global_step_start=global_step,
+                    epoch=epoch + 1,
                     ddp=False,
                     is_train=False,
                     rank=rank,
                     class_weights=class_weights,
+                    logger=logger,
                 )
-            print(
-                f"[epoch {epoch + 1}] val_loss={val_metrics['loss']:.4f} "
-                f"val_acc={val_metrics['acc']:.4f} val_f1={val_metrics['macro_f1']:.4f}"
+            logger.info(
+                "[epoch %d] val_loss=%.4f val_acc=%.4f val_f1=%.4f",
+                epoch + 1,
+                val_metrics["loss"],
+                val_metrics["acc"],
+                val_metrics["macro_f1"],
             )
 
         if rank == 0:
@@ -584,7 +696,7 @@ def main() -> None:
                     }
                 )
 
-            save_checkpoint(
+            last_path = save_checkpoint(
                 output_dir=args.output_dir,
                 filename="last.pt",
                 model=base_model,
@@ -593,8 +705,9 @@ def main() -> None:
                 args=args,
                 metrics=metrics,
             )
+            logger.info("Saved checkpoint: %s", last_path)
             if (epoch + 1) % args.save_every == 0:
-                save_checkpoint(
+                epoch_path = save_checkpoint(
                     output_dir=args.output_dir,
                     filename=f"epoch_{epoch + 1}.pt",
                     model=base_model,
@@ -603,9 +716,10 @@ def main() -> None:
                     args=args,
                     metrics=metrics,
                 )
+                logger.info("Saved checkpoint: %s", epoch_path)
             if monitor > best_metric:
                 best_metric = monitor
-                save_checkpoint(
+                best_path = save_checkpoint(
                     output_dir=args.output_dir,
                     filename="best.pt",
                     model=base_model,
@@ -614,9 +728,13 @@ def main() -> None:
                     args=args,
                     metrics=metrics,
                 )
+                logger.info("Updated best checkpoint: %s", best_path)
 
         if ddp:
             dist.barrier()
+
+    if rank == 0:
+        logger.info("Stage 2 BC training finished.")
 
     if ddp:
         dist.destroy_process_group()

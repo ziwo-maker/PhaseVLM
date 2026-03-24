@@ -4,6 +4,7 @@ import argparse
 import copy
 import fcntl
 import json
+import logging
 import os
 import random
 import shutil
@@ -46,6 +47,41 @@ from utils.my_utils import (
 )
 
 
+def configure_stdio() -> None:
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if callable(reconfigure):
+            try:
+                reconfigure(line_buffering=True, write_through=True)
+            except TypeError:
+                reconfigure(line_buffering=True)
+
+
+def setup_logger(log_path: str) -> logging.Logger:
+    log_dir = os.path.dirname(log_path) or "."
+    os.makedirs(log_dir, exist_ok=True)
+    run_tag = os.path.basename(os.path.normpath(log_dir)) or "projection_test"
+    logger = logging.getLogger(f"projection_train.online.{run_tag}")
+    if logger.handlers:
+        return logger
+
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+    formatter = logging.Formatter(
+        fmt="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+
+    stream_handler = logging.StreamHandler(sys.stdout)
+    stream_handler.setFormatter(formatter)
+    logger.addHandler(stream_handler)
+
+    file_handler = logging.FileHandler(log_path, encoding="utf-8")
+    file_handler.setFormatter(formatter)
+    logger.addHandler(file_handler)
+    return logger
+
+
 @dataclass
 class ProjectionRuntimeConfig:
     llm_path: str
@@ -57,11 +93,6 @@ class ProjectionRuntimeConfig:
     prefix_tokens: int
     prefix_mode: str
     max_length: int
-
-
-class NullLogger:
-    def log(self, payload: Dict[str, Any]) -> None:
-        print(payload)
 
 
 def merge(dic_tmp: Dict[str, Any], dic_to_change: Dict[str, Any]) -> Dict[str, Any]:
@@ -436,6 +467,7 @@ class ProjectionPolicyRunner:
         device: torch.device,
         torch_dtype: torch.dtype,
         use_wandb: bool,
+        logger: logging.Logger | None = None,
         record_snapshots: bool = True,
         record_traffic_series: bool = True,
         dump_cityflow_env_args: bool = True,
@@ -451,6 +483,7 @@ class ProjectionPolicyRunner:
         self.device = device
         self.torch_dtype = torch_dtype
         self.use_wandb = use_wandb
+        self.logger = logger
         self.record_snapshots = bool(record_snapshots)
         self.record_traffic_series = bool(record_traffic_series)
         self.dump_cityflow_env_args = bool(dump_cityflow_env_args)
@@ -474,6 +507,7 @@ class ProjectionPolicyRunner:
         self._traffic_series_last_written_bin = -1
         self._snapshot_last_written_bin = -1
         self._traffic_series_base_dt = None
+        self.log_path = ""
 
         self.fail_logs: list[dict[str, Any]] = []
         os.makedirs("./fails", exist_ok=True)
@@ -487,6 +521,15 @@ class ProjectionPolicyRunner:
 
     def initialize(self) -> None:
         path_check(self.dic_path)
+        self.log_path = os.path.join(self.dic_path["PATH_TO_WORK_DIRECTORY"], "projection_test.log")
+        if self.logger is None:
+            self.logger = setup_logger(self.log_path)
+        self.logger.info(
+            "Initialized projection test workspace: work_dir=%s model_dir=%s data_dir=%s",
+            self.dic_path["PATH_TO_WORK_DIRECTORY"],
+            self.dic_path["PATH_TO_MODEL"],
+            self.dic_path["PATH_TO_DATA"],
+        )
         copy_conf_file(self.dic_path, self.dic_agent_conf, self.dic_traffic_env_conf)
         copy_cityflow_file(self.dic_path, self.dic_traffic_env_conf)
         if self.dump_cityflow_env_args:
@@ -503,6 +546,7 @@ class ProjectionPolicyRunner:
         self.env.reset()
         self._load_traffic_series()
         self.initialize_policy()
+        self.logger.info("Loaded projection checkpoint: %s", self.projection_ckpt)
 
     def initialize_policy(self) -> None:
         try:
@@ -819,7 +863,7 @@ class ProjectionPolicyRunner:
         return rewards
 
     def test(self, logger: Any, test_round: int) -> Dict[str, float]:
-        print("================ Start Projection Test ================")
+        self.logger.info("================ Start Projection Test ================")
         assert self.env is not None
         total_run_cnt = self.dic_traffic_env_conf["RUN_COUNTS"]
         done = False
@@ -899,7 +943,7 @@ class ProjectionPolicyRunner:
                 self.env.waiting_vehicle_list[veh]["time"] for veh in self.env.waiting_vehicle_list
             ]
             waiting_time_episode.append(np.mean(waiting_times) if waiting_times else 0.0)
-            print("Queuing Vehicles:", sum(queue_length_episode))
+            self.logger.info("Queuing Vehicles: %s", sum(queue_length_episode))
 
         vehicle_travel_times: Dict[str, list[float]] = {}
         for inter in self.env.list_intersection:
@@ -926,23 +970,27 @@ class ProjectionPolicyRunner:
             "test_avg_waiting_time_over": float(np.mean(waiting_time_episode) if waiting_time_episode else 0.0),
             "test_avg_travel_time_over": float(total_travel_time),
         }
+        self.logger.info(
+            "Test results: %s",
+            json.dumps(results, ensure_ascii=False, sort_keys=True),
+        )
         if logger is not None:
             logger.log(results)
-        print("Test Round:", test_round, results)
+        self.logger.info("Test Round %d complete.", test_round)
 
         state_action_path = os.path.join(self.dic_path["PATH_TO_WORK_DIRECTORY"], "state_action.json")
         dump_json(state_action_log, state_action_path)
-        print("Testing time:", time.time() - start_time)
+        self.logger.info("Testing time: %.4f", time.time() - start_time)
         self.env.batch_log_2()
         return results
 
     def train_test(self) -> Dict[str, float]:
         all_config = merge(merge(self.dic_agent_conf, self.dic_path), self.dic_traffic_env_conf)
-        logger: Any = NullLogger()
+        logger: Any = None
         run = None
         if self.use_wandb:
             if wandb is None:
-                print("Warning: wandb is unavailable, falling back to console logging.")
+                self.logger.warning("wandb is unavailable, falling back to local logger output.")
             else:
                 run = wandb.init(
                     project=self.dic_traffic_env_conf["PROJECT_NAME"],
@@ -1005,6 +1053,7 @@ def _write_result_json(path: str, payload: Dict[str, Any]) -> None:
 
 
 def main(args: argparse.Namespace) -> Dict[str, Any]:
+    configure_stdio()
     if args.fp16 and args.bf16:
         raise ValueError("Choose only one of --fp16 or --bf16.")
     if args.eightphase:
@@ -1019,11 +1068,6 @@ def main(args: argparse.Namespace) -> Dict[str, Any]:
         raise error.flowFileException("Flow file does not exist.")
 
     runtime, prompt_mode = _resolve_projection_runtime(args)
-    if runtime.input_dim != len(location_direction_dict):
-        print(
-            f"Warning: checkpoint input_dim={runtime.input_dim}, "
-            f"online movement dim defaults to {len(location_direction_dict)}."
-        )
 
     run_counts = int(args.run_counts or default_count)
     if "24h" in args.traffic_file:
@@ -1110,6 +1154,12 @@ def main(args: argparse.Namespace) -> Dict[str, Any]:
         torch_dtype=torch_dtype,
         use_wandb=args.use_wandb,
     )
+    if runtime.input_dim != len(location_direction_dict):
+        runner.logger.warning(
+            "Checkpoint input_dim=%d, online movement dim defaults to %d.",
+            runtime.input_dim,
+            len(location_direction_dict),
+        )
     results = runner.train_test()
     payload = {
         "results": results,
@@ -1119,6 +1169,7 @@ def main(args: argparse.Namespace) -> Dict[str, Any]:
         "work_dir": runner.dic_path["PATH_TO_WORK_DIRECTORY"],
         "model_dir": runner.dic_path["PATH_TO_MODEL"],
         "data_dir": runner.dic_path["PATH_TO_DATA"],
+        "log_path": runner.log_path,
     }
     _write_result_json(args.result_json, payload)
     return payload

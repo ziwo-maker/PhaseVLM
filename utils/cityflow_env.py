@@ -606,7 +606,19 @@ class CityFlowEnv:
         - intersection["roads"][road_id]["num_lanes"]：该 road 在 roadnet 中的总车道数（len(road["lanes"])）。
         - intersection["movement_lane_counts"]：8 个 movement（每方向直行/左转：NT/NL/.../WL）的车道数量统计。
         """
-        roadnet = load_json(f'./{self.dic_path["PATH_TO_DATA"]}/{self.dic_traffic_env_conf["ROADNET_FILE"]}')
+        roadnet_file = self.dic_traffic_env_conf["ROADNET_FILE"]
+        if os.path.isabs(roadnet_file):
+            roadnet_path = roadnet_file
+        else:
+            data_root = self.dic_path.get("PATH_TO_DATA", "")
+            roadnet_path = os.path.join(data_root, roadnet_file) if data_root else roadnet_file
+
+        if not os.path.exists(roadnet_path):
+            fallback_path = os.path.join(self.path_to_work_directory, os.path.basename(roadnet_file))
+            if os.path.exists(fallback_path):
+                roadnet_path = fallback_path
+
+        roadnet = load_json(os.path.abspath(roadnet_path))
 
         intersections_raw = roadnet["intersections"]
         roads_raw = roadnet["roads"]

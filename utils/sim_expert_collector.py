@@ -10,16 +10,13 @@ from utils.my_utils import dump_json, get_state_detail, state2text, getPrompt, c
 
 
 class SimExpertCollector(LLM_Inference_VLLM):
+    _SPILLBACK_JAM_SPACING_M = 7.5
+    _SPILLBACK_BLOCK_THRESHOLD = 0.8
+    _SPILLBACK_BLOCK_WEIGHT = 0.5
+
     def initialize_llm(self):
-        mode = str(self.dic_agent_conf.get("CLIP_CAPTION_MODE", "")).strip().lower()
-        needs_llm = mode in ("prompt_llm", "prompt", "llm", "prompt_caption")
-        llm_path = str(self.dic_agent_conf.get("LLM_PATH", "") or "").strip()
-        if needs_llm and llm_path:
-            super().initialize_llm()
-            return
-        if needs_llm and not llm_path:
-            print("Clip caption mode requires LLM_PATH; falling back to rule-based captions.")
-        # Disable LLM init for simulation-only collector.
+        # SimExpert only does fast rule-based captioning during collection.
+        # LLM caption refinement is handled later by the standalone backfill script.
         self.llm_model = None
         self.tokenizer = None
         self.generation_kwargs = {}
@@ -110,10 +107,118 @@ class SimExpertCollector(LLM_Inference_VLLM):
             horizon = int(self.dic_traffic_env_conf.get("MIN_ACTION_TIME", 1) or 1)
         return max(1, horizon)
 
+    def _expert_score_weights(self):
+        def _safe_float(key, default):
+            try:
+                return float(self.dic_agent_conf.get(key, default))
+            except (TypeError, ValueError):
+                return float(default)
+
+        return {
+            "att": _safe_float("EXPERT_ATT_WEIGHT", 1.0),
+            "aql": _safe_float("EXPERT_AQL_WEIGHT", 1.0),
+            "awt": _safe_float("EXPERT_AWT_WEIGHT", 1.0),
+            "spillback": _safe_float("EXPERT_SPILLBACK_WEIGHT", 0.2),
+        }
+
+    @staticmethod
+    def _metric_mean(values):
+        return float(np.mean(values)) if values else 0.0
+
+    @staticmethod
+    def _minmax_normalize(values, action_names):
+        normalized = {}
+        if not values:
+            for action in action_names:
+                normalized[action] = 0.0
+            return normalized
+
+        min_value = min(values)
+        max_value = max(values)
+        spread = float(max_value - min_value)
+        for idx, action in enumerate(action_names):
+            if spread <= 1e-8:
+                normalized[action] = 0.0
+            else:
+                normalized[action] = float((values[idx] - min_value) / spread)
+        return normalized
+
+    def _score_candidates(self, candidate_metrics, base_action):
+        if not candidate_metrics:
+            return {}, {}, base_action
+
+        weights = self._expert_score_weights()
+        action_names = list(candidate_metrics.keys())
+        raw_values_by_metric = {
+            "att": [float(candidate_metrics[action].get("att", 0.0)) for action in action_names],
+            "aql": [float(candidate_metrics[action].get("aql", 0.0)) for action in action_names],
+            "awt": [float(candidate_metrics[action].get("awt", 0.0)) for action in action_names],
+            "spillback": [float(candidate_metrics[action].get("spillback", 0.0)) for action in action_names],
+        }
+
+        normalized_by_metric = {}
+        for metric, values in raw_values_by_metric.items():
+            normalized_by_metric[metric] = self._minmax_normalize(values, action_names)
+
+        candidate_scores = {}
+        for action in action_names:
+            candidate_scores[action] = float(
+                weights["att"] * normalized_by_metric["att"][action]
+                + weights["aql"] * normalized_by_metric["aql"][action]
+                + weights["awt"] * normalized_by_metric["awt"][action]
+                + weights["spillback"] * normalized_by_metric["spillback"][action]
+            )
+
+        best_action_name = None
+        best_score = None
+        base_action_name = code2action(base_action)
+        for action in action_names:
+            score = float(candidate_scores[action])
+            if best_score is None or score < best_score:
+                best_score = score
+                best_action_name = action
+            elif best_score is not None and abs(score - best_score) < 1e-9 and action == base_action_name:
+                best_action_name = action
+
+        enriched_metrics = {}
+        for action in action_names:
+            enriched_metrics[action] = {
+                "att": float(candidate_metrics[action].get("att", 0.0)),
+                "aql": float(candidate_metrics[action].get("aql", 0.0)),
+                "awt": float(candidate_metrics[action].get("awt", 0.0)),
+                "spillback": float(candidate_metrics[action].get("spillback", 0.0)),
+                "spillback_occupancy": float(candidate_metrics[action].get("spillback_occupancy", 0.0)),
+                "spillback_blocked_ratio": float(candidate_metrics[action].get("spillback_blocked_ratio", 0.0)),
+                "score": float(candidate_scores[action]),
+                "score_mode": "composite_spillback",
+                "score_norm": "minmax",
+                "weight_att": float(weights["att"]),
+                "weight_aql": float(weights["aql"]),
+                "weight_awt": float(weights["awt"]),
+                "weight_spillback": float(weights["spillback"]),
+                "norm_att": float(normalized_by_metric["att"][action]),
+                "norm_aql": float(normalized_by_metric["aql"][action]),
+                "norm_awt": float(normalized_by_metric["awt"][action]),
+                "norm_spillback": float(normalized_by_metric["spillback"][action]),
+            }
+        best_action_code = int(base_action)
+        for cand in range(4):
+            if code2action(cand) == (best_action_name or base_action_name):
+                best_action_code = cand
+                break
+        return candidate_scores, enriched_metrics, best_action_code
+
     def _simulate_candidate(self, inter_idx, action, base_actions, snapshot_path, phase_snapshot):
         env = self.env
         if env is None or snapshot_path is None:
-            return 0.0
+            return {
+                "att": 0.0,
+                "aql": 0.0,
+                "awt": 0.0,
+                "spillback": 0.0,
+                "spillback_occupancy": 0.0,
+                "spillback_blocked_ratio": 0.0,
+            }
 
         env.eng.load_from_file(snapshot_path)
         self._phase_state_restore(phase_snapshot)
@@ -131,10 +236,18 @@ class SimExpertCollector(LLM_Inference_VLLM):
         substeps = int(1 / interval) if interval > 0 else 1
         wait_speed = self._sim_wait_speed()
 
-        total_wait = 0.0
-        unique_waiting = set()
         target_inter = env.list_intersection[inter_idx]
         entering_lanes = list(target_inter.list_entering_lanes)
+        exiting_lanes = list(target_inter.list_exiting_lanes)
+        entering_lane_set = set(entering_lanes)
+        lane_lengths = getattr(target_inter, "lane_length", {}) or {}
+        previous_lane_vehicles = set()
+        lane_travel_times = {}
+        waiting_vehicle_times = {}
+        queue_trace = []
+        wait_trace = []
+        spillback_occupancy_trace = []
+        spillback_blocked_trace = []
 
         for _ in range(horizon):
             for inter in env.list_intersection:
@@ -153,16 +266,85 @@ class SimExpertCollector(LLM_Inference_VLLM):
                     inter.current_phase_duration = 1
 
             lane_vehicles = env.eng.get_lane_vehicles()
-            vehicle_speed = env.eng.get_vehicle_speed()
+            lane_waiting_counts = env.eng.get_lane_waiting_vehicle_count()
+            current_time = float(env.eng.get_current_time())
+            current_lane_vehicles = set()
             for lane in entering_lanes:
-                for veh in lane_vehicles.get(lane, []):
-                    if float(vehicle_speed.get(veh, 0.0)) < wait_speed:
-                        total_wait += 1.0
-                        unique_waiting.add(veh)
+                current_lane_vehicles.update(str(veh) for veh in lane_vehicles.get(lane, []))
 
-        if not unique_waiting:
-            return 0.0
-        return total_wait / len(unique_waiting)
+            new_arrivals = current_lane_vehicles - previous_lane_vehicles
+            new_left = previous_lane_vehicles - current_lane_vehicles
+            for veh in new_arrivals:
+                if veh not in lane_travel_times:
+                    lane_travel_times[veh] = {"enter_time": current_time, "leave_time": np.nan}
+            for veh in new_left:
+                if veh in lane_travel_times and np.isnan(lane_travel_times[veh]["leave_time"]):
+                    lane_travel_times[veh]["leave_time"] = current_time
+            previous_lane_vehicles = current_lane_vehicles
+
+            vehicle_ids = env.eng.get_vehicles(include_waiting=False)
+            seen_vehicle_ids = set()
+            for v_id in vehicle_ids:
+                v_info = env.eng.get_vehicle_info(v_id)
+                seen_vehicle_ids.add(str(v_id))
+                lane_id = str(v_info.get("drivable", ""))
+                speed = float(v_info.get("speed", 0.0))
+                if lane_id in entering_lane_set and speed < wait_speed:
+                    payload = waiting_vehicle_times.get(str(v_id))
+                    if payload is None or payload.get("link") != lane_id:
+                        waiting_vehicle_times[str(v_id)] = {"time": interval, "link": lane_id}
+                    else:
+                        payload["time"] = float(payload.get("time", 0.0)) + interval
+                elif str(v_id) in waiting_vehicle_times:
+                    waiting_vehicle_times.pop(str(v_id), None)
+
+            stale_ids = [veh_id for veh_id in waiting_vehicle_times if veh_id not in seen_vehicle_ids]
+            for veh_id in stale_ids:
+                waiting_vehicle_times.pop(veh_id, None)
+
+            queue_trace.append(
+                float(sum(float(lane_waiting_counts.get(lane, 0.0) or 0.0) for lane in entering_lanes))
+            )
+            wait_trace.append(
+                self._metric_mean([float(payload.get("time", 0.0)) for payload in waiting_vehicle_times.values()])
+            )
+
+            exiting_lane_occupancies = []
+            exiting_lane_blocked = []
+            for lane in exiting_lanes:
+                lane_length = float(lane_lengths.get(lane, 0.0) or 0.0)
+                jam_capacity = max(1.0, lane_length / self._SPILLBACK_JAM_SPACING_M)
+                lane_vehicle_count = float(len(lane_vehicles.get(lane, [])))
+                occupancy = min(1.0, lane_vehicle_count / jam_capacity)
+                lane_waiting = float(lane_waiting_counts.get(lane, 0.0) or 0.0)
+                exiting_lane_occupancies.append(occupancy)
+                exiting_lane_blocked.append(
+                    1.0 if occupancy >= self._SPILLBACK_BLOCK_THRESHOLD and lane_waiting > 0.0 else 0.0
+                )
+
+            spillback_occupancy_trace.append(self._metric_mean(exiting_lane_occupancies))
+            spillback_blocked_trace.append(self._metric_mean(exiting_lane_blocked))
+
+        final_time = float(env.eng.get_current_time())
+        att_values = []
+        for stats in lane_travel_times.values():
+            enter_time = stats.get("enter_time")
+            if enter_time is None or np.isnan(enter_time):
+                continue
+            leave_time = stats.get("leave_time")
+            resolved_leave = leave_time if leave_time is not None and not np.isnan(leave_time) else final_time
+            att_values.append(max(0.0, float(resolved_leave) - float(enter_time)))
+
+        spillback_occupancy = self._metric_mean(spillback_occupancy_trace)
+        spillback_blocked_ratio = self._metric_mean(spillback_blocked_trace)
+        return {
+            "att": self._metric_mean(att_values),
+            "aql": self._metric_mean(queue_trace),
+            "awt": self._metric_mean(wait_trace),
+            "spillback": spillback_occupancy + self._SPILLBACK_BLOCK_WEIGHT * spillback_blocked_ratio,
+            "spillback_occupancy": spillback_occupancy,
+            "spillback_blocked_ratio": spillback_blocked_ratio,
+        }
 
     def test(self, logger, test_round):
         print("================ Start Test ================")
@@ -221,6 +403,7 @@ class SimExpertCollector(LLM_Inference_VLLM):
             expert_actions = []
             action_list = []
             candidate_waits_all = []
+            candidate_metrics_all = []
             expert_action_margins = []
             base_action_names = []
 
@@ -229,25 +412,23 @@ class SimExpertCollector(LLM_Inference_VLLM):
                 for i in range(len(self.env.list_intersection)):
                     base_action = base_actions[i]
                     base_action_names.append(code2action(base_action))
-                    best_action = base_action
-                    best_wait = None
-                    candidate_waits = {}
+                    candidate_metrics = {}
                     for cand in range(4):
-                        avg_wait = self._simulate_candidate(
+                        metrics = self._simulate_candidate(
                             i, cand, base_actions, snapshot_path, phase_snapshot
                         )
-                        candidate_waits[code2action(cand)] = float(avg_wait)
-                        if best_wait is None or avg_wait < best_wait:
-                            best_wait = avg_wait
-                            best_action = cand
-                        elif abs(avg_wait - best_wait) < 1e-9 and cand == base_action:
-                            best_action = cand
+                        candidate_metrics[code2action(cand)] = metrics
+                    candidate_waits, enriched_metrics, best_action = self._score_candidates(
+                        candidate_metrics,
+                        base_action=base_action,
+                    )
                     sorted_waits = sorted(float(value) for value in candidate_waits.values())
                     if len(sorted_waits) >= 2:
                         action_margin = float(sorted_waits[1] - sorted_waits[0])
                     else:
                         action_margin = 0.0
                     candidate_waits_all.append(candidate_waits)
+                    candidate_metrics_all.append(enriched_metrics)
                     expert_action_margins.append(action_margin)
                     expert_actions.append(code2action(best_action))
                     action_list.append(best_action)
@@ -258,6 +439,7 @@ class SimExpertCollector(LLM_Inference_VLLM):
                 for base_action in base_actions:
                     base_action_names.append(code2action(base_action))
                     candidate_waits_all.append({})
+                    candidate_metrics_all.append({})
                     expert_action_margins.append(0.0)
                     expert_actions.append(code2action(base_action))
                     action_list.append(base_action)
@@ -271,6 +453,7 @@ class SimExpertCollector(LLM_Inference_VLLM):
                 expert_actions=expert_actions,
                 snapshot_paths=snapshot_paths,
                 candidate_action_waits=candidate_waits_all,
+                candidate_action_metrics=candidate_metrics_all,
                 expert_action_margins=expert_action_margins,
                 base_actions=base_action_names,
             )
