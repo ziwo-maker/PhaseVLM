@@ -20,7 +20,11 @@ if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
 from projection_train.prefix_action_policy import PrefixActionPolicy
-from projection_train.reward_shaping import resolve_objective_weights
+from projection_train.reward_shaping import (
+    WAIT_REDUCER_CHOICES,
+    WAIT_REDUCER_MIN_POSITIVE,
+    resolve_objective_weights,
+)
 from projection_train.rollout_buffer import TrajectoryRolloutBuffer
 from projection_train.snapshot_seed_dataset import SnapshotSeedDataset
 from projection_train.trajectory_env import TrajectoryCityFlowEnv
@@ -290,15 +294,7 @@ def resolve_runtime(args: argparse.Namespace) -> Dict[str, Any]:
 def resolve_snapshot_jsonl_paths(args: argparse.Namespace) -> List[str]:
     if args.snapshot_jsonl:
         return [str(item) for item in args.snapshot_jsonl if str(item).strip()]
-    ckpt_args = _load_checkpoint_args(args.stage2_ckpt)
-    raw_paths = ckpt_args.get("data_path")
-    if isinstance(raw_paths, str):
-        candidates = [raw_paths]
-    elif isinstance(raw_paths, (list, tuple)):
-        candidates = [str(item) for item in raw_paths]
-    else:
-        candidates = []
-    return [str(item) for item in candidates if str(item).strip()]
+    return []
 
 
 def build_env_paths(args: argparse.Namespace) -> tuple[str, str, int]:
@@ -367,14 +363,15 @@ def rollout_once(
     episode_reward = 0.0
     queue_trace: List[float] = []
     wait_trace: List[float] = []
+    travel_time_trace: List[float] = []
     active_trace: List[float] = []
     departed_trace: List[float] = []
-    delta_queue_reward_trace: List[float] = []
-    delta_wait_reward_trace: List[float] = []
-    system_vehicle_reward_trace: List[float] = []
-    throughput_reward_trace: List[float] = []
+    queue_reward_trace: List[float] = []
+    wait_reward_trace: List[float] = []
+    wait_signal_trace: List[float] = []
     travel_reward_trace: List[float] = []
     starvation_penalty_trace: List[float] = []
+    local_throughput_trace: List[float] = []
 
     for step_idx in range(int(rollout_steps)):
         seq_tensor = torch.tensor(obs["sequences"], dtype=torch.float32, device=device)
@@ -404,14 +401,15 @@ def rollout_once(
         episode_reward += float(sum(rewards))
         queue_trace.append(float(info.get("queue_sum", 0.0)))
         wait_trace.append(float(info.get("waiting_time_mean", 0.0)))
+        travel_time_trace.append(float(info.get("travel_time_mean", 0.0)))
         active_trace.append(float(info.get("active_vehicle_count", 0.0)))
         departed_trace.append(float(info.get("departed_vehicle_count", 0.0)))
-        delta_queue_reward_trace.append(float(info.get("delta_queue_reward_mean", 0.0)))
-        delta_wait_reward_trace.append(float(info.get("delta_wait_reward_mean", 0.0)))
-        system_vehicle_reward_trace.append(float(info.get("system_vehicle_reward_mean", 0.0)))
-        throughput_reward_trace.append(float(info.get("throughput_reward_mean", 0.0)))
+        queue_reward_trace.append(float(info.get("queue_reward_mean", 0.0)))
+        wait_reward_trace.append(float(info.get("wait_reward_mean", 0.0)))
+        wait_signal_trace.append(float(info.get("wait_signal_mean", 0.0)))
         travel_reward_trace.append(float(info.get("travel_reward_mean", 0.0)))
         starvation_penalty_trace.append(float(info.get("starvation_penalty_mean", 0.0)))
+        local_throughput_trace.append(float(info.get("local_throughput_mean", 0.0)))
         obs = next_obs
         if done and step_idx + 1 < int(rollout_steps):
             if episode_reset_fn is not None:
@@ -431,23 +429,18 @@ def rollout_once(
         "rollout_reward": episode_reward,
         "rollout_avg_queue": float(np.mean(queue_trace) if queue_trace else 0.0),
         "rollout_avg_waiting": float(np.mean(wait_trace) if wait_trace else 0.0),
+        "rollout_avg_travel_time": float(np.mean(travel_time_trace) if travel_time_trace else 0.0),
         "rollout_avg_active_vehicles": float(np.mean(active_trace) if active_trace else 0.0),
         "rollout_avg_departed_vehicles": float(np.mean(departed_trace) if departed_trace else 0.0),
-        "rollout_avg_delta_queue_reward": float(
-            np.mean(delta_queue_reward_trace) if delta_queue_reward_trace else 0.0
-        ),
-        "rollout_avg_delta_wait_reward": float(
-            np.mean(delta_wait_reward_trace) if delta_wait_reward_trace else 0.0
-        ),
-        "rollout_avg_system_vehicle_reward": float(
-            np.mean(system_vehicle_reward_trace) if system_vehicle_reward_trace else 0.0
-        ),
-        "rollout_avg_throughput_reward": float(
-            np.mean(throughput_reward_trace) if throughput_reward_trace else 0.0
-        ),
+        "rollout_avg_queue_reward": float(np.mean(queue_reward_trace) if queue_reward_trace else 0.0),
+        "rollout_avg_wait_reward": float(np.mean(wait_reward_trace) if wait_reward_trace else 0.0),
+        "rollout_avg_wait_signal": float(np.mean(wait_signal_trace) if wait_signal_trace else 0.0),
         "rollout_avg_travel_reward": float(np.mean(travel_reward_trace) if travel_reward_trace else 0.0),
         "rollout_avg_starvation_penalty": float(
             np.mean(starvation_penalty_trace) if starvation_penalty_trace else 0.0
+        ),
+        "rollout_avg_local_throughput": float(
+            np.mean(local_throughput_trace) if local_throughput_trace else 0.0
         ),
         "rollout_steps": float(buffer.num_steps),
         "rollout_transitions": float(buffer.num_transitions),
@@ -682,6 +675,32 @@ def save_checkpoint(
     return output_path
 
 
+def log_configuration_warnings(
+    logger: logging.Logger,
+    args: argparse.Namespace,
+    snapshot_jsonl_paths: Sequence[str],
+) -> None:
+    if not snapshot_jsonl_paths and float(args.snapshot_reset_prob) > 0.0:
+        logger.warning(
+            "snapshot_reset_prob=%.3f but no snapshot_jsonl was provided; training will only reset when an episode ends.",
+            float(args.snapshot_reset_prob),
+        )
+    if int(args.rollout_steps) < 4:
+        logger.warning(
+            "rollout_steps=%d is unusually small for PPO and often causes unstable updates.",
+            int(args.rollout_steps),
+        )
+    if int(args.mini_batch_size) <= 1:
+        logger.warning(
+            "mini_batch_size=%d gives the optimizer almost no averaging and can destabilize PPO.",
+            int(args.mini_batch_size),
+        )
+    if str(args.wait_reward_reducer or "").strip().lower() == "min":
+        logger.warning(
+            "wait_reward_reducer=min can make the wait signal collapse toward zero when any nearby approach has a fresh vehicle."
+        )
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--stage2_ckpt", type=str, required=True)
@@ -737,7 +756,7 @@ def parse_args() -> argparse.Namespace:
         "--waiting_reward_coef",
         type=float,
         default=-0.02,
-        help="Coefficient on waiting-time change (current - previous). Negative values reward waiting-time reductions.",
+        help="Coefficient on the resolved wait statistic. Negative values reward lower wait signals.",
     )
     parser.add_argument(
         "--system_vehicle_reward_coef",
@@ -755,6 +774,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--starvation_threshold_steps", type=int, default=2)
     parser.add_argument("--starvation_queue_threshold", type=float, default=8.0)
     parser.add_argument("--starvation_wait_threshold", type=float, default=45.0)
+    parser.add_argument(
+        "--wait_reward_scope",
+        type=str,
+        default="neighborhood",
+        choices=["local", "neighborhood"],
+        help="Whether the wait reward uses only the current intersection or the current intersection plus neighbors.",
+    )
+    parser.add_argument(
+        "--wait_reward_reducer",
+        type=str,
+        default=WAIT_REDUCER_MIN_POSITIVE,
+        choices=list(WAIT_REDUCER_CHOICES),
+        help="Reducer applied to the collected wait values before the wait reward coefficient is applied.",
+    )
     parser.add_argument("--eval_every", type=int, default=10)
     parser.add_argument("--save_every", type=int, default=10)
     parser.add_argument(
@@ -897,6 +930,7 @@ def main() -> None:
         min_action_time=args.min_action_time,
         reward_alpha=args.reward_alpha,
         switch_penalty_beta=args.switch_penalty_beta,
+        queue_reward_coef=args.queue_reward_coef,
         waiting_reward_coef=args.waiting_reward_coef,
         system_vehicle_reward_coef=args.system_vehicle_reward_coef,
         throughput_reward_coef=args.throughput_reward_coef,
@@ -904,6 +938,8 @@ def main() -> None:
         starvation_threshold_steps=args.starvation_threshold_steps,
         starvation_queue_threshold=args.starvation_queue_threshold,
         starvation_wait_threshold=args.starvation_wait_threshold,
+        wait_reward_scope=args.wait_reward_scope,
+        wait_reward_reducer=args.wait_reward_reducer,
         selection_queue_weight=args.selection_queue_weight,
         selection_wait_weight=args.selection_wait_weight,
         selection_travel_weight=args.selection_travel_weight,
@@ -923,6 +959,7 @@ def main() -> None:
         min_action_time=args.min_action_time,
         reward_alpha=args.reward_alpha,
         switch_penalty_beta=args.switch_penalty_beta,
+        queue_reward_coef=args.queue_reward_coef,
         waiting_reward_coef=args.waiting_reward_coef,
         system_vehicle_reward_coef=args.system_vehicle_reward_coef,
         throughput_reward_coef=args.throughput_reward_coef,
@@ -930,6 +967,8 @@ def main() -> None:
         starvation_threshold_steps=args.starvation_threshold_steps,
         starvation_queue_threshold=args.starvation_queue_threshold,
         starvation_wait_threshold=args.starvation_wait_threshold,
+        wait_reward_scope=args.wait_reward_scope,
+        wait_reward_reducer=args.wait_reward_reducer,
         selection_queue_weight=args.selection_queue_weight,
         selection_wait_weight=args.selection_wait_weight,
         selection_travel_weight=args.selection_travel_weight,
@@ -938,6 +977,7 @@ def main() -> None:
     )
 
     snapshot_jsonl_paths = resolve_snapshot_jsonl_paths(args)
+    log_configuration_warnings(logger, args, snapshot_jsonl_paths)
     snapshot_dataset = None
     if snapshot_jsonl_paths:
         snapshot_dataset = SnapshotSeedDataset(
@@ -948,8 +988,13 @@ def main() -> None:
             min_intersections=1,
         )
         if len(snapshot_dataset) == 0:
-            raise RuntimeError("No valid snapshot seeds were loaded from the resolved snapshot jsonl paths.")
-        if is_main_process():
+            snapshot_dataset = None
+            if is_main_process():
+                logger.warning(
+                    "Ignoring snapshot reset because no valid snapshot seeds were loaded from %s.",
+                    snapshot_jsonl_paths,
+                )
+        elif is_main_process():
             logger.info("Loaded snapshot seeds: %d from %s", len(snapshot_dataset), snapshot_jsonl_paths)
 
     if is_main_process():
@@ -983,14 +1028,43 @@ def main() -> None:
         args,
     )
     if is_main_process():
+        baseline_score = resolve_selection_score(baseline_eval_metrics, args)
         logger.info(
             "[eval 0] reward=%.4f avg_queue=%.4f avg_wait=%.4f avg_travel=%.4f score=%.4f",
             baseline_eval_metrics["eval_reward"],
             baseline_eval_metrics["eval_avg_queue"],
             baseline_eval_metrics["eval_avg_waiting"],
             baseline_eval_metrics["eval_avg_travel_time"],
-            resolve_selection_score(baseline_eval_metrics, args),
+            baseline_score,
         )
+        save_checkpoint(
+            output_dir=args.output_dir,
+            filename="baseline.pt",
+            policy=policy,
+            optimizer=optimizer,
+            update_idx=0,
+            args=args,
+            metrics=baseline_eval_metrics,
+        )
+        save_checkpoint(
+            output_dir=args.output_dir,
+            filename="best.pt",
+            policy=policy,
+            optimizer=optimizer,
+            update_idx=0,
+            args=args,
+            metrics=baseline_eval_metrics,
+        )
+        save_checkpoint(
+            output_dir=args.output_dir,
+            filename="last.pt",
+            policy=policy,
+            optimizer=optimizer,
+            update_idx=0,
+            args=args,
+            metrics=baseline_eval_metrics,
+        )
+        best_metric = float(baseline_score)
 
     def _reset_train_env() -> Dict[str, Any]:
         use_snapshot = snapshot_dataset is not None and rng.random() < args.snapshot_reset_prob
@@ -1033,20 +1107,19 @@ def main() -> None:
         )
         if is_main_process():
             logger.info(
-                "[update %d/%d] reward=%.4f queue=%.4f wait=%.4f active=%.4f "
-                "dq=%.4f dw=%.4f sv=%.4f thr=%.4f trv=%.4f starve=%.4f "
-                "policy=%.4f value=%.4f entropy=%.4f kl=%.4f "
+                "[update %d/%d] reward=%.4f queue=%.4f wait=%.4f wait_sig=%.4f travel=%.4f active=%.4f "
+                "rq=%.4f rw=%.4f rt=%.4f starve=%.4f policy=%.4f value=%.4f entropy=%.4f kl=%.4f "
                 "transitions=%.0f",
                 update_idx,
                 args.num_updates,
                 merged_metrics["rollout_reward"],
                 merged_metrics["rollout_avg_queue"],
                 merged_metrics["rollout_avg_waiting"],
+                merged_metrics["rollout_avg_wait_signal"],
+                merged_metrics["rollout_avg_travel_time"],
                 merged_metrics["rollout_avg_active_vehicles"],
-                merged_metrics["rollout_avg_delta_queue_reward"],
-                merged_metrics["rollout_avg_delta_wait_reward"],
-                merged_metrics["rollout_avg_system_vehicle_reward"],
-                merged_metrics["rollout_avg_throughput_reward"],
+                merged_metrics["rollout_avg_queue_reward"],
+                merged_metrics["rollout_avg_wait_reward"],
                 merged_metrics["rollout_avg_travel_reward"],
                 merged_metrics["rollout_avg_starvation_penalty"],
                 merged_metrics["policy_loss"],
@@ -1056,8 +1129,16 @@ def main() -> None:
                 merged_metrics["rollout_transitions"],
             )
 
-        should_save = (args.save_every > 0 and update_idx % args.save_every == 0) or update_idx == args.num_updates
-        if should_save and is_main_process():
+        if is_main_process():
+            save_checkpoint(
+                output_dir=args.output_dir,
+                filename=f"epoch_{update_idx:04d}.pt",
+                policy=policy,
+                optimizer=optimizer,
+                update_idx=update_idx,
+                args=args,
+                metrics=merged_metrics,
+            )
             save_checkpoint(
                 output_dir=args.output_dir,
                 filename="last.pt",

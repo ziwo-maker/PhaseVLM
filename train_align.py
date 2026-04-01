@@ -127,6 +127,16 @@ def split_dataset(dataset, val_ratio: float, seed: int):
     return train_set, val_set
 
 
+def _build_eval_subset(eval_set, max_samples: Optional[int], ddp: bool, rank: int, world_size: int):
+    eval_limit = len(eval_set)
+    if max_samples is not None and int(max_samples) > 0:
+        eval_limit = min(len(eval_set), int(max_samples))
+        eval_set = Subset(eval_set, range(eval_limit))
+    if ddp and world_size > 1:
+        eval_set = Subset(eval_set, range(rank, len(eval_set), world_size))
+    return eval_set, eval_limit
+
+
 def _parse_temperature_sweep(raw: Optional[str], default_value: float) -> list[float]:
     if raw is None:
         return [default_value]
@@ -174,6 +184,13 @@ def _run_training(
         shuffle_samples=False,
     )
     train_set, val_set = split_dataset(dataset, args.val_ratio, args.seed)
+    eval_set, eval_size = _build_eval_subset(
+        val_set,
+        max_samples=args.eval_max_samples,
+        ddp=ddp,
+        rank=rank,
+        world_size=world_size,
+    )
 
     if ddp:
         train_sampler = DistributedSampler(train_set, num_replicas=world_size, rank=rank, shuffle=True)
@@ -186,15 +203,14 @@ def _run_training(
             pin_memory=True,
             drop_last=True,
         )
-        val_loader = None
-        if rank == 0:
-            val_loader = DataLoader(
-                val_set,
-                batch_size=args.batch_size,
-                num_workers=args.num_workers,
-                collate_fn=traffic_clip_collate,
-                pin_memory=True,
-            )
+        val_loader = DataLoader(
+            eval_set,
+            batch_size=args.batch_size,
+            shuffle=False,
+            num_workers=args.num_workers,
+            collate_fn=traffic_clip_collate,
+            pin_memory=True,
+        )
     else:
         train_loader = DataLoader(
             train_set,
@@ -205,7 +221,7 @@ def _run_training(
             pin_memory=True,
         )
         val_loader = DataLoader(
-            val_set,
+            eval_set,
             batch_size=args.batch_size,
             shuffle=False,
             num_workers=args.num_workers,
@@ -276,10 +292,12 @@ def _run_training(
         "temperature": float(temperature_value),
         "learnable_logit_scale": bool(args.learnable_logit_scale),
         "contrastive_mode": "distributed_global_batch" if ddp else "local_batch",
+        "eval_mode": "distributed_sharded" if ddp else "single_process",
         "data_path": list(args.data_path),
         "dataset_size": len(dataset),
         "train_size": len(train_set),
         "val_size": len(val_set),
+        "eval_size": int(eval_size),
         "shuffle_before_split": False,
         "batch_size_per_device": int(args.batch_size),
         "effective_global_batch_size": int(args.batch_size * world_size * max(1, args.grad_accum_steps)),
@@ -417,15 +435,44 @@ def _run_training(
                     f"eta={_format_duration(eta_seconds)}"
                 )
 
+        if ddp:
+            # Keep all ranks aligned before switching from training to eval.
+            dist.barrier()
+
+        eval_metrics: dict[str, float] = {}
+        eval_duration_seconds = 0.0
+        checkpoint_due = (epoch + 1) % args.save_every_epochs == 0
+        if val_loader is not None:
+            if ddp and rank == 0:
+                _log(
+                    rank,
+                    f"[epoch {epoch+1}/{args.epochs}] train phase synced across ranks; "
+                    "running distributed eval"
+                )
+            eval_started_clock = perf_counter()
+            base_model = model.module if hasattr(model, "module") else model
+            eval_metrics = evaluate_retrieval(
+                base_model,
+                val_loader,
+                device=device,
+                ks=(1, 5, 10),
+                max_samples=args.eval_max_samples,
+            )
+            eval_duration_seconds = perf_counter() - eval_started_clock
+
         if rank == 0:
-            eval_metrics: dict[str, float] = {}
-            eval_duration_seconds = 0.0
             avg_loss = running_loss / max(1, step_count)
             temp_value, logit_scale_value = _current_temp_and_scale()
             lr_value = _current_lr()
             epoch_duration_seconds = perf_counter() - epoch_started_clock
             total_elapsed_seconds = perf_counter() - run_started_clock
             memory_stats = _peak_memory_stats(device)
+            if ddp and checkpoint_due:
+                _log(
+                    rank,
+                    f"[epoch {epoch+1}/{args.epochs}] train phase synced across ranks; "
+                    "running rank0-only checkpoint/logging"
+                )
             _log(
                 rank,
                 f"[epoch {epoch+1}/{args.epochs}] train_loss={avg_loss:.4f} "
@@ -436,17 +483,7 @@ def _run_training(
                 f"peak_mem={memory_stats['peak_allocated_gb']:.2f}GB/"
                 f"{memory_stats['peak_reserved_gb']:.2f}GB"
             )
-            if val_loader is not None:
-                eval_started_clock = perf_counter()
-                base_model = model.module if hasattr(model, "module") else model
-                eval_metrics = evaluate_retrieval(
-                    base_model,
-                    val_loader,
-                    device=device,
-                    ks=(1, 5, 10),
-                    max_samples=args.eval_max_samples,
-                )
-                eval_duration_seconds = perf_counter() - eval_started_clock
+            if eval_metrics:
                 metrics_str = " ".join([f"{k}={v:.4f}" for k, v in eval_metrics.items()])
                 _log(
                     rank,
@@ -456,7 +493,7 @@ def _run_training(
 
             checkpoint_path = ""
             checkpoint_duration_seconds = 0.0
-            if (epoch + 1) % args.save_every_epochs == 0:
+            if checkpoint_due:
                 checkpoint_started_clock = perf_counter()
                 base_model = model.module if hasattr(model, "module") else model
                 run_args = dict(vars(args))
@@ -501,6 +538,11 @@ def _run_training(
                 "peak_reserved_gb": memory_stats["peak_reserved_gb"],
             }
             _append_jsonl(metrics_path, last_epoch_record)
+
+        if ddp:
+            # Keep non-zero ranks parked here until rank 0 finishes optional
+            # checkpoint/logging work and all ranks can enter the next epoch together.
+            dist.barrier()
 
     if rank != 0:
         return None

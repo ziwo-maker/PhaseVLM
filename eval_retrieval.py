@@ -1,6 +1,56 @@
 from typing import Dict, Iterable, List, Optional
 
 import torch
+import torch.distributed as dist
+
+
+def _is_distributed_eval() -> bool:
+    return dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1
+
+
+def _empty_embeddings() -> Dict[str, torch.Tensor]:
+    return {
+        "image": torch.empty((0, 0), dtype=torch.float32),
+        "text": torch.empty((0, 0), dtype=torch.float32),
+    }
+
+
+def _gather_embeddings_across_ranks(
+    embeds: Dict[str, torch.Tensor],
+    max_samples: Optional[int] = None,
+) -> Dict[str, torch.Tensor]:
+    if not _is_distributed_eval():
+        return embeds
+
+    gathered: List[Optional[Dict[str, torch.Tensor]]] = [None for _ in range(dist.get_world_size())]
+    dist.all_gather_object(gathered, embeds)
+
+    if dist.get_rank() != 0:
+        return _empty_embeddings()
+
+    image_parts: List[torch.Tensor] = []
+    text_parts: List[torch.Tensor] = []
+    for item in gathered:
+        if not item:
+            continue
+        image = item.get("image")
+        text = item.get("text")
+        if not torch.is_tensor(image) or not torch.is_tensor(text):
+            continue
+        if image.numel() == 0 or text.numel() == 0:
+            continue
+        image_parts.append(image.cpu())
+        text_parts.append(text.cpu())
+
+    if not image_parts or not text_parts:
+        return _empty_embeddings()
+
+    image_embeds = torch.cat(image_parts, dim=0)
+    text_embeds = torch.cat(text_parts, dim=0)
+    if max_samples is not None and max_samples > 0:
+        image_embeds = image_embeds[:max_samples]
+        text_embeds = text_embeds[:max_samples]
+    return {"image": image_embeds, "text": text_embeds}
 
 
 def _chunked_topk(
@@ -51,6 +101,7 @@ def collect_embeddings(
     device: torch.device,
     max_samples: Optional[int] = None,
 ) -> Dict[str, torch.Tensor]:
+    sample_limit = max_samples if max_samples is not None and max_samples > 0 else None
     model.eval()
     image_embeds: List[torch.Tensor] = []
     text_embeds: List[torch.Tensor] = []
@@ -64,13 +115,15 @@ def collect_embeddings(
             image_embeds.append(img_vec.cpu())
             text_embeds.append(txt_vec.cpu())
             seen += sequences.size(0)
-            if max_samples is not None and seen >= max_samples:
+            if sample_limit is not None and seen >= sample_limit:
                 break
+    if not image_embeds or not text_embeds:
+        return _empty_embeddings()
     image_embeds = torch.cat(image_embeds, dim=0)
     text_embeds = torch.cat(text_embeds, dim=0)
-    if max_samples is not None:
-        image_embeds = image_embeds[:max_samples]
-        text_embeds = text_embeds[:max_samples]
+    if sample_limit is not None:
+        image_embeds = image_embeds[:sample_limit]
+        text_embeds = text_embeds[:sample_limit]
     return {"image": image_embeds, "text": text_embeds}
 
 
@@ -82,4 +135,13 @@ def evaluate_retrieval(
     max_samples: Optional[int] = None,
 ) -> Dict[str, float]:
     embeds = collect_embeddings(model, dataloader, device, max_samples=max_samples)
+    embeds = _gather_embeddings_across_ranks(embeds, max_samples=max_samples)
+    if _is_distributed_eval() and dist.get_rank() != 0:
+        return {}
+    if embeds["image"].numel() == 0 or embeds["text"].numel() == 0:
+        metrics: Dict[str, float] = {}
+        for k in ks:
+            metrics[f"R@{k}_i2t"] = 0.0
+            metrics[f"R@{k}_t2i"] = 0.0
+        return metrics
     return compute_recall_at_k(embeds["image"], embeds["text"], ks=ks)

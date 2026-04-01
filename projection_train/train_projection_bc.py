@@ -8,6 +8,7 @@ import random
 import sys
 import time
 from contextlib import nullcontext
+from datetime import timedelta
 from typing import Dict, List, Sequence, Tuple
 
 import torch
@@ -71,20 +72,39 @@ def seed_everything(seed: int) -> None:
     torch.cuda.manual_seed_all(seed)
 
 
-def init_distributed() -> Tuple[bool, int, int, torch.device]:
+def init_distributed(timeout_seconds: int) -> Tuple[bool, int, int, torch.device]:
     if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
         rank = int(os.environ["RANK"])
         world_size = int(os.environ["WORLD_SIZE"])
         local_rank = int(os.environ.get("LOCAL_RANK", 0))
         backend = "nccl" if torch.cuda.is_available() else "gloo"
         if not dist.is_initialized():
-            dist.init_process_group(backend=backend, init_method="env://")
+            dist.init_process_group(
+                backend=backend,
+                init_method="env://",
+                timeout=timedelta(seconds=max(1, int(timeout_seconds))),
+            )
         device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
         if torch.cuda.is_available():
             torch.cuda.set_device(device)
         return True, rank, world_size, device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     return False, 0, 1, device
+
+
+def barrier() -> None:
+    if not dist.is_available() or not dist.is_initialized():
+        return
+    if dist.get_backend() == "nccl" and torch.cuda.is_available():
+        dist.barrier(device_ids=[torch.cuda.current_device()])
+    else:
+        dist.barrier()
+
+
+def shard_eval_subset(eval_set: Subset | None, ddp: bool, rank: int, world_size: int) -> Subset | None:
+    if eval_set is None or not ddp or world_size <= 1:
+        return eval_set
+    return Subset(eval_set, list(range(rank, len(eval_set), world_size)))
 
 
 def resolve_amp_dtype(args: argparse.Namespace, device: torch.device) -> torch.dtype | None:
@@ -460,6 +480,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--soft_target_alpha", type=float, default=0.5)
     parser.add_argument("--soft_label_temperature", type=float, default=0.5)
     parser.add_argument("--disable_class_balance", action="store_true", default=False)
+    parser.add_argument("--ddp_timeout_seconds", type=int, default=1800)
     return parser.parse_args()
 
 
@@ -471,7 +492,7 @@ def main() -> None:
     if args.min_lr < 0 or args.min_lr > args.lr:
         raise ValueError("--min_lr must be within [0, lr]")
 
-    ddp, rank, world_size, device = init_distributed()
+    ddp, rank, world_size, device = init_distributed(args.ddp_timeout_seconds)
     os.makedirs(args.output_dir, exist_ok=True)
     logger = setup_logger(args.output_dir, rank)
     seed_everything(args.seed + rank)
@@ -492,6 +513,7 @@ def main() -> None:
             args.log_interval,
             args.grad_accum_steps,
         )
+        logger.info("Distributed timeout: %ds", args.ddp_timeout_seconds)
         logger.info("Loading grouped dataset from: %s", ", ".join(args.data_path))
 
     dataset = GroupedTrafficActionDataset(
@@ -509,6 +531,7 @@ def main() -> None:
     class_weights = None
     if not args.disable_class_balance:
         class_weights = compute_class_weights(train_set)
+    eval_set = shard_eval_subset(val_set, ddp=ddp, rank=rank, world_size=world_size)
 
     if ddp:
         train_sampler = DistributedSampler(train_set, num_replicas=world_size, rank=rank, shuffle=True)
@@ -522,11 +545,11 @@ def main() -> None:
             drop_last=False,
         )
         val_loader = None
-        if val_set is not None and rank == 0:
+        if eval_set is not None:
             val_loader = DataLoader(
-                val_set,
+                eval_set,
                 batch_size=args.batch_size,
-                sampler=SequentialSampler(val_set),
+                sampler=SequentialSampler(eval_set),
                 num_workers=args.num_workers,
                 pin_memory=(device.type == "cuda"),
                 collate_fn=grouped_action_collate,
@@ -544,23 +567,24 @@ def main() -> None:
         )
         val_loader = (
             DataLoader(
-                val_set,
+                eval_set,
                 batch_size=args.batch_size,
-                sampler=SequentialSampler(val_set),
+                sampler=SequentialSampler(eval_set),
                 num_workers=args.num_workers,
                 pin_memory=(device.type == "cuda"),
                 collate_fn=grouped_action_collate,
                 drop_last=False,
             )
-            if val_set is not None
+            if eval_set is not None
             else None
         )
 
     if rank == 0:
         logger.info(
-            "Prepared dataloaders: train_samples=%d val_samples=%d train_batches=%d val_batches=%d batch_size=%d num_workers=%d",
+            "Prepared dataloaders: train_samples=%d val_samples=%d local_val_samples=%d train_batches=%d local_val_batches=%d batch_size=%d num_workers=%d",
             len(train_set),
             len(val_set) if val_set is not None else 0,
+            len(eval_set) if eval_set is not None else 0,
             len(train_loader),
             len(val_loader) if val_loader is not None else 0,
             args.batch_size,
@@ -646,12 +670,10 @@ def main() -> None:
                 train_metrics["macro_f1"],
             )
 
-        if ddp:
-            dist.barrier()
-
         val_metrics = None
-        if rank == 0 and val_loader is not None:
-            logger.info("Epoch %d/%d validation started.", epoch + 1, args.epochs)
+        if val_loader is not None:
+            if rank == 0:
+                logger.info("Epoch %d/%d validation started.", epoch + 1, args.epochs)
             eval_model: PrefixActionPolicy = model.module if hasattr(model, "module") else model
             with torch.no_grad():
                 val_metrics, _ = run_epoch(
@@ -665,19 +687,20 @@ def main() -> None:
                     lr_scale_fn=lr_scale_fn,
                     global_step_start=global_step,
                     epoch=epoch + 1,
-                    ddp=False,
+                    ddp=ddp,
                     is_train=False,
                     rank=rank,
                     class_weights=class_weights,
                     logger=logger,
                 )
-            logger.info(
-                "[epoch %d] val_loss=%.4f val_acc=%.4f val_f1=%.4f",
-                epoch + 1,
-                val_metrics["loss"],
-                val_metrics["acc"],
-                val_metrics["macro_f1"],
-            )
+            if rank == 0 and val_metrics is not None:
+                logger.info(
+                    "[epoch %d] val_loss=%.4f val_acc=%.4f val_f1=%.4f",
+                    epoch + 1,
+                    val_metrics["loss"],
+                    val_metrics["acc"],
+                    val_metrics["macro_f1"],
+                )
 
         if rank == 0:
             base_model: PrefixActionPolicy = model.module if hasattr(model, "module") else model
@@ -731,12 +754,13 @@ def main() -> None:
                 logger.info("Updated best checkpoint: %s", best_path)
 
         if ddp:
-            dist.barrier()
+            barrier()
 
     if rank == 0:
         logger.info("Stage 2 BC training finished.")
 
     if ddp:
+        barrier()
         dist.destroy_process_group()
 
 

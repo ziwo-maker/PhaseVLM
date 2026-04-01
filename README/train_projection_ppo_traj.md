@@ -219,6 +219,7 @@ reward =
 
 ```bash
 --queue_reward_coef -0.35
+
 --waiting_reward_coef -0.01
 ```
 

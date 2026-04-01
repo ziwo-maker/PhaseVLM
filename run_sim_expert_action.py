@@ -2,11 +2,18 @@ import os
 import time
 import argparse
 import json
+from copy import deepcopy
 
+from utils.clean_align_jsonl import clean_jsonl
+from utils.backfill_llm_captions import backfill_captions
 from utils import error
-from utils.sim_expert_collector import SimExpertCollector
 from utils.config import *
-from utils.utils import merge
+
+
+def _merge_dict(base, extra):
+    merged = deepcopy(base)
+    merged.update(extra)
+    return merged
 
 
 def parse_args():
@@ -39,6 +46,28 @@ def parse_args():
     parser.add_argument("--expert_aql_weight", type=float, default=1.0)
     parser.add_argument("--expert_awt_weight", type=float, default=1.0)
     parser.add_argument("--expert_spillback_weight", type=float, default=0.2)
+    parser.add_argument("--clean_seq_len", type=int, default=16)
+    parser.add_argument(
+        "--clean_output",
+        type=str,
+        default="",
+        help="Optional cleaned jsonl output path. Defaults to <raw>.cleaned.jsonl.",
+    )
+    parser.add_argument(
+        "--backfill_output",
+        type=str,
+        default="",
+        help="Optional LLM caption output path. Defaults to <clean_or_raw>.llm_caption.jsonl.",
+    )
+    parser.add_argument("--skip_clean", action="store_true", default=False)
+    parser.add_argument("--skip_llm_backfill", action="store_true", default=False)
+    parser.add_argument(
+        "--backfill_llm_path",
+        type=str,
+        default="",
+        help="LLM path for caption backfill. Defaults to --llm_path when omitted.",
+    )
+    parser.add_argument("--backfill_batch_size", type=int, default=8)
 
     return parser.parse_args()
 
@@ -164,6 +193,44 @@ def _write_batch_manifest(memo, batch_tag, batch_summary):
     print("batch_manifest:", manifest_path)
 
 
+def _extract_eval_metrics(test_results):
+    if not isinstance(test_results, dict):
+        return {}
+
+    metrics = {}
+    mapping = {
+        "ATT": "test_avg_travel_time_over",
+        "AQL": "test_avg_queue_len_over",
+        "AWT": "test_avg_waiting_time_over",
+    }
+    for output_key, source_key in mapping.items():
+        value = test_results.get(source_key)
+        try:
+            metrics[output_key] = float(value)
+        except (TypeError, ValueError):
+            continue
+    return metrics
+
+
+def _print_eval_metrics_by_file(batch_summary):
+    if not batch_summary:
+        return
+    print("sim_eval_metrics_by_file:")
+    for item in batch_summary:
+        traffic_file = str(item.get("traffic_file", "") or "").strip()
+        metrics = item.get("evaluation_metrics") or {}
+        att = metrics.get("ATT")
+        aql = metrics.get("AQL")
+        awt = metrics.get("AWT")
+        if att is None and aql is None and awt is None:
+            print(f"  {traffic_file}: ATT=N/A | AQL=N/A | AWT=N/A")
+            continue
+        att_text = f"{float(att):.4f}" if att is not None else "N/A"
+        aql_text = f"{float(aql):.4f}" if aql is not None else "N/A"
+        awt_text = f"{float(awt):.4f}" if awt is not None else "N/A"
+        print(f"  {traffic_file}: ATT={att_text} | AQL={aql_text} | AWT={awt_text}")
+
+
 def _merge_batch_training_sets(batch_tag, batch_summary):
     if not batch_summary:
         return ""
@@ -187,7 +254,104 @@ def _merge_batch_training_sets(batch_tag, batch_summary):
     return merged_output_path
 
 
+def _strip_jsonl_suffix(path):
+    normalized = str(path or "").strip()
+    if normalized.lower().endswith(".jsonl"):
+        return normalized[:-6]
+    return normalized
+
+
+def _resolve_clean_output_path(raw_input_path, requested_output):
+    requested = str(requested_output or "").strip()
+    if requested:
+        return requested
+    return f"{_strip_jsonl_suffix(raw_input_path)}.cleaned.jsonl"
+
+
+def _resolve_backfill_output_path(backfill_input_path, requested_output):
+    requested = str(requested_output or "").strip()
+    if requested:
+        return requested
+    return f"{_strip_jsonl_suffix(backfill_input_path)}.llm_caption.jsonl"
+
+
+def _resolve_backfill_llm_path(in_args):
+    llm_path = str(in_args.backfill_llm_path or in_args.llm_path or "").strip()
+    if not llm_path:
+        raise SystemExit("LLM backfill requires --backfill_llm_path or --llm_path.")
+    return llm_path
+
+
+def _print_clean_stats(stats):
+    print("clean_stats:")
+    for key in (
+        "total_lines",
+        "bad_lines",
+        "total_groups",
+        "kept_groups",
+        "dropped_zero_groups",
+        "dropped_range_groups",
+        "written_lines",
+        "incomplete_groups_dropped",
+        "incomplete_groups_kept",
+        "dropped_low_margin_groups",
+        "dropped_duplicate_caption_groups",
+    ):
+        print(f"  {key}={stats[key]}")
+
+
+def _run_postprocess_pipeline(in_args, raw_input_path):
+    if not raw_input_path or not os.path.exists(raw_input_path):
+        raise SystemExit(f"Pipeline input jsonl not found: {raw_input_path}")
+
+    result = {
+        "pipeline_input_path": raw_input_path,
+        "clean_output_path": "",
+        "llm_caption_output_path": "",
+        "clean_stats": None,
+        "backfill_stats": None,
+    }
+
+    current_input_path = raw_input_path
+    if not in_args.skip_clean:
+        clean_output_path = _resolve_clean_output_path(raw_input_path, in_args.clean_output)
+        clean_stats = clean_jsonl(
+            inputs=[raw_input_path],
+            output_path=clean_output_path,
+            seq_len=in_args.clean_seq_len,
+        )
+        print("clean_output_path:", clean_output_path)
+        _print_clean_stats(clean_stats)
+        result["clean_output_path"] = clean_output_path
+        result["clean_stats"] = clean_stats
+        current_input_path = clean_output_path
+
+    if not in_args.skip_llm_backfill:
+        backfill_output_path = _resolve_backfill_output_path(current_input_path, in_args.backfill_output)
+        backfill_stats = backfill_captions(
+            input_path=current_input_path,
+            output_path=backfill_output_path,
+            llm_path=_resolve_backfill_llm_path(in_args),
+            batch_size=in_args.backfill_batch_size,
+            language=in_args.clip_caption_language,
+            max_tokens=in_args.clip_caption_max_tokens,
+            temperature=in_args.clip_caption_temperature,
+            top_p=in_args.clip_caption_top_p,
+        )
+        print("llm_caption_output_path:", backfill_output_path)
+        print(
+            "llm_caption_stats:",
+            json.dumps(backfill_stats, ensure_ascii=False),
+        )
+        result["llm_caption_output_path"] = backfill_output_path
+        result["backfill_stats"] = backfill_stats
+
+    return result
+
+
 def _run_single_traffic_file(in_args, dataset_spec, traffic_file, run_tag, batch_tag=None):
+    from utils.sim_expert_collector import SimExpertCollector
+
     count = _resolve_run_count(dataset_spec["count"], traffic_file)
     road_net = dataset_spec["road_net"]
     template = dataset_spec["template"]
@@ -279,12 +443,12 @@ def _run_single_traffic_file(in_args, dataset_spec, traffic_file, run_tag, batch
 
     trainer = SimExpertCollector(
         dic_agent_conf_extra,
-        merge(dic_traffic_env_conf, dic_traffic_env_conf_extra),
+        _merge_dict(dic_traffic_env_conf, dic_traffic_env_conf_extra),
         dic_path_extra,
         f"{template}-{road_net}",
         traffic_file.split(".")[0],
     )
-    trainer.train_test()
+    test_results = trainer.train_test()
     traffic_series_run_tag = os.path.basename(dic_path_extra["PATH_TO_WORK_DIRECTORY"])
     traffic_series_output_path = os.path.join(
         "data",
@@ -298,6 +462,7 @@ def _run_single_traffic_file(in_args, dataset_spec, traffic_file, run_tag, batch
         "path_to_model": dic_path_extra["PATH_TO_MODEL"],
         "path_to_work_directory": dic_path_extra["PATH_TO_WORK_DIRECTORY"],
         "traffic_series_output_path": traffic_series_output_path,
+        "evaluation_metrics": _extract_eval_metrics(test_results),
     }
 
 
@@ -319,6 +484,7 @@ def main(in_args):
 
     batch_summary = []
     multi_file_mode = len(resolved_traffic_files) > 1
+    merged_output_path = ""
     for idx, traffic_file in enumerate(resolved_traffic_files, start=1):
         print(f"===== [{idx}/{len(resolved_traffic_files)}] start {traffic_file} =====")
         result = _run_single_traffic_file(
@@ -330,10 +496,26 @@ def main(in_args):
         )
         batch_summary.append(result)
 
+    _print_eval_metrics_by_file(batch_summary)
+
     if multi_file_mode:
         merged_output_path = _merge_batch_training_sets(batch_tag, batch_summary)
         for item in batch_summary:
             item["merged_traffic_series_output_path"] = merged_output_path
+
+    pipeline_input_path = merged_output_path if multi_file_mode else batch_summary[0]["traffic_series_output_path"]
+    postprocess_result = _run_postprocess_pipeline(in_args, pipeline_input_path)
+    print("pipeline_input_path:", pipeline_input_path)
+    if postprocess_result.get("clean_output_path"):
+        print("pipeline_clean_output_path:", postprocess_result["clean_output_path"])
+    if postprocess_result.get("llm_caption_output_path"):
+        print("pipeline_llm_caption_output_path:", postprocess_result["llm_caption_output_path"])
+
+    if multi_file_mode:
+        for item in batch_summary:
+            item["pipeline_input_path"] = postprocess_result["pipeline_input_path"]
+            item["clean_output_path"] = postprocess_result["clean_output_path"]
+            item["llm_caption_output_path"] = postprocess_result["llm_caption_output_path"]
         _write_batch_manifest(in_args.memo, batch_tag, batch_summary)
 
 

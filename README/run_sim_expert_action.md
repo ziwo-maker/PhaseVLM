@@ -4,12 +4,13 @@
 
 ## 1. 改动目标
 
-这次对 `run_sim_expert_action.py` 的修改主要有两类：
+这次对 `run_sim_expert_action.py` 的修改主要有三类：
 
 1. 保留并兼容原先常用的命令行参数
 2. 支持同一个 `dataset` 下批量处理多个 `traffic_file`
+3. 把采集、清洗、LLM caption 回填串成一个命令
 
-也就是说，脚本现在既能继续跑单个 flow 文件，也能一次性跑多个 flow 文件并汇总训练集输出。
+也就是说，脚本现在既能继续跑单个 flow 文件，也能一次性跑多个 flow 文件并汇总训练集输出，还能直接把后处理一步接完。
 
 ## 2. 当前支持的 `traffic_file` 用法
 
@@ -76,6 +77,16 @@ python run_sim_expert_action.py \
 - `--expert_aql_weight`
 - `--expert_awt_weight`
 - `--expert_spillback_weight`
+
+同时新增了数据集后处理参数，用来把“采集 -> 清洗 -> LLM caption 回填”串成一个命令：
+
+- `--clean_seq_len`
+- `--clean_output`
+- `--backfill_output`
+- `--skip_clean`
+- `--skip_llm_backfill`
+- `--backfill_llm_path`
+- `--backfill_batch_size`
 
 ## 4. 脚本内部结构变化
 
@@ -162,9 +173,63 @@ data/recorded/batch_<timestamp>/traffic_prompt_series_2s.jsonl
 
 这样多文件跑完之后，可以直接拿这个 merged jsonl 去做后续清洗或训练，而不需要手工再拼接。
 
-## 6. 行为说明
+## 6. 新增的一体化后处理
 
-### 6.1 单文件模式
+现在 `run_sim_expert_action.py` 在采集结束后，会默认继续执行两步：
+
+1. 调用 `clean_align_jsonl` 逻辑生成 cleaned jsonl
+2. 调用 `backfill_llm_captions` 逻辑生成带 LLM caption 的最终 jsonl
+
+也就是说，之前这三条命令：
+
+```bash
+python run_sim_expert_action.py --dataset jinan --traffic_file anon_3_4_jinan_real.json
+
+python utils/clean_align_jsonl.py --inputs ... --output data/recorded/align_train.cleaned.jsonl --seq_len 16
+
+python utils/backfill_llm_captions.py \
+  --input data/recorded/align_train.cleaned.jsonl \
+  --output data/recorded/align_train.cleaned.llm_caption.jsonl \
+  --llm_path /home/data/model/gemma-3-27B/
+```
+
+现在可以直接收敛成一条命令。
+
+### 6.1 后处理输入来源
+
+- 单文件模式：后处理输入就是该次运行生成的 `traffic_prompt_series_2s.jsonl`
+- 多文件模式：后处理输入就是 batch merge 后的总 jsonl
+
+### 6.2 默认输出命名
+
+如果不显式传输出路径：
+
+- 清洗输出默认为 `<raw>.cleaned.jsonl`
+- 回填输出默认为 `<clean_or_raw>.llm_caption.jsonl`
+
+例如单文件采集产物如果是：
+
+```text
+data/recorded/anon_3_4_jinan_real_03_25_12_00_00/traffic_prompt_series_2s.jsonl
+```
+
+那么默认会继续生成：
+
+```text
+data/recorded/anon_3_4_jinan_real_03_25_12_00_00/traffic_prompt_series_2s.cleaned.jsonl
+data/recorded/anon_3_4_jinan_real_03_25_12_00_00/traffic_prompt_series_2s.cleaned.llm_caption.jsonl
+```
+
+### 6.3 可选跳过
+
+如果你只想保留部分流程：
+
+- `--skip_clean`：跳过清洗，直接对原始 jsonl 做 caption 回填
+- `--skip_llm_backfill`：只采集并清洗，不做 caption 回填
+
+## 7. 行为说明
+
+### 7.1 单文件模式
 
 如果 `--traffic_file` 最终只解析出一个文件：
 
@@ -172,7 +237,7 @@ data/recorded/batch_<timestamp>/traffic_prompt_series_2s.jsonl
 - 不写 batch manifest
 - 不做 merged jsonl
 
-### 6.2 多文件模式
+### 7.2 多文件模式
 
 如果 `--traffic_file` 最终解析出多个文件：
 
@@ -181,9 +246,9 @@ data/recorded/batch_<timestamp>/traffic_prompt_series_2s.jsonl
 - 自动生成 batch manifest
 - 自动生成 merged jsonl
 
-## 7. 推荐命令
+## 8. 推荐命令
 
-### 7.1 单文件
+### 8.1 单文件一体化命令
 
 ```bash
 python run_sim_expert_action.py \
@@ -191,10 +256,23 @@ python run_sim_expert_action.py \
   --traffic_file anon_3_4_jinan_real.json \
   --llm_model gemma-3-27B \
   --llm_path /home/data/model/gemma-3-27B/ \
-  --clip_caption_mode prompt_llm
+  --clean_seq_len 16
 ```
 
-### 7.2 多文件
+### 8.2 指定和原来一致的输出文件名
+
+```bash
+python run_sim_expert_action.py \
+  --dataset jinan \
+  --traffic_file anon_3_4_jinan_real.json \
+  --llm_model gemma-3-27B \
+  --llm_path /home/data/model/gemma-3-27B/ \
+  --clean_seq_len 16 \
+  --clean_output data/recorded/align_train.cleaned.jsonl \
+  --backfill_output data/recorded/align_train.cleaned.llm_caption.jsonl
+```
+
+### 8.3 多文件
 
 ```bash
 python run_sim_expert_action.py \
@@ -205,10 +283,10 @@ python run_sim_expert_action.py \
     anon_3_4_jinan_real_2500.json \
   --llm_model gemma-3-27B \
   --llm_path /home/data/model/gemma-3-27B/ \
-  --clip_caption_mode prompt_llm
+  --clean_seq_len 16
 ```
 
-### 7.3 全量
+### 8.4 全量
 
 ```bash
 python run_sim_expert_action.py \
@@ -216,10 +294,10 @@ python run_sim_expert_action.py \
   --traffic_file all \
   --llm_model gemma-3-27B \
   --llm_path /home/data/model/gemma-3-27B/ \
-  --clip_caption_mode prompt_llm
+  --clean_seq_len 16
 ```
 
-## 8. 当前结论
+## 9. 当前结论
 
 `run_sim_expert_action.py` 现在已经不再是“只能处理单个 flow 文件”的入口，而是一个支持：
 
@@ -227,5 +305,7 @@ python run_sim_expert_action.py \
 - 多文件批量采集
 - dataset 内全量采集
 - 自动批次汇总
+- 自动清洗
+- 自动 LLM caption 回填
 
 的训练集生成入口。

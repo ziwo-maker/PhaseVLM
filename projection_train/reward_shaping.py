@@ -1,11 +1,22 @@
 from __future__ import annotations
 
-from typing import Dict, Mapping
+from typing import Dict, Iterable, Mapping
 
 
 OBJECTIVE_QUEUE = "queue"
 OBJECTIVE_WAIT = "wait"
 OBJECTIVE_TRAVEL = "travel"
+
+WAIT_REDUCER_MEAN = "mean"
+WAIT_REDUCER_MAX = "max"
+WAIT_REDUCER_MIN = "min"
+WAIT_REDUCER_MIN_POSITIVE = "min_positive"
+WAIT_REDUCER_CHOICES = (
+    WAIT_REDUCER_MEAN,
+    WAIT_REDUCER_MAX,
+    WAIT_REDUCER_MIN,
+    WAIT_REDUCER_MIN_POSITIVE,
+)
 
 
 def resolve_objective_weights(
@@ -32,9 +43,34 @@ def resolve_objective_weights(
     return {name: float(value * scale) for name, value in weights.items()}
 
 
+def reduce_wait_values(
+    wait_values: Iterable[float],
+    reducer: str = WAIT_REDUCER_MIN_POSITIVE,
+) -> float:
+    values = [max(0.0, float(value)) for value in wait_values]
+    if not values:
+        return 0.0
+
+    resolved_reducer = str(reducer or WAIT_REDUCER_MIN_POSITIVE).strip().lower()
+    if resolved_reducer == WAIT_REDUCER_MEAN:
+        return float(sum(values) / len(values))
+    if resolved_reducer == WAIT_REDUCER_MAX:
+        return float(max(values))
+    if resolved_reducer == WAIT_REDUCER_MIN:
+        return float(min(values))
+    if resolved_reducer == WAIT_REDUCER_MIN_POSITIVE:
+        positive_values = [value for value in values if value > 0.0]
+        if positive_values:
+            return float(min(positive_values))
+        return 0.0
+    raise ValueError(
+        f"Unsupported wait reducer: {reducer!r}. Expected one of {WAIT_REDUCER_CHOICES}."
+    )
+
+
 def compute_local_shaped_reward(
     queue_delta: float,
-    wait_delta: float,
+    wait_value: float,
     active_vehicle_delta: float,
     throughput_count: float,
     queue_reward_coef: float,
@@ -46,7 +82,7 @@ def compute_local_shaped_reward(
     objective_weights: Mapping[str, float],
 ) -> Dict[str, float]:
     queue_reward = float(objective_weights.get(OBJECTIVE_QUEUE, 0.0)) * float(queue_reward_coef) * float(queue_delta)
-    wait_reward = float(objective_weights.get(OBJECTIVE_WAIT, 0.0)) * float(waiting_reward_coef) * float(wait_delta)
+    wait_reward = float(objective_weights.get(OBJECTIVE_WAIT, 0.0)) * float(waiting_reward_coef) * float(wait_value)
     system_vehicle_reward = (
         float(objective_weights.get(OBJECTIVE_TRAVEL, 0.0))
         * float(system_vehicle_reward_coef)

@@ -6,7 +6,6 @@ import pandas as pd
 import os
 import csv
 import cityflow as engine
-import time
 from datetime import datetime, timedelta
 from multiprocessing import Process
 from .my_utils import load_json, calculate_road_length
@@ -531,7 +530,10 @@ class CityFlowEnv:
             f.close()
 
     def reset(self):
-        print(" ============= self.eng.reset() to be implemented ==========")
+        # Clear per-episode dynamic caches before creating a fresh engine.
+        self.current_time = None
+        self.waiting_vehicle_list = {}
+        self.system_states = None
         cityflow_config = {
             "interval": self.dic_traffic_env_conf["INTERVAL"],
             "seed": int(np.random.randint(0, 100)),
@@ -1081,9 +1083,6 @@ class CityFlowEnv:
                     ])
 
     def step(self, action):
-
-        step_start_time = time.time()
-
         list_action_in_sec = [action]
         list_action_in_sec_display = [action]
         for i in range(self.dic_traffic_env_conf["MIN_ACTION_TIME"]-1):
@@ -1104,10 +1103,6 @@ class CityFlowEnv:
 
             before_action_feature = self.get_feature()
             # state = self.get_state()
-
-            if i == 0:
-                print("time: {0}".format(instant_time))
-                    
             self._inner_step(action_in_sec)
 
             # get reward
@@ -1116,8 +1111,6 @@ class CityFlowEnv:
                 average_reward_action_list[j] = (average_reward_action_list[j] * i + reward[j]) / (i + 1)
             self.log(cur_time=instant_time, before_action_feature=before_action_feature, action=action_in_sec_display)
             next_state, done = self.get_state()
-
-        print("Step time: ", time.time() - step_start_time)
         return next_state, reward, done, average_reward_action_list
 
     def _inner_step(self, action):

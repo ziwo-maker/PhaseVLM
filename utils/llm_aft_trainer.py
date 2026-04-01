@@ -1479,8 +1479,9 @@ class LLM_Inference_VLLM:
             config=all_config,
         )
 
-        self.test(logger, 0)
+        results = self.test(logger, 0)
         wandb.finish()
+        return results
 
     '''
     ======================= Class Utils =======================
