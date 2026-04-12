@@ -15,11 +15,9 @@ class SimExpertCollector(LLM_Inference_VLLM):
     _SPILLBACK_BLOCK_WEIGHT = 0.5
 
     def initialize_llm(self):
-        # SimExpert only does fast rule-based captioning during collection.
-        # LLM caption refinement is handled later by the standalone backfill script.
-        self.llm_model = None
-        self.tokenizer = None
-        self.generation_kwargs = {}
+        # Load LLM model first, then proceed with simulation
+        # Call parent class method to actually load the LLM model
+        super().initialize_llm()
 
     def _phase_state_snapshot(self):
         snapshots = []

@@ -1,4 +1,5 @@
 import argparse
+import gc
 import json
 import os
 import re
@@ -11,6 +12,7 @@ DEFAULT_CAPTION_TEMPERATURE = 0.2
 DEFAULT_CAPTION_TOP_P = 0.9
 DEFAULT_MAX_MODEL_LEN = 2048
 DEFAULT_GPU_MEMORY_UTILIZATION = 0.9
+DEFAULT_TENSOR_PARALLEL_SIZE = 0
 MOVEMENT_LABELS = {
     "NT": "north through",
     "NL": "north left",
@@ -305,8 +307,15 @@ def _clean_clip_caption(text: str) -> str:
     return " ".join(cleaned.split())
 
 
-def _infer_tensor_parallel_size() -> int:
+def _resolve_tensor_parallel_size(requested_size: object = DEFAULT_TENSOR_PARALLEL_SIZE) -> int:
     import torch
+
+    try:
+        requested = int(requested_size or 0)
+    except (TypeError, ValueError):
+        requested = 0
+    if requested > 0:
+        return requested
 
     visible = os.environ.get("CUDA_VISIBLE_DEVICES", "")
     if visible:
@@ -336,7 +345,7 @@ def _load_caption_model(args):
             pass
         return "transformers", model, tokenizer
 
-    tensor_parallel_size = _infer_tensor_parallel_size()
+    tensor_parallel_size = _resolve_tensor_parallel_size(getattr(args, "tensor_parallel_size", 0))
     available_gpus = torch.cuda.device_count()
     if available_gpus > 0 and tensor_parallel_size > available_gpus:
         tensor_parallel_size = available_gpus
@@ -364,6 +373,29 @@ def _load_caption_model(args):
     except Exception:
         pass
     return "vllm", model, tokenizer
+
+
+def _shutdown_caption_model(backend: str, model) -> None:
+    if model is None:
+        return
+
+    try:
+        if backend == "vllm":
+            llm_engine = getattr(model, "llm_engine", None)
+            engine_core = getattr(llm_engine, "engine_core", None)
+            shutdown = getattr(engine_core, "shutdown", None)
+            if callable(shutdown):
+                shutdown()
+    finally:
+        del model
+        gc.collect()
+        try:
+            import torch
+
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception:
+            pass
 
 
 def _generate_captions(prompts: List[str], args, backend: str, model, tokenizer) -> List[str]:
@@ -505,6 +537,7 @@ def parse_args():
     parser.add_argument("--output", type=str, required=True)
     parser.add_argument("--llm_path", type=str, required=True)
     parser.add_argument("--batch_size", type=int, default=8)
+    parser.add_argument("--tensor_parallel_size", type=int, default=DEFAULT_TENSOR_PARALLEL_SIZE)
     parser.add_argument("--language", type=str, default=DEFAULT_CAPTION_LANGUAGE)
     parser.add_argument("--max_tokens", type=int, default=DEFAULT_CAPTION_MAX_NEW_TOKENS)
     parser.add_argument("--temperature", type=float, default=DEFAULT_CAPTION_TEMPERATURE)
@@ -517,6 +550,7 @@ def backfill_captions(
     output_path: str,
     llm_path: str,
     batch_size: int = 8,
+    tensor_parallel_size: int = DEFAULT_TENSOR_PARALLEL_SIZE,
     language: str = DEFAULT_CAPTION_LANGUAGE,
     max_tokens: int = DEFAULT_CAPTION_MAX_NEW_TOKENS,
     temperature: float = DEFAULT_CAPTION_TEMPERATURE,
@@ -527,6 +561,7 @@ def backfill_captions(
         output=str(output_path),
         llm_path=str(llm_path),
         batch_size=int(batch_size),
+        tensor_parallel_size=int(tensor_parallel_size),
         language=str(language or DEFAULT_CAPTION_LANGUAGE),
         max_tokens=int(max_tokens),
         temperature=float(temperature),
@@ -538,7 +573,10 @@ def backfill_captions(
 
     prompts = [_group_prompt(group, language=args.language) for group in groups]
     backend, model, tokenizer = _load_caption_model(args)
-    raw_captions = _generate_captions(prompts, args, backend=backend, model=model, tokenizer=tokenizer)
+    try:
+        raw_captions = _generate_captions(prompts, args, backend=backend, model=model, tokenizer=tokenizer)
+    finally:
+        _shutdown_caption_model(backend, model)
     captions: List[str] = []
     caption_modes: List[str] = []
     fallback_count = 0
@@ -588,6 +626,7 @@ def backfill_captions(
         "output_path": args.output,
         "llm_path": args.llm_path,
         "llm_model_name": _infer_model_name_from_path(args.llm_path),
+        "tensor_parallel_size": int(args.tensor_parallel_size),
         "num_groups": len(groups),
         "num_records": len(rewritten_records),
         "language": args.language,
@@ -606,6 +645,7 @@ def main():
         output_path=args.output,
         llm_path=args.llm_path,
         batch_size=args.batch_size,
+        tensor_parallel_size=args.tensor_parallel_size,
         language=args.language,
         max_tokens=args.max_tokens,
         temperature=args.temperature,

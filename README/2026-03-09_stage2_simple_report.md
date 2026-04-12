@@ -304,15 +304,47 @@ Table 2 里的 LightGPT 结果，默认应理解为“同数据集训练、同�
 |              | Qwen 8B + Projection（ours+zero-shot+PPO,第二次） | **277.69** | **170\.54** | **43.94** | **365\.20** | **104.825\.23** | 
 注：当前结果没有使用PPO微调，其余对比的方法使用了PPO的.
 
+使用仅在jinan——realPPO 的数据集，居然在jinan三个数据集上，都取得了接近最优的效果。实验结果如下：
+2026-04-02 12:20:50 | INFO | projection_train.online.anon_3_4_jinan_real_2500.json_04_02_10_32_15 | Test results: {"test_avg_queue_len_over": 131.61666666666667, "test_avg_travel_time_over": 259.75591554423005, "test_avg_waiting_time_over": 43.07452544764841, "test_queuing_vehicle_num_over": 15794.0, "test_reward_over": -602.8858111721117}
+2026-04-02 12:20:50 | INFO | projection_train.online.anon_3_4_jinan_real_2500.json_04_02_10_32_15 | Test Round 0 complete.
+2026-04-02 12:20:50 | INFO | projection_train.online.anon_3_4_jinan_real_2500.json_04_02_10_32_15 | Testing time: 6509.8480
 
+2026-04-02 12:20:35 | INFO | projection_train.online.anon_3_4_jinan_real_2000.json_04_02_10_32_48 | Test results: {"test_avg_queue_len_over": 105.99166666666666, "test_avg_travel_time_over": 268.9786941580756, "test_avg_waiting_time_over": 41.298549589456634, "test_queuing_vehicle_num_over": 12719.0, "test_reward_over": -588.4272913209678}
+2026-04-02 12:20:35 | INFO | projection_train.online.anon_3_4_jinan_real_2000.json_04_02_10_32_48 | Test Round 0 complete.
+2026-04-02 12:20:35 | INFO | projection_train.online.anon_3_4_jinan_real_2000.json_04_02_10_32_48 | Testing time: 6459.9982
+Batch log for inter  0
+
+hangzhou,仅在hangzhou_real上PPO：
+2026-04-03 08:31:25 | INFO | projection_train.online.anon_4_4_hangzhou_real.json_04_03_07_24_44 | Test results: {"test_avg_queue_len_over": 589.6833333333333, "test_avg_travel_time_over": 874.9242373449547, "test_avg_waiting_time_over": 720.9819758286465, "test_queuing_vehicle_num_over": 70762.0, "test_reward_over": -1425.660385613662}
 
 
 当前训练存在以下几个问题1.的一个对齐阶段太慢了，而且数据集重复太多，没有意义2.第二阶段，转向的不同类型平衡不够，需要做平衡
 我现在已经完成了第二阶段的修复
 第一阶段的修改还没有做。主要是考虑，第一阶段的“专家决策”的选择指标实际上是要和第三阶段对齐的，所以暂时没有改。
-ColightLLM是：为五个 timestep 之后邻居路口总排队长度的倒数。
-我觉得接下来的优化，可以考虑这个方向。整体再优化一次
+ColightLLM是：为五个 timestep 之后邻居路口总排队长度的倒数。(使用了这个作为我的PPO奖励函数，但是效果不好)
 
-当前的训练最大的瓶颈是PPO修改以后（以前是只看wait），PPO阶段反而变得更差了，提升效果不好。总结下来我认为原因有1.现在的三个指标都参与评价函数的训练是不行的，只考虑wait，会带动其他指标的，他们之间不是孤立的关系。
+在jinan数据集效果很好，杭州的在八卡上跑，接下来试试新乡数据集
 
+
+
+
+这些值是“当前这次 update 的 rollout 统计”，不是整个训练过程的累计平均。来源是每个环境 step 里的 info，然后在 rollout_once() 里对这次 rollout 的 rollout_steps 个 step 做平均，projection_train/
+  train_projection_ppo_traj.py:393 到 projection_train/train_projection_ppo_traj.py:428。
+
+  - queue: 当前系统里所有路口入口车道上的排队车辆总数，再对本次 rollout 取平均。定义在 projection_train/trajectory_env.py:751 到 projection_train/trajectory_env.py:763。单位基本就是“辆”，不是每个路口平均。
+  - wait: 当前所有等待车辆的平均等待时长，再对本次 rollout 取平均。定义在 projection_train/trajectory_env.py:757 到 projection_train/trajectory_env.py:763。单位是秒。
+  - travel: 当前 episode 到这一时刻为止，车辆平均 travel time，再对本次 rollout 取平均。定义在 projection_train/trajectory_env.py:671 到 projection_train/trajectory_env.py:698，写入日志见 projection_train/
+    trajectory_env.py:781 到 projection_train/trajectory_env.py:805。单位也是秒。这个值会随着 episode 往后推进自然变大。
+  - active: 当前网络中的活跃车辆数，再对本次 rollout 取平均，projection_train/trajectory_env.py:759。
+  - q: q_reward_mean，不是 queue。它是每个路口的 “future-Q reward” 的平均值，计算方式大致是 1 / (1 + neighborhood_queue_sum)，neighborhood 包含该路口和邻居路口，定义在 projection_train/trajectory_env.py:592 到
+    projection_train/trajectory_env.py:599。值越大越好。
+  - nq: q_neighbor_queue_mean，就是上面那个 neighborhood queue sum 的平均值，projection_train/trajectory_env.py:797 到 projection_train/trajectory_env.py:800。值越小越好。
+  - reward: 本次 rollout 中奖励的总和，projection_train/train_projection_ppo_traj.py:393。这里实际用的是 env.step() 返回的 q_rewards，不是 base_rewards，projection_train/trajectory_env.py:792 到
+    projection_train/trajectory_env.py:806。
+  - policy / value / entropy / kl: PPO 更新时的优化指标，来自 projection_train/train_projection_ppo_traj.py:481 到 projection_train/train_projection_ppo_traj.py:531。它们不是交通指标。
+
+  你这条日志里如果看到 queue=84.5000, wait=36.3720，更准确的意思是：这次 update 对应的 rollout 窗口内，系统平均大约有 84.5 辆等待车，而这些等待车的平均等待时间约 36.4 秒。
+
+  还有一个容易误解的点：训练循环默认会持续在同一个 episode 里往前跑，只有 episode 结束才 reset，projection_train/train_projection_ppo_traj.py:1000 到 projection_train/train_projection_ppo_traj.py:1004。所以不同
+  update 间的 wait、queue、travel 本身就代表 episode 不同时间段的交通状态，不是从同一起点直接可比。
 

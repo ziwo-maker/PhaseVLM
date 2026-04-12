@@ -422,6 +422,7 @@ class LLM_Inference_VLLM:
         self.trainer = None
         self.device = None
         self._resolved_image_token = None
+        self.qwen = False
         self.ts_image_client = None
         self.ts_image_adapter = ts_image_adapter
         self.ts_history = None
@@ -577,10 +578,10 @@ class LLM_Inference_VLLM:
                 device_map=device_map,
             )
             self.processor = AutoProcessor.from_pretrained(llm_path, padding_side="left")
-            # processor as tokenizer for text-only usage
-            self.tokenizer = AutoProcessor.from_pretrained(llm_path)
+            self.tokenizer = self.processor
             try:
-                self.tokenizer.pad_token_id = 0
+                if getattr(self.tokenizer, "pad_token_id", None) is None:
+                    self.tokenizer.pad_token_id = getattr(self.tokenizer, "eos_token_id", 0) or 0
             except Exception:
                 pass
 
@@ -619,7 +620,7 @@ class LLM_Inference_VLLM:
                 model=llm_path,
                 tokenizer=llm_path,
                 dtype=torch.bfloat16,            # 先排除 bf16 兼容性
-                tensor_parallel_size=4,         # 先排除 TP/NCCL
+                tensor_parallel_size=tensor_parallel_size,
                 max_model_len=2048,             # 先降低上下文
                 max_num_seqs=4,                 # 先降低并发
                 max_num_batched_tokens=2048,
@@ -647,12 +648,101 @@ class LLM_Inference_VLLM:
             # Align image placeholder token with the loaded model, if possible.
             self._resolve_image_token()
 
+    def _build_multimodal_prompt_text(self, prompt):
+        apply_chat_template = getattr(self.tokenizer, "apply_chat_template", None)
+        if apply_chat_template is None:
+            apply_chat_template = getattr(self.processor, "apply_chat_template", None)
+        if apply_chat_template is None:
+            return str(prompt)
+
+        if self.qwen:
+            messages = [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image"},
+                        {"type": "text", "text": str(prompt)},
+                    ],
+                }
+            ]
+        else:
+            messages = [{"role": "user", "content": f"<start_of_image> {prompt}"}]
+
+        return apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+
+    def _resolve_model_device(self):
+        model_device = getattr(self.llm_model, "device", None)
+        if model_device is not None:
+            return model_device
+        try:
+            return next(self.llm_model.parameters()).device
+        except Exception:
+            return None
+
+    def _generate_multimodal_responses(self, prompts, images, batch_size=16):
+        if not prompts:
+            return []
+        if len(prompts) != len(images):
+            raise ValueError("prompts/images batch size mismatch.")
+
+        batch_size = max(1, int(batch_size or 1))
+        prompt_texts = [self._build_multimodal_prompt_text(prompt) for prompt in prompts]
+
+        if self.qwen:
+            responses = []
+            model_device = self._resolve_model_device()
+            for start in range(0, len(prompt_texts), batch_size):
+                batch_texts = prompt_texts[start:start + batch_size]
+                batch_images = images[start:start + batch_size]
+                current_inputs = self.processor(
+                    text=batch_texts,
+                    images=batch_images,
+                    padding=True,
+                    return_tensors="pt",
+                )
+                if model_device is not None:
+                    current_inputs = {
+                        key: value.to(model_device) if hasattr(value, "to") else value
+                        for key, value in current_inputs.items()
+                    }
+
+                with torch.no_grad():
+                    output_ids = self.llm_model.generate(**current_inputs, **self.test_generation_kwargs)
+
+                prompt_width = current_inputs["input_ids"].shape[1]
+                generated_ids = output_ids[:, prompt_width:]
+                responses.extend(self.processor.batch_decode(generated_ids, skip_special_tokens=True))
+            return responses
+
+        sampling_params = self.generation_kwargs
+        vllm_prompts = [
+            {
+                "prompt": text,
+                "multi_modal_data": {"image": image},
+            }
+            for text, image in zip(prompt_texts, images)
+        ]
+        responses = []
+        for start in range(0, len(vllm_prompts), batch_size):
+            batch = vllm_prompts[start:start + batch_size]
+            outputs = self.llm_model.generate(prompts=batch, sampling_params=sampling_params)
+            for output in outputs:
+                responses.append(output.outputs[0].text if output.outputs else "")
+        return responses
+
     def initialize(self):
         path_check(self.dic_path)
         copy_conf_file(self.dic_path, self.dic_agent_conf, self.dic_traffic_env_conf)
         copy_cityflow_file(self.dic_path, self.dic_traffic_env_conf)
         if self.save_cityflow_env_args:
             self._dump_cityflow_env_args()
+
+        # Load model first, then initialize simulation environment
+        self.initialize_llm()
 
         self.env = CityFlowEnv(
             path_to_log=self.dic_path["PATH_TO_WORK_DIRECTORY"],
@@ -661,7 +751,6 @@ class LLM_Inference_VLLM:
             dic_path=self.dic_path
         )
         self.env.reset()
-        self.initialize_llm()
 
     def _dump_cityflow_env_args(self):
         run_dir = str(self.dic_path.get("PATH_TO_WORK_DIRECTORY", "")).strip()
@@ -1348,45 +1437,11 @@ class LLM_Inference_VLLM:
                 prompts.append(prompt)
                 snapshot_paths.append(snapshot_path or "")
 
-            inputs_text = [
-                    self.tokenizer.apply_chat_template(
-                        [{"role": "user", "content": f"<start_of_image> {p}"}],  # 这里 content 直接用字符串 p
-                        tokenize=False,
-                        add_generation_prompt=True,
-                    )
-                    for p in prompts
-                ]
-            
-
-
-
-            # 2) vLLM 多模态输入：每条是一个 dict（prompt + multi_modal_data）
-            #    ts_images: List[PIL.Image.Image]
-            vllm_prompts = [
-                {
-                    "prompt": txt,
-                    "multi_modal_data": {"image": img},  # 单图直接放 PIL.Image
-                }
-                for txt, img in zip(inputs_text, ts_images)
-            ]
-
-            # 3) SamplingParams：vLLM 用这个，不是 HF 的 generate kwargs
-            sampling_params = self.generation_kwargs # 你的 generation_kwargs 需要是 vLLM 支持的字段
-
-            responses = []
-            bs = 16
-            for start in range(0, len(inputs_text), bs):
-                # batch = inputs_text[start:start + bs]
-                batch = vllm_prompts[start:start + bs]
-
-                # vLLM.generate 返回的是 RequestOutput 列表，不是 token ids
-                outputs = self.llm_model.generate(prompts=batch, sampling_params=sampling_params)
-
-                # 取每条的第一条 beam/候选文本
-                for out in outputs:
-                    responses.append(out.outputs[0].text)
-
-                    
+            responses = self._generate_multimodal_responses(prompts, ts_images, batch_size=16)
+            if len(responses) != len(current_states):
+                raise RuntimeError(
+                    f"LLM response count mismatch: expected {len(current_states)}, got {len(responses)}."
+                )
 
             fail_num = 0
             vehicle_nums = self.get_vehicle_num(current_states)

@@ -333,6 +333,7 @@ def _run_postprocess_pipeline(in_args, raw_input_path):
             output_path=backfill_output_path,
             llm_path=_resolve_backfill_llm_path(in_args),
             batch_size=in_args.backfill_batch_size,
+            tensor_parallel_size=in_args.tensor_parallel_size,
             language=in_args.clip_caption_language,
             max_tokens=in_args.clip_caption_max_tokens,
             temperature=in_args.clip_caption_temperature,

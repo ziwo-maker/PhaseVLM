@@ -1,4 +1,5 @@
 import os
+import sys
 import time
 import argparse
 import torch
@@ -7,6 +8,8 @@ from utils.llm_aft_trainer import LLM_Inference_VLLM
 from utils.config import *
 from utils.utils import merge, location_direction_dict
 from src.TimeVLM.ts_image_adapter import TimeSeriesImageAdapter
+
+_PROJECT_ROOT = os.path.abspath(os.path.dirname(__file__))
 
 
 def parse_args():
@@ -45,7 +48,50 @@ def _resolve_ts_adapter_device():
     return "cuda:0"
 
 
+def _normalize_llm_model_name(llm_model, llm_path):
+    raw_name = str(llm_model or "").strip()
+    if not raw_name:
+        raw_name = os.path.basename(os.path.normpath(str(llm_path or "").strip()))
+
+    alias = raw_name.lower().replace("_", "-")
+    alias_map = {
+        "qwen3-8b": "qwen3-vl-8B",
+        "qwen3-vl-8b": "qwen3-vl-8B",
+        "qwen3-vl-8b-instruct": "qwen3-vl-8B",
+        "qwen-vl-8b": "qwen3-vl-8B",
+    }
+    return alias_map.get(alias, raw_name)
+
+
+def _project_path(*parts):
+    return os.path.join(_PROJECT_ROOT, *parts)
+
+
+def _prepare_project_output_root(dirname):
+    base_path = _project_path(dirname)
+    if os.path.islink(base_path):
+        target_path = os.path.realpath(base_path)
+        try:
+            os.makedirs(target_path, exist_ok=True)
+            return base_path
+        except OSError as exc:
+            fallback_path = _project_path(f"{dirname}_local")
+            os.makedirs(fallback_path, exist_ok=True)
+            print(
+                f"[run_open_LLM_with_vllm] Warning: failed to use '{base_path}' "
+                f"(symlink target: '{target_path}'). Reason: {exc}. "
+                f"Falling back to '{fallback_path}'.",
+                file=sys.stderr,
+                flush=True,
+            )
+            return fallback_path
+    os.makedirs(base_path, exist_ok=True)
+    return base_path
+
+
 def main(in_args):
+    in_args.llm_path = os.path.normpath(os.path.expanduser(str(in_args.llm_path).strip()))
+    in_args.llm_model = _normalize_llm_model_name(in_args.llm_model, in_args.llm_path)
     traffic_file_list = []
 
     if in_args.dataset == 'jinan':
@@ -152,12 +198,13 @@ def main(in_args):
         dic_agent_conf_extra["FIXED_TIME"] = [30, 30, 30, 30]
 
     dic_traffic_env_conf_extra["NUM_AGENTS"] = dic_traffic_env_conf_extra["NUM_INTERSECTIONS"]
+    timestamp = time.strftime('%m_%d_%H_%M_%S', time.localtime(time.time()))
+    model_root = _prepare_project_output_root("model")
+    records_root = _prepare_project_output_root("records")
     dic_path_extra = {
-        "PATH_TO_MODEL": os.path.join("model", in_args.memo, in_args.traffic_file + "_" +
-                                      time.strftime('%m_%d_%H_%M_%S', time.localtime(time.time()))),
-        "PATH_TO_WORK_DIRECTORY": os.path.join("records", in_args.memo, in_args.traffic_file + "_" +
-                                               time.strftime('%m_%d_%H_%M_%S', time.localtime(time.time()))),
-        "PATH_TO_DATA": os.path.join("data", template, str(road_net))
+        "PATH_TO_MODEL": os.path.join(model_root, in_args.memo, f"{in_args.traffic_file}_{timestamp}"),
+        "PATH_TO_WORK_DIRECTORY": os.path.join(records_root, in_args.memo, f"{in_args.traffic_file}_{timestamp}"),
+        "PATH_TO_DATA": _project_path("data", template, str(road_net))
     }
 
     ts_adapter = TimeSeriesImageAdapter(
