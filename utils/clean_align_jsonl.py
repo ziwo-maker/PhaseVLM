@@ -444,6 +444,16 @@ def _write_group_lines(fout, group_lines: List[str]) -> int:
     return written
 
 
+def _maybe_flush_output(fout, pending_groups: int, flush_every_groups: int) -> int:
+    flush_every_groups = int(flush_every_groups or 0)
+    if flush_every_groups <= 0:
+        return pending_groups
+    if pending_groups < flush_every_groups:
+        return pending_groups
+    fout.flush()
+    return 0
+
+
 def clean_jsonl(
     inputs: List[str],
     output_path: str,
@@ -461,6 +471,7 @@ def clean_jsonl(
     rebalance_reference: str = "second_largest",
     rebalance_max_extra_copies_per_group: int = 4,
     rebalance_seed: int = 7,
+    flush_every_groups: int = 128,
 ) -> dict:
     movement_keys = movement_keys or list(DEFAULT_MOVEMENT_KEYS)
     resolved_rebalance_targets = _resolve_rebalance_targets(rebalance_targets or [])
@@ -491,6 +502,7 @@ def clean_jsonl(
     caption_bucket: Dict[tuple[int, int], List[int]] = defaultdict(list)
     seen_exact_captions: set[str] = set()
     kept_groups_buffer: List[dict] = []
+    pending_flush_groups = 0
 
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
     with open(output_path, "w", encoding="utf-8") as fout:
@@ -546,6 +558,12 @@ def clean_jsonl(
                             kept_groups_buffer.append(_make_group_entry(current_group_lines, record, profile))
                         else:
                             stats["written_lines"] += _write_group_lines(fout, current_group_lines)
+                            pending_flush_groups += 1
+                            pending_flush_groups = _maybe_flush_output(
+                                fout,
+                                pending_flush_groups,
+                                flush_every_groups,
+                            )
                     else:
                         if drop_zero_seq and total == 0.0:
                             stats["dropped_zero_groups"] += 1
@@ -566,6 +584,12 @@ def clean_jsonl(
                             kept_groups_buffer.append(_make_group_entry(current_group_lines, current_group[-1], profile))
                         else:
                             stats["written_lines"] += _write_group_lines(fout, current_group_lines)
+                            pending_flush_groups += 1
+                            pending_flush_groups = _maybe_flush_output(
+                                fout,
+                                pending_flush_groups,
+                                flush_every_groups,
+                            )
                         stats["incomplete_groups_kept"] += 1
                     else:
                         stats["incomplete_groups_dropped"] += 1
@@ -582,12 +606,20 @@ def clean_jsonl(
             )
             for group in output_groups:
                 stats["written_lines"] += _write_group_lines(fout, group.get("lines") or [])
+                pending_flush_groups += 1
+                pending_flush_groups = _maybe_flush_output(
+                    fout,
+                    pending_flush_groups,
+                    flush_every_groups,
+                )
             stats["rebalance_base_groups"] = int(rebalance_summary["base_groups"])
             stats["rebalance_added_groups"] = int(rebalance_summary["added_groups"])
             stats["rebalance_output_groups"] = int(rebalance_summary["output_groups"])
             stats["rebalance_target_counts_before"] = dict(rebalance_summary["target_counts_before"])
             stats["rebalance_target_counts_after"] = dict(rebalance_summary["target_counts_after"])
             stats["rebalance_target_counts_target"] = dict(rebalance_summary["target_counts_target"])
+        if pending_flush_groups > 0:
+            fout.flush()
 
     return stats
 
