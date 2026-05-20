@@ -6,6 +6,7 @@ from projection_train.reward_shaping import (
     OBJECTIVE_QUEUE,
     OBJECTIVE_TRAVEL,
     OBJECTIVE_WAIT,
+    REWARD_MODE_STABLE_DELTA,
     WAIT_REDUCER_MAX,
     WAIT_REDUCER_MEAN,
     WAIT_REDUCER_MIN,
@@ -80,6 +81,104 @@ def test_wait_reward_penalizes_absolute_delay() -> None:
     assert low_wait["wait_reward"] < 0.0
     assert high_wait["wait_reward"] < low_wait["wait_reward"]
     assert high_wait["reward"] < low_wait["reward"]
+
+
+def test_stable_delta_wait_ignores_absolute_delay_when_delta_is_zero() -> None:
+    weights = resolve_objective_weights(queue_weight=0.0, wait_weight=1.0, travel_weight=0.0)
+    low_absolute_wait = compute_local_shaped_reward(
+        queue_delta=0.0,
+        wait_value=30.0,
+        wait_delta=0.0,
+        active_vehicle_delta=0.0,
+        throughput_count=0.0,
+        queue_reward_coef=-0.35,
+        waiting_reward_coef=-0.01,
+        system_vehicle_reward_coef=-0.01,
+        throughput_reward_coef=0.02,
+        switch_penalty=0.0,
+        starvation_penalty=0.0,
+        objective_weights=weights,
+        reward_mode=REWARD_MODE_STABLE_DELTA,
+    )
+    high_absolute_wait = compute_local_shaped_reward(
+        queue_delta=0.0,
+        wait_value=600.0,
+        wait_delta=0.0,
+        active_vehicle_delta=0.0,
+        throughput_count=0.0,
+        queue_reward_coef=-0.35,
+        waiting_reward_coef=-0.01,
+        system_vehicle_reward_coef=-0.01,
+        throughput_reward_coef=0.02,
+        switch_penalty=0.0,
+        starvation_penalty=0.0,
+        objective_weights=weights,
+        reward_mode=REWARD_MODE_STABLE_DELTA,
+    )
+    assert low_absolute_wait["wait_reward"] == pytest.approx(0.0)
+    assert high_absolute_wait["wait_reward"] == pytest.approx(low_absolute_wait["wait_reward"])
+    assert high_absolute_wait["reward"] == pytest.approx(low_absolute_wait["reward"])
+
+
+def test_stable_delta_wait_delta_penalizes_growth_and_rewards_reduction() -> None:
+    weights = resolve_objective_weights(queue_weight=0.0, wait_weight=1.0, travel_weight=0.0)
+    growing_wait = compute_local_shaped_reward(
+        queue_delta=0.0,
+        wait_value=600.0,
+        wait_delta=30.0,
+        active_vehicle_delta=0.0,
+        throughput_count=0.0,
+        queue_reward_coef=-0.35,
+        waiting_reward_coef=-0.01,
+        system_vehicle_reward_coef=-0.01,
+        throughput_reward_coef=0.02,
+        switch_penalty=0.0,
+        starvation_penalty=0.0,
+        objective_weights=weights,
+        reward_mode=REWARD_MODE_STABLE_DELTA,
+        wait_delta_scale=30.0,
+    )
+    falling_wait = compute_local_shaped_reward(
+        queue_delta=0.0,
+        wait_value=600.0,
+        wait_delta=-30.0,
+        active_vehicle_delta=0.0,
+        throughput_count=0.0,
+        queue_reward_coef=-0.35,
+        waiting_reward_coef=-0.01,
+        system_vehicle_reward_coef=-0.01,
+        throughput_reward_coef=0.02,
+        switch_penalty=0.0,
+        starvation_penalty=0.0,
+        objective_weights=weights,
+        reward_mode=REWARD_MODE_STABLE_DELTA,
+        wait_delta_scale=30.0,
+    )
+    assert growing_wait["wait_reward"] == pytest.approx(-1.0)
+    assert falling_wait["wait_reward"] == pytest.approx(1.0)
+    assert falling_wait["reward"] > growing_wait["reward"]
+
+
+def test_stable_delta_reward_is_clipped_for_extreme_inputs() -> None:
+    weights = resolve_objective_weights(queue_weight=1.0, wait_weight=1.0, travel_weight=1.0)
+    result = compute_local_shaped_reward(
+        queue_delta=-1000.0,
+        wait_value=0.0,
+        wait_delta=-1000.0,
+        active_vehicle_delta=-1000.0,
+        throughput_count=1000.0,
+        queue_reward_coef=-0.35,
+        waiting_reward_coef=-0.01,
+        system_vehicle_reward_coef=-0.01,
+        throughput_reward_coef=0.02,
+        switch_penalty=0.0,
+        starvation_penalty=0.0,
+        objective_weights=weights,
+        reward_mode=REWARD_MODE_STABLE_DELTA,
+        reward_clip=0.5,
+    )
+    assert result["raw_reward"] > 0.5
+    assert result["reward"] == pytest.approx(0.5)
 
 
 def test_selection_weights_change_training_objective_mix() -> None:

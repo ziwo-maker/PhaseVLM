@@ -23,6 +23,12 @@ class TrajectoryRolloutBuffer:
         self.dones: List[torch.Tensor] = []
         self.advantages: torch.Tensor | None = None
         self.returns: torch.Tensor | None = None
+        self.reward_mean = 0.0
+        self.reward_std = 0.0
+        self.return_mean = 0.0
+        self.return_std = 0.0
+        self.advantage_mean = 0.0
+        self.advantage_std = 0.0
 
     def add(
         self,
@@ -82,6 +88,15 @@ class TrajectoryRolloutBuffer:
 
         self.advantages = advantages
         self.returns = advantages + values
+        flat_rewards = rewards.reshape(-1)
+        flat_returns = self.returns.reshape(-1)
+        flat_advantages = advantages.reshape(-1)
+        self.reward_mean = float(flat_rewards.mean().item())
+        self.reward_std = float(flat_rewards.std(unbiased=False).item())
+        self.return_mean = float(flat_returns.mean().item())
+        self.return_std = float(flat_returns.std(unbiased=False).item())
+        self.advantage_mean = float(flat_advantages.mean().item())
+        self.advantage_std = float(flat_advantages.std(unbiased=False).item())
 
     def flattened(self, max_items: Optional[int] = None) -> Dict[str, torch.Tensor | List[str]]:
         if self.advantages is None or self.returns is None:

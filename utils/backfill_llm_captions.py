@@ -1,18 +1,23 @@
 import argparse
 import gc
+import hashlib
 import json
 import os
+import random
 import re
-from typing import Any, Dict, List
+from itertools import chain
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 DEFAULT_MOVEMENT_KEYS = ["NT", "NL", "ST", "SL", "ET", "EL", "WT", "WL"]
 DEFAULT_CAPTION_LANGUAGE = "en"
 DEFAULT_CAPTION_MAX_NEW_TOKENS = 64
-DEFAULT_CAPTION_TEMPERATURE = 0.2
-DEFAULT_CAPTION_TOP_P = 0.9
+DEFAULT_CAPTION_TEMPERATURE = 0.8
+DEFAULT_CAPTION_TOP_P = 0.95
 DEFAULT_MAX_MODEL_LEN = 2048
 DEFAULT_GPU_MEMORY_UTILIZATION = 0.9
 DEFAULT_TENSOR_PARALLEL_SIZE = 0
+DEFAULT_MAX_CAPTION_RETRIES = 3
+DEFAULT_DIVERSITY_HAMMING_THRESHOLD = 4
 MOVEMENT_LABELS = {
     "NT": "north through",
     "NL": "north left",
@@ -23,6 +28,12 @@ MOVEMENT_LABELS = {
     "WT": "west through",
     "WL": "west left",
 }
+VISUAL_DESCRIPTORS = [
+    "queue forming", "long line", "steady flow", "sparse traffic",
+    "congested", "bumper-to-bumper", "clear road", "light traffic",
+    "heavy congestion", "moderate buildup", "vehicles waiting",
+    "empty lane", "busy intersection", "traffic piling up",
+]
 
 
 def _safe_int(value: object) -> int:
@@ -221,19 +232,121 @@ def _build_structured_caption(metrics: Dict[str, Any]) -> str:
     return " ".join(part.strip() for part in (sentence_one, sentence_two) if part.strip())
 
 
+def _normalize_text(text: str) -> str:
+    text = str(text or "").lower().strip()
+    text = re.sub(r"[^a-z0-9\s]+", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _tokenize(text: str) -> List[str]:
+    words = text.split()
+    if not words:
+        return []
+    tokens = list(words)
+    tokens.extend(f"{words[idx]}_{words[idx + 1]}" for idx in range(len(words) - 1))
+    return tokens
+
+
+def _simhash(tokens: List[str]) -> int:
+    vec = [0] * 64
+    for token in tokens:
+        hashed = int(hashlib.md5(token.encode("utf-8")).hexdigest()[:16], 16)
+        for bit in range(64):
+            if (hashed >> bit) & 1:
+                vec[bit] += 1
+            else:
+                vec[bit] -= 1
+    output = 0
+    for bit, value in enumerate(vec):
+        if value >= 0:
+            output |= 1 << bit
+    return output
+
+
+def _hamming(a: int, b: int) -> int:
+    value = a ^ b
+    try:
+        return value.bit_count()
+    except AttributeError:
+        return bin(value).count("1")
+
+
+def _caption_min_hamming_distance(caption: str, seen_hashes: List[int]) -> Optional[int]:
+    """Compute min Hamming distance of *caption* to all previously accepted captions."""
+    if not seen_hashes:
+        return None
+    normalized = _normalize_text(caption)
+    if not normalized:
+        return None
+    tokens = _tokenize(normalized)
+    if not tokens:
+        return None
+    h = _simhash(tokens)
+    return min(_hamming(h, ref) for ref in seen_hashes)
+
+
 def _caption_needs_fallback(text: str) -> bool:
+    """Returns True if the LLM-generated caption is unfit (too short, missing movements,
+    lacking trend words, or reads like a data dump).
+
+    A failed caption now triggers a RETRY with a different template instead of a
+    deterministic fallback.  The structured fallback is only used as last resort after
+    max retries are exhausted.
+    """
     normalized = " ".join(str(text or "").strip().split())
     if not normalized:
         return True
     lowered = normalized.lower()
     movement_mentions = re.findall(r"\b(nt|nl|st|sl|et|el|wt|wl)\b", lowered)
-    if len(normalized.split()) < 18:
+    if len(normalized.split()) < 15:
         return True
-    if len(movement_mentions) < 2:
+    if len(movement_mentions) < 1:
         return True
-    if not any(token in lowered for token in ("rising", "declining", "steady", "increasing", "decreasing")):
-        return True
+    banned_patterns = [
+        "vehicles in total",
+        "vehicles counted",
+        "vehicles and ",
+        "average",
+        "per bin",
+        "total ",
+        "peak bin",
+    ]
+    for pattern in banned_patterns:
+        if pattern in lowered:
+            return True
     return False
+
+
+def _caption_is_too_similar(
+    caption: str,
+    seen_hashes: List[int],
+    threshold: int = DEFAULT_DIVERSITY_HAMMING_THRESHOLD,
+) -> bool:
+    """Check if *caption* is too similar (by SimHash Hamming distance) to any
+    previously accepted caption."""
+    if not seen_hashes:
+        return False
+    min_dist = _caption_min_hamming_distance(caption, seen_hashes)
+    if min_dist is None:
+        return False
+    return min_dist <= threshold
+
+
+def _accept_caption_hash(caption: str, seen_hashes: List[int]) -> None:
+    """Register *caption* into the seen-hash list so future captions can check
+    diversity against it."""
+    normalized = _normalize_text(caption)
+    if not normalized:
+        return
+    tokens = _tokenize(normalized)
+    if not tokens:
+        return
+    seen_hashes.append(_simhash(tokens))
+
+
+def _build_structured_caption_safe(metrics: Dict[str, Any]) -> str:
+    """Structured caption as last-resort fallback after retries are exhausted."""
+    return _build_structured_caption(metrics)
 
 
 def _clip_trend_label(first_total: float, last_total: float) -> str:
@@ -280,17 +393,81 @@ def _summarize_history_for_caption(
 
 
 def _clip_caption_instruction_series(language: str) -> str:
+    """Return a randomly selected prompt template for caption generation.
+
+    Templates describe the VISUAL SCENE (what a camera would see) rather than
+    reciting numeric statistics.  This produces more diverse captions and better
+    alignment with the TS images used during training.
+    """
     lang = str(language or DEFAULT_CAPTION_LANGUAGE).strip().lower()
     target_language = "English" if lang in ("en", "eng", "english") else lang
-    return (
-        "Convert the following structured traffic summary into a specific visual caption of one intersection. "
-        f"Write in {target_language}. Output exactly two sentences on one line, with no quotes. "
-        "Sentence 1 must state the dominant axis, whether through traffic or left turns dominate, and whether "
-        "overall demand is rising, declining, or steady. Sentence 2 must mention at least two explicit "
-        "movements using their abbreviations in parentheses, such as south through (ST), and say where the "
-        "latest load is concentrated. Avoid vague openings like 'moderate traffic' or 'heavy traffic' unless "
-        "they are followed by concrete movement details. Do not mention data, tables, summaries, charts, or timestamps."
-    )
+
+    templates = [
+        # Template A: visual scene focus
+        (
+            "You are looking at a traffic camera feed at one intersection. "
+            "Describe what you SEE in the latest frame, based on the traffic summary below. "
+            f"Write in {target_language}. Output exactly two sentences on one line, with no quotes. "
+            "Sentence 1: describe the visual scene — which approaches look busy or clear, "
+            "whether queues appear to be growing, shrinking, or stable. Use concrete visual "
+            "language like 'queue forming', 'clear road', 'steady flow', 'bumper-to-bumper'. "
+            "Sentence 2: describe the most noticeable details — where vehicles are concentrated "
+            "right now, which lanes appear congested or empty. Mention specific movements "
+            "using their abbreviations in parentheses ONLY when they help identify the lane. "
+            "Do NOT recite raw vehicle counts, timestamps, or statistics. "
+            "Do NOT mention data, tables, summaries, or charts."
+        ),
+        # Template B: time-dynamics focus
+        (
+            "A traffic camera has been recording one intersection for the past 30 seconds. "
+            "Based on the summary below, write a natural-language description of the scene. "
+            f"Write in {target_language}. Output exactly two sentences on one line, with no quotes. "
+            "Sentence 1: describe how traffic has changed over the observation window — "
+            "is congestion building up, clearing out, or staying the same? Use vivid "
+            "descriptors like 'queues are growing', 'traffic is easing', 'intersection is clearing'. "
+            "Sentence 2: describe the current state of the busiest lanes and the quietest lanes. "
+            "Mention movement abbreviations (e.g., ST, NT) naturally in context. "
+            "Do NOT list numbers or use phrases like 'X vehicles counted'. "
+            "Do NOT mention data, tables, summaries, or timestamps."
+        ),
+        # Template C: directional focus
+        (
+            "Describe the traffic scene at this intersection as if narrating a traffic report. "
+            f"Write in {target_language}. Output exactly two sentences on one line, with no quotes. "
+            "Sentence 1: identify which direction (north-south or east-west) dominates the scene "
+            "and whether through traffic or left turns are more prominent. Use visual terms like "
+            "'dominates', 'flows freely', 'is backed up', 'is nearly empty'. "
+            "Sentence 2: zoom in on the most congested movement direction right now and contrast "
+            "it with the emptiest. Mention specific movement abbreviations accurately. "
+            "Do NOT recite raw vehicle counts or tabular data. "
+            "Do NOT mention data, tables, summaries, or timestamps."
+        ),
+        # Template D: concise snapshot
+        (
+            "Summarize the latest traffic camera image at this intersection. "
+            f"Write in {target_language}. Output exactly two sentences on one line, with no quotes. "
+            "Sentence 1: in plain visual language, describe the overall traffic picture — "
+            "which approaches are busy, which are clear, and whether the situation is "
+            "improving or worsening. Sentence 2: point out the most striking visual detail, "
+            "such as a long queue in a specific lane or an unusually empty approach. "
+            "Include relevant movement abbreviations. Avoid numerical counts. "
+            "Do NOT mention data, tables, summaries, or timestamps."
+        ),
+        # Template E: congestion pattern focus
+        (
+            "Based on the traffic summary, paint a picture of what the latest camera frame shows. "
+            f"Write in {target_language}. Output exactly two sentences on one line, with no quotes. "
+            "Sentence 1: describe the congestion pattern — where vehicles are clustered, "
+            "which movements have the heaviest load, and whether the pattern is typical or unusual. "
+            "Use descriptors like 'heavy', 'light', 'moderate', 'backed up', 'free-flowing'. "
+            "Sentence 2: highlight the movement with the most vehicles waiting right now, "
+            "and note any movement that stands out as unexpectedly empty. "
+            "Include movement abbreviations for precision. "
+            "Do NOT recite raw vehicle counts. "
+            "Do NOT mention data, tables, summaries, or timestamps."
+        ),
+    ]
+    return random.choice(templates)
 
 
 def _clean_clip_caption(text: str) -> str:
@@ -441,20 +618,23 @@ def _generate_captions(prompts: List[str], args, backend: str, model, tokenizer)
     try:
         from tqdm import tqdm
 
-        batch_iter = tqdm(range(0, len(prompts), batch_size), desc="caption batches")
+        batch_iter = tqdm(
+            range(0, len(prompts), batch_size),
+            desc="caption batches",
+            disable=not os.isatty(2),
+        )
     except Exception:
         batch_iter = range(0, len(prompts), batch_size)
     for start in batch_iter:
         batch = prompts[start : start + batch_size]
-        outputs = model.generate(prompts=batch, sampling_params=sampling_params)
+        outputs = model.generate(prompts=batch, sampling_params=sampling_params, use_tqdm=False)
         for output in outputs:
             text = output.outputs[0].text if output.outputs else ""
             captions.append(_clean_clip_caption(text))
     return captions
 
 
-def _read_grouped_records(path: str) -> List[List[Dict]]:
-    groups: List[List[Dict]] = []
+def _iter_grouped_records(path: str) -> Iterator[List[Dict]]:
     current_group: List[Dict] = []
     with open(path, "r", encoding="utf-8") as handle:
         for line in handle:
@@ -463,11 +643,22 @@ def _read_grouped_records(path: str) -> List[List[Dict]]:
             record = json.loads(line)
             current_group.append(record)
             if record.get("clip_caption"):
-                groups.append(current_group)
+                yield current_group
                 current_group = []
     if current_group:
-        groups.append(current_group)
-    return groups
+        yield current_group
+
+
+def _iter_group_batches(path: str, batch_size: int) -> Iterator[List[List[Dict]]]:
+    batch: List[List[Dict]] = []
+    batch_size = max(1, int(batch_size))
+    for group in _iter_grouped_records(path):
+        batch.append(group)
+        if len(batch) >= batch_size:
+            yield batch
+            batch = []
+    if batch:
+        yield batch
 
 
 def _group_prompt(group: List[Dict], language: str = DEFAULT_CAPTION_LANGUAGE) -> str:
@@ -542,6 +733,18 @@ def parse_args():
     parser.add_argument("--max_tokens", type=int, default=DEFAULT_CAPTION_MAX_NEW_TOKENS)
     parser.add_argument("--temperature", type=float, default=DEFAULT_CAPTION_TEMPERATURE)
     parser.add_argument("--top_p", type=float, default=DEFAULT_CAPTION_TOP_P)
+    parser.add_argument(
+        "--max_caption_retries",
+        type=int,
+        default=DEFAULT_MAX_CAPTION_RETRIES,
+        help="max regeneration attempts per caption for quality/diversity (0 = no retry)",
+    )
+    parser.add_argument(
+        "--diversity_hamming_threshold",
+        type=int,
+        default=DEFAULT_DIVERSITY_HAMMING_THRESHOLD,
+        help="SimHash Hamming distance below which captions are considered too similar",
+    )
     return parser.parse_args()
 
 
@@ -555,6 +758,8 @@ def backfill_captions(
     max_tokens: int = DEFAULT_CAPTION_MAX_NEW_TOKENS,
     temperature: float = DEFAULT_CAPTION_TEMPERATURE,
     top_p: float = DEFAULT_CAPTION_TOP_P,
+    max_caption_retries: int = DEFAULT_MAX_CAPTION_RETRIES,
+    diversity_hamming_threshold: int = DEFAULT_DIVERSITY_HAMMING_THRESHOLD,
 ) -> dict:
     args = argparse.Namespace(
         input=str(input_path),
@@ -566,75 +771,167 @@ def backfill_captions(
         max_tokens=int(max_tokens),
         temperature=float(temperature),
         top_p=float(top_p),
+        max_caption_retries=int(max_caption_retries),
+        diversity_hamming_threshold=int(diversity_hamming_threshold),
     )
-    groups = _read_grouped_records(args.input)
-    if not groups:
+    batch_size = max(1, int(args.batch_size))
+    group_batches = _iter_group_batches(args.input, batch_size=batch_size)
+    first_batch = next(group_batches, None)
+    if first_batch is None:
         raise SystemExit(f"No caption groups found in {args.input}.")
-
-    prompts = [_group_prompt(group, language=args.language) for group in groups]
     backend, model, tokenizer = _load_caption_model(args)
-    try:
-        raw_captions = _generate_captions(prompts, args, backend=backend, model=model, tokenizer=tokenizer)
-    finally:
-        _shutdown_caption_model(backend, model)
-    captions: List[str] = []
-    caption_modes: List[str] = []
+    max_retries = max(0, int(args.max_caption_retries))
+    diversity_threshold = int(args.diversity_hamming_threshold)
+    num_groups = 0
+    num_records = 0
     fallback_count = 0
-    for group, llm_caption in zip(groups, raw_captions):
-        last_record = group[-1] if group else {}
-        meta = last_record.get("meta") or {}
-        if not isinstance(meta, dict):
-            meta = {}
-        movement_keys = meta.get("movement_keys")
-        if not isinstance(movement_keys, list) or not movement_keys:
-            movement_keys = list((last_record.get("movement_counts") or {}).keys()) or list(DEFAULT_MOVEMENT_KEYS)
-        history = [
-            {
-                "date": item.get("date"),
-                "movement_counts": item.get("movement_counts") or {},
-            }
-            for item in group
-        ]
-        metrics = _extract_history_metrics(history, movement_keys)
-        if _caption_needs_fallback(llm_caption):
-            captions.append(_build_structured_caption(metrics))
-            caption_modes.append("structured_fallback")
-            fallback_count += 1
-        else:
-            captions.append(llm_caption)
-            caption_modes.append("llm")
-    if len(captions) != len(groups):
-        raise SystemExit(
-            f"Caption count mismatch: generated {len(captions)} captions for {len(groups)} groups."
-        )
-
-    rewritten_records = _rewrite_groups(
-        groups,
-        captions,
-        llm_model_name=_infer_model_name_from_path(args.llm_path),
-        caption_modes=caption_modes,
-    )
+    retry_count = 0
+    diversity_retry_count = 0
+    llm_model_name = _infer_model_name_from_path(args.llm_path)
+    seen_hashes: List[int] = []
     output_dir = os.path.dirname(args.output)
     if output_dir:
         os.makedirs(output_dir, exist_ok=True)
-    with open(args.output, "w", encoding="utf-8") as handle:
-        for record in rewritten_records:
-            handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+    try:
+        with open(args.output, "w", encoding="utf-8") as handle:
+            for groups in chain([first_batch], group_batches):
+                # ---- first pass: batch generate ----
+                prompts = [_group_prompt(group, language=args.language) for group in groups]
+                raw_captions = _generate_captions(
+                    prompts,
+                    args,
+                    backend=backend,
+                    model=model,
+                    tokenizer=tokenizer,
+                )
+                captions: List[str] = [""] * len(groups)
+                caption_modes: List[str] = ["llm"] * len(groups)
+                retry_indices: List[int] = []
+
+                for idx, (group, llm_caption) in enumerate(zip(groups, raw_captions)):
+                    needs_retry = False
+                    retry_reason = ""
+
+                    if _caption_needs_fallback(llm_caption):
+                        needs_retry = True
+                        retry_reason = "quality"
+                    elif _caption_is_too_similar(llm_caption, seen_hashes, threshold=diversity_threshold):
+                        needs_retry = True
+                        retry_reason = "diversity"
+
+                    if needs_retry:
+                        retry_indices.append(idx)
+                    else:
+                        captions[idx] = llm_caption
+                        caption_modes[idx] = "llm"
+                        _accept_caption_hash(llm_caption, seen_hashes)
+
+                # ---- retry loop: regenerate failed captions with new templates ----
+                retry_round = 0
+                while retry_indices and retry_round < max_retries:
+                    retry_round += 1
+                    next_retry_indices: List[int] = []
+                    retry_prompts = []
+                    retry_temps: List[float] = []
+                    for idx in retry_indices:
+                        group = groups[idx]
+                        retry_prompts.append(
+                            _group_prompt(group, language=args.language)
+                        )
+                        # increase temperature slightly each retry for more diversity
+                        retry_temps.append(
+                            min(1.0, float(args.temperature) + 0.1 * retry_round)
+                        )
+
+                    retry_args = argparse.Namespace(
+                        **{**vars(args), "temperature": retry_temps[0] if retry_temps else float(args.temperature)}
+                    )
+                    retry_batch_captions = _generate_captions(
+                        retry_prompts,
+                        retry_args,
+                        backend=backend,
+                        model=model,
+                        tokenizer=tokenizer,
+                    )
+                    for local_idx, idx in enumerate(retry_indices):
+                        llm_caption = retry_batch_captions[local_idx]
+                        needs_retry = False
+                        if _caption_needs_fallback(llm_caption):
+                            needs_retry = True
+                            retry_count += 1
+                        elif _caption_is_too_similar(llm_caption, seen_hashes, threshold=diversity_threshold):
+                            needs_retry = True
+                            diversity_retry_count += 1
+
+                        if needs_retry:
+                            next_retry_indices.append(idx)
+                        else:
+                            captions[idx] = llm_caption
+                            caption_modes[idx] = f"llm_retry_{retry_round}"
+                            _accept_caption_hash(llm_caption, seen_hashes)
+                    retry_indices = next_retry_indices
+
+                # ---- last resort: structured fallback for exhausted retries ----
+                for idx in retry_indices:
+                    group = groups[idx]
+                    last_record = group[-1] if group else {}
+                    meta = last_record.get("meta") or {}
+                    if not isinstance(meta, dict):
+                        meta = {}
+                    movement_keys = meta.get("movement_keys")
+                    if not isinstance(movement_keys, list) or not movement_keys:
+                        movement_keys = list(
+                            (last_record.get("movement_counts") or {}).keys()
+                        ) or list(DEFAULT_MOVEMENT_KEYS)
+                    history = [
+                        {
+                            "date": item.get("date"),
+                            "movement_counts": item.get("movement_counts") or {},
+                        }
+                        for item in group
+                    ]
+                    metrics = _extract_history_metrics(history, movement_keys)
+                    captions[idx] = _build_structured_caption_safe(metrics)
+                    caption_modes[idx] = "structured_fallback_exhausted"
+                    fallback_count += 1
+                if len(captions) != len(groups):
+                    raise SystemExit(
+                        f"Caption count mismatch: generated {len(captions)} captions for {len(groups)} groups."
+                    )
+
+                rewritten_records = _rewrite_groups(
+                    groups,
+                    captions,
+                    llm_model_name=llm_model_name,
+                    caption_modes=caption_modes,
+                )
+                for record in rewritten_records:
+                    handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+                handle.flush()
+                num_groups += len(groups)
+                num_records += len(rewritten_records)
+    finally:
+        _shutdown_caption_model(backend, model)
 
     return {
         "input_path": args.input,
         "output_path": args.output,
         "llm_path": args.llm_path,
-        "llm_model_name": _infer_model_name_from_path(args.llm_path),
+        "llm_model_name": llm_model_name,
         "tensor_parallel_size": int(args.tensor_parallel_size),
-        "num_groups": len(groups),
-        "num_records": len(rewritten_records),
+        "num_groups": int(num_groups),
+        "num_records": int(num_records),
         "language": args.language,
         "max_tokens": int(args.max_tokens),
         "temperature": float(args.temperature),
         "top_p": float(args.top_p),
+        "max_caption_retries": int(max_retries),
+        "diversity_hamming_threshold": int(diversity_threshold),
+        "num_llm_first_pass": int(num_groups - fallback_count - retry_count - diversity_retry_count),
+        "num_quality_retries": int(retry_count),
+        "num_diversity_retries": int(diversity_retry_count),
         "num_structured_fallback_captions": int(fallback_count),
-        "num_llm_captions": int(len(groups) - fallback_count),
+        "num_llm_captions": int(num_groups - fallback_count),
     }
 
 
@@ -650,8 +947,14 @@ def main():
         max_tokens=args.max_tokens,
         temperature=args.temperature,
         top_p=args.top_p,
+        max_caption_retries=args.max_caption_retries,
+        diversity_hamming_threshold=args.diversity_hamming_threshold,
     )
     print(f"Wrote {result['num_groups']} caption groups to {args.output}")
+    print(f"  first-pass LLM: {result['num_llm_first_pass']}")
+    print(f"  quality retries: {result['num_quality_retries']}")
+    print(f"  diversity retries: {result['num_diversity_retries']}")
+    print(f"  exhausted fallbacks: {result['num_structured_fallback_captions']}")
 
 
 if __name__ == "__main__":

@@ -157,6 +157,12 @@ def _resolve_output_dir(base_dir: str, temperature_value: float, multi_run: bool
     return os.path.join(base_dir, f"temp_{temperature_value:.4f}")
 
 
+def _mean_metric(metrics: dict[str, float]) -> float:
+    if not metrics:
+        return 0.0
+    return float(sum(float(value) for value in metrics.values()) / max(1, len(metrics)))
+
+
 def _run_training(
     args,
     temperature_value: float,
@@ -175,6 +181,11 @@ def _run_training(
     run_started_clock = perf_counter()
     saved_checkpoints: list[str] = []
     last_epoch_record: dict[str, Any] = {}
+    best_epoch_record: dict[str, Any] = {}
+    best_metric_name = "mean_recall"
+    best_metric_value = float("-inf")
+    best_checkpoint_path = output_path / "best.pt"
+    last_checkpoint_path = output_path / "last.pt"
 
     dataset = TrafficClipJsonlDataset(
         path=args.data_path,
@@ -362,6 +373,31 @@ def _run_training(
             return 0.0
         return float(optimizer.param_groups[0].get("lr", 0.0))
 
+    def _checkpoint_payload() -> dict[str, Any]:
+        base_model = model.module if hasattr(model, "module") else model
+        run_args = dict(vars(args))
+        run_args["temperature"] = temperature_value
+        run_args["output_dir"] = output_dir
+        return {
+            "ts_projector": base_model.ts_projector.state_dict(),
+            "vision_projector": base_model.vision_projector.state_dict(),
+            "logit_scale": base_model.logit_scale.detach().cpu(),
+            "args": run_args,
+        }
+
+    def _remember_checkpoint(path: Path) -> None:
+        path_text = str(path)
+        if path_text not in saved_checkpoints:
+            saved_checkpoints.append(path_text)
+
+    def _save_checkpoint(path: Path) -> float:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        checkpoint_started_clock = perf_counter()
+        torch.save(_checkpoint_payload(), path)
+        checkpoint_duration_seconds = perf_counter() - checkpoint_started_clock
+        _remember_checkpoint(path)
+        return checkpoint_duration_seconds
+
     for epoch in range(args.epochs):
         epoch_started_at = datetime.now()
         epoch_started_clock = perf_counter()
@@ -494,25 +530,35 @@ def _run_training(
             checkpoint_path = ""
             checkpoint_duration_seconds = 0.0
             if checkpoint_due:
-                checkpoint_started_clock = perf_counter()
-                base_model = model.module if hasattr(model, "module") else model
-                run_args = dict(vars(args))
-                run_args["temperature"] = temperature_value
-                run_args["output_dir"] = output_dir
-                ckpt = {
-                    "ts_projector": base_model.ts_projector.state_dict(),
-                    "vision_projector": base_model.vision_projector.state_dict(),
-                    "logit_scale": base_model.logit_scale.detach().cpu(),
-                    "args": run_args,
-                }
                 checkpoint_path = os.path.join(output_dir, f"align_epoch_{epoch+1}.pt")
-                torch.save(ckpt, checkpoint_path)
-                checkpoint_duration_seconds = perf_counter() - checkpoint_started_clock
-                saved_checkpoints.append(checkpoint_path)
+                checkpoint_duration_seconds = _save_checkpoint(Path(checkpoint_path))
                 _log(
                     rank,
                     f"[epoch {epoch+1}/{args.epochs}] checkpoint_saved={checkpoint_path} "
                     f"save_time={_format_duration(checkpoint_duration_seconds)}"
+                )
+
+            best_checkpoint_updated = False
+            best_checkpoint_duration_seconds = 0.0
+            current_best_metric_value = _mean_metric(eval_metrics) if eval_metrics else float("-inf")
+            if eval_metrics and (not best_epoch_record or current_best_metric_value > best_metric_value):
+                best_metric_value = current_best_metric_value
+                best_checkpoint_duration_seconds = _save_checkpoint(best_checkpoint_path)
+                best_epoch_record = {
+                    "epoch": epoch + 1,
+                    "metric_name": best_metric_name,
+                    "metric_value": round(float(best_metric_value), 6),
+                    "checkpoint_path": str(best_checkpoint_path),
+                    "checkpoint_save_duration": _format_duration(best_checkpoint_duration_seconds),
+                    "checkpoint_save_duration_seconds": round(best_checkpoint_duration_seconds, 3),
+                    "eval_metrics": {key: round(float(value), 6) for key, value in eval_metrics.items()},
+                }
+                best_checkpoint_updated = True
+                _log(
+                    rank,
+                    f"[epoch {epoch+1}/{args.epochs}] best_checkpoint_saved={best_checkpoint_path} "
+                    f"{best_metric_name}={best_metric_value:.4f} "
+                    f"save_time={_format_duration(best_checkpoint_duration_seconds)}"
                 )
 
             last_epoch_record = {
@@ -534,6 +580,12 @@ def _run_training(
                 "checkpoint_path": checkpoint_path,
                 "checkpoint_save_duration": _format_duration(checkpoint_duration_seconds),
                 "checkpoint_save_duration_seconds": round(checkpoint_duration_seconds, 3),
+                "best_checkpoint_updated": bool(best_checkpoint_updated),
+                "best_metric_name": best_metric_name if eval_metrics else "",
+                "best_metric_value": round(float(current_best_metric_value), 6) if eval_metrics else None,
+                "best_checkpoint_path": str(best_checkpoint_path) if best_epoch_record else "",
+                "best_checkpoint_save_duration": _format_duration(best_checkpoint_duration_seconds),
+                "best_checkpoint_save_duration_seconds": round(best_checkpoint_duration_seconds, 3),
                 "peak_allocated_gb": memory_stats["peak_allocated_gb"],
                 "peak_reserved_gb": memory_stats["peak_reserved_gb"],
             }
@@ -546,6 +598,31 @@ def _run_training(
 
     if rank != 0:
         return None
+
+    last_checkpoint_duration_seconds = _save_checkpoint(last_checkpoint_path)
+    _log(
+        rank,
+        f"[final] last_checkpoint_saved={last_checkpoint_path} "
+        f"save_time={_format_duration(last_checkpoint_duration_seconds)}"
+    )
+    if not best_epoch_record:
+        best_metric_value = 0.0
+        best_checkpoint_duration_seconds = _save_checkpoint(best_checkpoint_path)
+        best_epoch_record = {
+            "epoch": int(last_epoch_record.get("epoch", args.epochs)),
+            "metric_name": "",
+            "metric_value": None,
+            "checkpoint_path": str(best_checkpoint_path),
+            "checkpoint_save_duration": _format_duration(best_checkpoint_duration_seconds),
+            "checkpoint_save_duration_seconds": round(best_checkpoint_duration_seconds, 3),
+            "eval_metrics": {},
+            "fallback": "no_eval_metrics_saved_best_as_final_model",
+        }
+        _log(
+            rank,
+            f"[final] best_checkpoint_saved={best_checkpoint_path} "
+            "fallback=no_eval_metrics_saved_best_as_final_model"
+        )
 
     ended_at = datetime.now()
     duration_seconds = perf_counter() - run_started_clock
@@ -568,6 +645,9 @@ def _run_training(
         "train_size": len(train_set),
         "val_size": len(val_set),
         "saved_checkpoints": saved_checkpoints,
+        "best_checkpoint_path": str(best_checkpoint_path),
+        "last_checkpoint_path": str(last_checkpoint_path),
+        "best_epoch": best_epoch_record,
         "last_epoch": last_epoch_record,
     }
     _write_json(run_summary_path, run_summary)

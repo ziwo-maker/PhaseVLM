@@ -534,9 +534,14 @@ class CityFlowEnv:
         self.current_time = None
         self.waiting_vehicle_list = {}
         self.system_states = None
+        configured_seed = self.dic_traffic_env_conf.get("CITYFLOW_SEED")
+        try:
+            cityflow_seed = int(configured_seed) if configured_seed not in (None, "") else int(np.random.randint(0, 100))
+        except (TypeError, ValueError):
+            cityflow_seed = int(np.random.randint(0, 100))
         cityflow_config = {
             "interval": self.dic_traffic_env_conf["INTERVAL"],
-            "seed": int(np.random.randint(0, 100)),
+            "seed": cityflow_seed,
             "laneChange": True,
             "dir": self.path_to_work_directory+"/",
             "roadnetFile": self.dic_traffic_env_conf["ROADNET_FILE"],

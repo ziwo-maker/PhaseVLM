@@ -9,7 +9,7 @@ import sys
 import time
 from contextlib import nullcontext
 from datetime import timedelta
-from typing import Dict, List, Sequence, Tuple
+from typing import Any, Dict, List, Sequence, Tuple
 
 import torch
 import torch.distributed as dist
@@ -21,11 +21,17 @@ _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
-from data_split import blocked_group_subset
+from data_split import blocked_group_subset, stratified_label_subset
 from projection_train.action_space import ACTION_LIST, action_to_index
 from projection_train.grouped_dataset import GroupedTrafficActionDataset, grouped_action_collate
 from projection_train.prefix_action_policy import PrefixActionPolicy
 from projection_train.prompt_utils import build_task_prompt
+
+
+BASELINE_ACTION_DISTRIBUTIONS: Dict[str, Dict[str, float]] = {
+    "stage2_bc_val02": {"ETWT": 36.88, "NTST": 31.46, "ELWL": 15.00, "NLSL": 16.67},
+    "baseline": {"ETWT": 36.88, "NTST": 31.46, "ELWL": 15.00, "NLSL": 16.67},
+}
 
 
 def configure_stdio() -> None:
@@ -101,7 +107,7 @@ def barrier() -> None:
         dist.barrier()
 
 
-def shard_eval_subset(eval_set: Subset | None, ddp: bool, rank: int, world_size: int) -> Subset | None:
+def shard_eval_subset(eval_set, ddp: bool, rank: int, world_size: int):
     if eval_set is None or not ddp or world_size <= 1:
         return eval_set
     return Subset(eval_set, list(range(rank, len(eval_set), world_size)))
@@ -117,21 +123,93 @@ def resolve_amp_dtype(args: argparse.Namespace, device: torch.device) -> torch.d
     return None
 
 
-def split_dataset(dataset, val_ratio: float, seed: int) -> Tuple[Subset, Subset | None]:
+def split_dataset(
+    dataset,
+    val_ratio: float,
+    seed: int,
+    split_strategy: str,
+) -> Tuple[Subset, Subset | None]:
     if len(dataset) == 0:
         raise RuntimeError("No grouped samples found for Stage 2 training.")
-    return blocked_group_subset(dataset, val_ratio=val_ratio)
+    if split_strategy == "blocked":
+        return blocked_group_subset(dataset, val_ratio=val_ratio)
+    if split_strategy == "stratified":
+        return stratified_label_subset(
+            dataset,
+            val_ratio=val_ratio,
+            label_attr="expert_action",
+            seed=seed,
+        )
+    raise ValueError(f"Unsupported split strategy: {split_strategy}")
 
 
-def compute_class_weights(train_set: Subset) -> torch.Tensor:
-    dataset = train_set.dataset
+def dataset_samples(dataset) -> List:
+    if isinstance(dataset, Subset):
+        base_samples = list(getattr(dataset.dataset, "samples", []))
+        return [base_samples[int(idx)] for idx in dataset.indices]
+    return list(getattr(dataset, "samples", []))
+
+
+def action_distribution(dataset) -> Dict[str, int]:
+    counts = {action: 0 for action in ACTION_LIST}
+    extra_counts: Dict[str, int] = {}
+    for sample in dataset_samples(dataset):
+        action = str(getattr(sample, "expert_action", "") or "")
+        if action in counts:
+            counts[action] += 1
+        else:
+            extra_counts[action] = extra_counts.get(action, 0) + 1
+    counts.update({key: value for key, value in sorted(extra_counts.items())})
+    return counts
+
+
+def format_action_distribution(counts: Dict[str, int]) -> str:
+    return ", ".join(f"{action}={int(counts.get(action, 0))}" for action in counts)
+
+
+def compute_class_weights(train_set) -> torch.Tensor:
     counts = torch.zeros(len(ACTION_LIST), dtype=torch.float32)
-    for sample_idx in train_set.indices:
-        label = action_to_index(dataset.samples[int(sample_idx)].expert_action)
+    for sample in dataset_samples(train_set):
+        label = action_to_index(getattr(sample, "expert_action", ""))
         counts[label] += 1.0
     counts = counts.clamp_min(1.0)
     weights = counts.sum() / (counts * float(len(ACTION_LIST)))
     return weights / weights.mean().clamp_min(1e-8)
+
+
+def _parse_global_action_weights(raw: str | None) -> torch.Tensor | None:
+    """Parse comma-separated per-action weights e.g. '0.5,1.0,1.0,2.0'."""
+    if raw is None or not str(raw).strip():
+        return None
+    parts = [p.strip() for p in str(raw).split(",")]
+    if len(parts) != len(ACTION_LIST):
+        raise ValueError(
+            f"--global_action_weights expects {len(ACTION_LIST)} values, got {len(parts)}"
+        )
+    return torch.tensor([float(p) for p in parts], dtype=torch.float32)
+
+
+def _compute_action_balance_loss(logits: torch.Tensor) -> torch.Tensor:
+    """Entropy regularizer: penalize non-uniform predicted action distribution."""
+    probs = F.softmax(logits, dim=-1)
+    batch_probs = probs.mean(dim=0)
+    eps = 1e-8
+    entropy = -(batch_probs * torch.log(batch_probs + eps)).sum()
+    max_entropy = torch.log(
+        torch.tensor(len(ACTION_LIST), device=logits.device, dtype=torch.float32)
+    )
+    return max_entropy - entropy
+
+
+def _compute_overconf_penalty(logits: torch.Tensor) -> torch.Tensor:
+    """Penalize when any action's mean probability exceeds uniform."""
+    probs = F.softmax(logits, dim=-1)
+    mean_probs = probs.mean(dim=0)
+    if mean_probs.numel() < 2:
+        return torch.tensor(0.0, device=logits.device)
+    uniform = 1.0 / len(ACTION_LIST)
+    excess = torch.relu(mean_probs - uniform)
+    return excess.sum()
 
 
 def build_soft_targets(
@@ -244,6 +322,7 @@ def save_checkpoint(
     epoch: int,
     args: argparse.Namespace,
     metrics: Dict[str, float],
+    selection: Dict[str, Any] | None = None,
 ) -> str:
     os.makedirs(output_dir, exist_ok=True)
     checkpoint = {
@@ -254,9 +333,41 @@ def save_checkpoint(
         "metrics": metrics,
         "args": vars(args),
     }
+    if selection is not None:
+        checkpoint["checkpoint_selection"] = selection
     path = os.path.join(output_dir, filename)
     torch.save(checkpoint, path)
     return path
+
+
+def resolve_best_monitor(metrics: Dict[str, float], args: argparse.Namespace) -> Tuple[str, str, float]:
+    metric_name = str(args.best_metric or "val_macro_f1").strip()
+    if metric_name not in metrics:
+        fallback_name = ""
+        if metric_name.startswith("val_"):
+            candidate = "train_" + metric_name[len("val_") :]
+            if candidate in metrics:
+                fallback_name = candidate
+        if not fallback_name:
+            available = ", ".join(sorted(metrics))
+            raise KeyError(f"Best checkpoint metric '{metric_name}' is not available. Available metrics: {available}")
+        metric_name = fallback_name
+
+    mode = str(args.best_mode or "auto").strip().lower()
+    if mode == "auto":
+        mode = "min" if metric_name.endswith("_loss") else "max"
+    if mode not in {"max", "min"}:
+        raise ValueError(f"Unsupported best checkpoint mode: {args.best_mode}")
+    return metric_name, mode, float(metrics[metric_name])
+
+
+def is_better_monitor(value: float, best_value: float | None, mode: str, min_delta: float) -> bool:
+    if best_value is None:
+        return True
+    delta = max(0.0, float(min_delta))
+    if mode == "min":
+        return value < best_value - delta
+    return value > best_value + delta
 
 
 def current_lr(optimizer: torch.optim.Optimizer) -> float:
@@ -359,6 +470,10 @@ def run_epoch(
                             else:
                                 alpha = float(args.soft_target_alpha)
                                 raw_loss = (1.0 - alpha) * hard_loss + alpha * soft_loss
+                    if getattr(args, "action_balance_weight", 0.0) > 0:
+                        raw_loss = raw_loss + args.action_balance_weight * _compute_action_balance_loss(logits)
+                    if getattr(args, "overconf_penalty_weight", 0.0) > 0:
+                        raw_loss = raw_loss + args.overconf_penalty_weight * _compute_overconf_penalty(logits)
                     loss = raw_loss / max(1, args.grad_accum_steps)
                 if is_train:
                     if scaler is not None:
@@ -434,7 +549,9 @@ def run_epoch(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--data_path", type=str, required=True, nargs="+")
+    parser.add_argument("--data_path", type=str, nargs="+", default=None)
+    parser.add_argument("--train_data_path", type=str, nargs="+", default=None)
+    parser.add_argument("--val_data_path", type=str, nargs="+", default=None)
     parser.add_argument("--llm_path", type=str, required=True)
     parser.add_argument("--align_ckpt", type=str, required=True)
     parser.add_argument("--output_dir", type=str, default="records/projection_bc")
@@ -463,6 +580,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--weight_decay", type=float, default=1e-4)
     parser.add_argument("--max_grad_norm", type=float, default=1.0)
     parser.add_argument("--val_ratio", type=float, default=0.1)
+    parser.add_argument(
+        "--split_strategy",
+        type=str,
+        default="stratified",
+        choices=["stratified", "blocked"],
+        help="Dataset split strategy. stratified keeps expert_action classes represented in validation.",
+    )
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--max_samples", type=int, default=None)
     parser.add_argument("--min_action_margin", type=float, default=None)
@@ -472,6 +596,33 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--log_interval", type=int, default=20)
     parser.add_argument("--save_every", type=int, default=1)
     parser.add_argument(
+        "--best_metric",
+        type=str,
+        default="val_macro_f1",
+        choices=[
+            "val_macro_f1",
+            "val_acc",
+            "val_loss",
+            "train_macro_f1",
+            "train_acc",
+            "train_loss",
+        ],
+        help="Metric used to update best.pt during offline BC training.",
+    )
+    parser.add_argument(
+        "--best_mode",
+        type=str,
+        default="auto",
+        choices=["auto", "max", "min"],
+        help="Whether larger or smaller best_metric is better. auto minimizes loss and maximizes other metrics.",
+    )
+    parser.add_argument(
+        "--best_min_delta",
+        type=float,
+        default=0.0,
+        help="Minimum metric improvement required before overwriting best.pt.",
+    )
+    parser.add_argument(
         "--target_mode",
         type=str,
         default="mixed",
@@ -480,6 +631,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--soft_target_alpha", type=float, default=0.5)
     parser.add_argument("--soft_label_temperature", type=float, default=0.5)
     parser.add_argument("--disable_class_balance", action="store_true", default=False)
+    parser.add_argument("--action_balance_weight", type=float, default=0.0)
+    parser.add_argument("--overconf_penalty_weight", type=float, default=0.0)
+    parser.add_argument("--global_action_weights", type=str, default=None)
     parser.add_argument("--ddp_timeout_seconds", type=int, default=1800)
     return parser.parse_args()
 
@@ -491,6 +645,10 @@ def main() -> None:
         raise ValueError("Choose only one of --fp16 or --bf16")
     if args.min_lr < 0 or args.min_lr > args.lr:
         raise ValueError("--min_lr must be within [0, lr]")
+    if bool(args.data_path) == bool(args.train_data_path):
+        raise ValueError("Provide exactly one of --data_path or --train_data_path")
+    if args.val_data_path and not args.train_data_path:
+        raise ValueError("--val_data_path requires --train_data_path")
 
     ddp, rank, world_size, device = init_distributed(args.ddp_timeout_seconds)
     os.makedirs(args.output_dir, exist_ok=True)
@@ -514,23 +672,97 @@ def main() -> None:
             args.grad_accum_steps,
         )
         logger.info("Distributed timeout: %ds", args.ddp_timeout_seconds)
-        logger.info("Loading grouped dataset from: %s", ", ".join(args.data_path))
+        if args.train_data_path:
+            logger.info("Loading explicit train dataset from: %s", ", ".join(args.train_data_path))
+            if args.val_data_path:
+                logger.info("Loading explicit val dataset from: %s", ", ".join(args.val_data_path))
+        else:
+            logger.info("Loading grouped dataset from: %s", ", ".join(args.data_path or []))
 
-    dataset = GroupedTrafficActionDataset(
-        path=args.data_path,
-        seq_len=args.seq_len,
-        intersection_id=args.intersection_id,
-        require_expert_action=True,
-        valid_actions=ACTION_LIST,
-        max_samples=args.max_samples,
-        min_action_margin=args.min_action_margin,
-    )
+    explicit_eval = bool(args.train_data_path)
+    if explicit_eval:
+        train_set = GroupedTrafficActionDataset(
+            path=args.train_data_path,
+            seq_len=args.seq_len,
+            intersection_id=args.intersection_id,
+            require_expert_action=True,
+            valid_actions=ACTION_LIST,
+            max_samples=args.max_samples,
+            min_action_margin=args.min_action_margin,
+        )
+        val_set = (
+            GroupedTrafficActionDataset(
+                path=args.val_data_path,
+                seq_len=args.seq_len,
+                intersection_id=args.intersection_id,
+                require_expert_action=True,
+                valid_actions=ACTION_LIST,
+                max_samples=None,
+                min_action_margin=None,
+            )
+            if args.val_data_path
+            else None
+        )
+        dataset = None
+        if rank == 0:
+            logger.info(
+                "Loaded explicit datasets: train_samples=%d val_samples=%d",
+                len(train_set),
+                len(val_set) if val_set is not None else 0,
+            )
+    else:
+        dataset = GroupedTrafficActionDataset(
+            path=args.data_path,
+            seq_len=args.seq_len,
+            intersection_id=args.intersection_id,
+            require_expert_action=True,
+            valid_actions=ACTION_LIST,
+            max_samples=args.max_samples,
+            min_action_margin=args.min_action_margin,
+        )
+        if rank == 0:
+            logger.info("Loaded dataset with %d samples before split.", len(dataset))
+        train_set, val_set = split_dataset(
+            dataset,
+            val_ratio=args.val_ratio,
+            seed=args.seed,
+            split_strategy=args.split_strategy,
+        )
     if rank == 0:
-        logger.info("Loaded dataset with %d samples before split.", len(dataset))
-    train_set, val_set = split_dataset(dataset, args.val_ratio, args.seed)
+        train_distribution = action_distribution(train_set)
+        val_distribution = action_distribution(val_set) if val_set is not None else {}
+        if explicit_eval:
+            logger.info("Split strategy: explicit train/val files")
+        else:
+            total_distribution = action_distribution(dataset)
+            logger.info(
+                "Split strategy: %s val_ratio=%.4f seed=%d",
+                args.split_strategy,
+                args.val_ratio,
+                args.seed,
+            )
+            logger.info("Action distribution total: %s", format_action_distribution(total_distribution))
+        logger.info("Action distribution train: %s", format_action_distribution(train_distribution))
+        if val_set is not None:
+            logger.info("Action distribution val: %s", format_action_distribution(val_distribution))
+            missing_val_actions = [action for action in ACTION_LIST if int(val_distribution.get(action, 0)) == 0]
+            if missing_val_actions:
+                logger.warning(
+                    "Validation split is missing action classes: %s",
+                    ",".join(missing_val_actions),
+                )
+        else:
+            logger.info("Action distribution val: none")
     class_weights = None
     if not args.disable_class_balance:
         class_weights = compute_class_weights(train_set)
+    if args.global_action_weights:
+        global_w = _parse_global_action_weights(args.global_action_weights)
+        if global_w is not None:
+            if class_weights is not None:
+                class_weights = class_weights * global_w
+            else:
+                class_weights = global_w
     eval_set = shard_eval_subset(val_set, ddp=ddp, rank=rank, world_size=world_size)
 
     if ddp:
@@ -633,8 +865,15 @@ def main() -> None:
     class_weights = class_weights.to(device) if class_weights is not None else None
 
     lr_scale_fn = build_lr_scheduler(args, max(1, math.ceil(len(train_loader) / max(1, args.grad_accum_steps))))
-    best_metric = float("-inf")
+    best_monitor_value: float | None = None
     global_step = 0
+    if rank == 0:
+        logger.info(
+            "Best checkpoint selection: metric=%s mode=%s min_delta=%.6g",
+            args.best_metric,
+            args.best_mode,
+            args.best_min_delta,
+        )
 
     for epoch in range(args.epochs):
         if ddp:
@@ -704,7 +943,6 @@ def main() -> None:
 
         if rank == 0:
             base_model: PrefixActionPolicy = model.module if hasattr(model, "module") else model
-            monitor = val_metrics["macro_f1"] if val_metrics is not None else train_metrics["macro_f1"]
             metrics = {
                 "train_loss": train_metrics["loss"],
                 "train_acc": train_metrics["acc"],
@@ -718,6 +956,14 @@ def main() -> None:
                         "val_macro_f1": val_metrics["macro_f1"],
                     }
                 )
+            monitor_metric, monitor_mode, monitor_value = resolve_best_monitor(metrics, args)
+            selection = {
+                "type": "offline_metric",
+                "metric": monitor_metric,
+                "mode": monitor_mode,
+                "value": monitor_value,
+                "min_delta": float(args.best_min_delta),
+            }
 
             last_path = save_checkpoint(
                 output_dir=args.output_dir,
@@ -727,6 +973,7 @@ def main() -> None:
                 epoch=epoch + 1,
                 args=args,
                 metrics=metrics,
+                selection=selection,
             )
             logger.info("Saved checkpoint: %s", last_path)
             if (epoch + 1) % args.save_every == 0:
@@ -738,10 +985,19 @@ def main() -> None:
                     epoch=epoch + 1,
                     args=args,
                     metrics=metrics,
+                    selection=selection,
                 )
                 logger.info("Saved checkpoint: %s", epoch_path)
-            if monitor > best_metric:
-                best_metric = monitor
+            if is_better_monitor(
+                value=monitor_value,
+                best_value=best_monitor_value,
+                mode=monitor_mode,
+                min_delta=args.best_min_delta,
+            ):
+                previous_best = best_monitor_value
+                best_monitor_value = monitor_value
+                best_selection = dict(selection)
+                best_selection["previous_best_value"] = previous_best
                 best_path = save_checkpoint(
                     output_dir=args.output_dir,
                     filename="best.pt",
@@ -750,8 +1006,16 @@ def main() -> None:
                     epoch=epoch + 1,
                     args=args,
                     metrics=metrics,
+                    selection=best_selection,
                 )
-                logger.info("Updated best checkpoint: %s", best_path)
+                logger.info(
+                    "Updated best checkpoint: %s (%s=%.6f mode=%s previous=%s)",
+                    best_path,
+                    monitor_metric,
+                    monitor_value,
+                    monitor_mode,
+                    "none" if previous_best is None else f"{previous_best:.6f}",
+                )
 
         if ddp:
             barrier()

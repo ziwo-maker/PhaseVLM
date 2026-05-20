@@ -13,8 +13,10 @@ import numpy as np
 from projection_train.action_space import ACTION_LIST
 from projection_train.prompt_utils import build_task_prompt
 from projection_train.reward_shaping import (
+    REWARD_MODE_CHOICES,
+    REWARD_MODE_STABLE_DELTA,
     WAIT_REDUCER_CHOICES,
-    WAIT_REDUCER_MIN_POSITIVE,
+    WAIT_REDUCER_MEAN,
     compute_local_shaped_reward,
     reduce_wait_values,
     resolve_objective_weights,
@@ -120,7 +122,7 @@ class TrajectoryCityFlowEnv:
         traffic_series_interval: int = 2,
         window_s: int = 30,
         min_action_time: int = 30,
-        yellow_time: int = 5,
+        yellow_time: int = 3,
         interval: float = 1.0,
         reward_alpha: float = 0.1,
         switch_penalty_beta: float = 0.02,
@@ -133,12 +135,21 @@ class TrajectoryCityFlowEnv:
         starvation_queue_threshold: float = 8.0,
         starvation_wait_threshold: float = 45.0,
         wait_reward_scope: str = "neighborhood",
-        wait_reward_reducer: str = WAIT_REDUCER_MIN_POSITIVE,
+        wait_reward_reducer: str = WAIT_REDUCER_MEAN,
+        reward_mode: str = REWARD_MODE_STABLE_DELTA,
+        queue_delta_scale: float = 4.0,
+        wait_delta_scale: float = 30.0,
+        active_delta_scale: float = 4.0,
+        throughput_scale: float = 2.0,
+        reward_clip: float = 3.0,
+        global_reward_scale: float = 1.0,
         selection_queue_weight: float = 1.0,
         selection_wait_weight: float = 1.0,
         selection_travel_weight: float = 1.0,
         reward_info: Optional[Dict[str, float]] = None,
         run_counts: int = 3600,
+        env_seed: Optional[int] = None,
+        advance_seed_on_reset: bool = False,
     ) -> None:
         self.roadnet_path = _resolve_existing_path(roadnet_path)
         self.traffic_root = _resolve_existing_path(traffic_root)
@@ -165,13 +176,23 @@ class TrajectoryCityFlowEnv:
         resolved_wait_scope = str(wait_reward_scope or "neighborhood").strip().lower()
         if resolved_wait_scope not in {"local", "neighborhood"}:
             raise ValueError("wait_reward_scope must be one of {'local', 'neighborhood'}.")
-        resolved_wait_reducer = str(wait_reward_reducer or WAIT_REDUCER_MIN_POSITIVE).strip().lower()
+        resolved_wait_reducer = str(wait_reward_reducer or WAIT_REDUCER_MEAN).strip().lower()
         if resolved_wait_reducer not in WAIT_REDUCER_CHOICES:
             raise ValueError(
                 f"wait_reward_reducer must be one of {WAIT_REDUCER_CHOICES}, got {wait_reward_reducer!r}."
             )
+        resolved_reward_mode = str(reward_mode or REWARD_MODE_STABLE_DELTA).strip().lower()
+        if resolved_reward_mode not in REWARD_MODE_CHOICES:
+            raise ValueError(f"reward_mode must be one of {REWARD_MODE_CHOICES}, got {reward_mode!r}.")
         self.wait_reward_scope = resolved_wait_scope
         self.wait_reward_reducer = resolved_wait_reducer
+        self.reward_mode = resolved_reward_mode
+        self.queue_delta_scale = max(1e-8, float(queue_delta_scale))
+        self.wait_delta_scale = max(1e-8, float(wait_delta_scale))
+        self.active_delta_scale = max(1e-8, float(active_delta_scale))
+        self.throughput_scale = max(1e-8, float(throughput_scale))
+        self.reward_clip = max(0.0, float(reward_clip))
+        self.global_reward_scale = float(global_reward_scale)
         self.objective_weights = resolve_objective_weights(
             queue_weight=selection_queue_weight,
             wait_weight=selection_wait_weight,
@@ -179,6 +200,9 @@ class TrajectoryCityFlowEnv:
         )
         self.reward_info = dict(reward_info or {"queue_length": -0.25})
         self.run_counts = int(run_counts)
+        self.base_env_seed = None if env_seed is None else int(env_seed)
+        self.advance_seed_on_reset = bool(advance_seed_on_reset)
+        self._reset_seed_counts: Dict[str, int] = {}
 
         self.num_col, self.num_row = _infer_grid_shape(self.roadnet_path)
         self.phase_time_lookup = _build_phase_time_lookup(self.roadnet_path)
@@ -243,6 +267,7 @@ class TrajectoryCityFlowEnv:
                 "TRAFFIC_COUNT_BASENAME": "traffic_counts",
                 "DIC_REWARD_INFO": dict(self.reward_info),
                 "LIST_STATE_FEATURE": ["cur_phase", "traffic_movement_pressure_queue"],
+                "CITYFLOW_SEED": self._resolve_cityflow_seed(traffic_file),
             },
         )
         dic_path = {
@@ -256,13 +281,30 @@ class TrajectoryCityFlowEnv:
             dic_traffic_env_conf=env_conf,
             dic_path=dic_path,
         )
-        env.reset()
         return env
 
     def get_env(self, traffic_file: str) -> CityFlowEnv:
         if traffic_file not in self._env_cache:
             self._env_cache[traffic_file] = self._create_env(traffic_file)
         return self._env_cache[traffic_file]
+
+    def _resolve_cityflow_seed(self, traffic_file: str) -> Optional[int]:
+        if self.base_env_seed is None:
+            return None
+        offset = self._reset_seed_counts.get(traffic_file, 0) if self.advance_seed_on_reset else 0
+        return int(self.base_env_seed + offset)
+
+    def _apply_cityflow_seed(self, env: CityFlowEnv, traffic_file: str) -> None:
+        seed = self._resolve_cityflow_seed(traffic_file)
+        if seed is None:
+            env.dic_traffic_env_conf.pop("CITYFLOW_SEED", None)
+            return
+        env.dic_traffic_env_conf["CITYFLOW_SEED"] = int(seed)
+
+    def _mark_env_reset(self, traffic_file: str) -> None:
+        if self.base_env_seed is None or not self.advance_seed_on_reset:
+            return
+        self._reset_seed_counts[traffic_file] = self._reset_seed_counts.get(traffic_file, 0) + 1
 
     def _restore_phase_state(self, env: CityFlowEnv, snapshot_path: str) -> None:
         snapshot = _load_json(snapshot_path)
@@ -625,7 +667,9 @@ class TrajectoryCityFlowEnv:
     def reset(self, traffic_file: str = "") -> Dict[str, Any]:
         resolved_traffic_file = str(traffic_file or self.default_traffic_file)
         env = self.get_env(resolved_traffic_file)
+        self._apply_cityflow_seed(env, resolved_traffic_file)
         env.reset()
+        self._mark_env_reset(resolved_traffic_file)
         self._refresh_measurements(env)
         self._set_runtime_state(env, resolved_traffic_file, "full")
         self._init_history_from_seed(seed_sample=None)
@@ -633,7 +677,9 @@ class TrajectoryCityFlowEnv:
 
     def reset_from_snapshot(self, seed_sample: SnapshotSeedSample) -> Dict[str, Any]:
         env = self.get_env(seed_sample.traffic_file)
+        self._apply_cityflow_seed(env, seed_sample.traffic_file)
         env.reset()
+        self._mark_env_reset(seed_sample.traffic_file)
         snapshot_path = _resolve_existing_path(seed_sample.snapshot_path)
         env.eng.load_from_file(snapshot_path)
         self._restore_phase_state(env, snapshot_path)
@@ -700,13 +746,25 @@ class TrajectoryCityFlowEnv:
         starvation_penalties: List[float] = []
         switch_penalties: List[float] = []
         wait_signal_values: List[float] = []
+        wait_delta_values: List[float] = []
         local_throughput_counts: List[float] = []
+        queue_terms: List[float] = []
+        wait_terms: List[float] = []
+        active_vehicle_terms: List[float] = []
+        throughput_terms: List[float] = []
+        raw_rewards: List[float] = []
+        clipped_rewards: List[float] = []
 
         for idx, intersection_id in enumerate(self.intersection_ids):
             previous_local = self.prev_local_metrics_by_intersection.get(intersection_id) or {}
             current_local = current_local_metrics.get(intersection_id) or {}
             queue_delta = float(current_local.get("queue_sum", 0.0)) - float(previous_local.get("queue_sum", 0.0))
             wait_value = self._resolve_wait_reward_value(current_local_metrics, intersection_id)
+            previous_wait_value = self._resolve_wait_reward_value(
+                self.prev_local_metrics_by_intersection,
+                intersection_id,
+            )
+            wait_delta = float(wait_value - previous_wait_value)
             prev_active_count = float(previous_local.get("active_vehicle_count", 0.0))
             current_active_count = float(current_local.get("active_vehicle_count", 0.0))
             active_vehicle_delta = current_active_count - prev_active_count
@@ -730,6 +788,14 @@ class TrajectoryCityFlowEnv:
                 switch_penalty=float(self.switch_penalty_beta * float(switch_penalty[idx])),
                 starvation_penalty=starvation_penalty,
                 objective_weights=self.objective_weights,
+                wait_delta=wait_delta,
+                reward_mode=self.reward_mode,
+                queue_delta_scale=self.queue_delta_scale,
+                wait_delta_scale=self.wait_delta_scale,
+                active_delta_scale=self.active_delta_scale,
+                throughput_scale=self.throughput_scale,
+                reward_clip=self.reward_clip,
+                global_reward_scale=self.global_reward_scale,
             )
             rewards.append(float(shaped["reward"]))
             queue_rewards.append(float(shaped["queue_reward"]))
@@ -740,7 +806,14 @@ class TrajectoryCityFlowEnv:
             starvation_penalties.append(float(starvation_penalty))
             switch_penalties.append(float(self.switch_penalty_beta * float(switch_penalty[idx])))
             wait_signal_values.append(float(wait_value))
+            wait_delta_values.append(float(wait_delta))
             local_throughput_counts.append(float(throughput_count))
+            queue_terms.append(float(shaped["queue_term"]))
+            wait_terms.append(float(shaped["wait_term"]))
+            active_vehicle_terms.append(float(shaped["active_vehicle_term"]))
+            throughput_terms.append(float(shaped["throughput_term"]))
+            raw_rewards.append(float(shaped["raw_reward"]))
+            clipped_rewards.append(float(shaped["clipped_reward"]))
 
         self.prev_actions = [int(item) for item in action_arr.tolist()]
         self.current_time_s = current_time_s
@@ -768,8 +841,23 @@ class TrajectoryCityFlowEnv:
             ),
             "wait_signal_values": wait_signal_values,
             "wait_signal_mean": float(np.mean(wait_signal_values) if wait_signal_values else 0.0),
+            "wait_delta_values": wait_delta_values,
+            "wait_delta_mean": float(np.mean(wait_delta_values) if wait_delta_values else 0.0),
             "local_throughput_counts": local_throughput_counts,
             "local_throughput_mean": float(np.mean(local_throughput_counts) if local_throughput_counts else 0.0),
+            "queue_terms": queue_terms,
+            "queue_term_mean": float(np.mean(queue_terms) if queue_terms else 0.0),
+            "wait_terms": wait_terms,
+            "wait_term_mean": float(np.mean(wait_terms) if wait_terms else 0.0),
+            "active_vehicle_terms": active_vehicle_terms,
+            "active_vehicle_term_mean": float(np.mean(active_vehicle_terms) if active_vehicle_terms else 0.0),
+            "throughput_terms": throughput_terms,
+            "throughput_term_mean": float(np.mean(throughput_terms) if throughput_terms else 0.0),
+            "raw_rewards": raw_rewards,
+            "raw_reward_mean": float(np.mean(raw_rewards) if raw_rewards else 0.0),
+            "clipped_rewards": clipped_rewards,
+            "clipped_reward_mean": float(np.mean(clipped_rewards) if clipped_rewards else 0.0),
+            "reward_mode": self.reward_mode,
             "wait_reward_scope": self.wait_reward_scope,
             "wait_reward_reducer": self.wait_reward_reducer,
             "departed_vehicle_count": departed_vehicle_count,

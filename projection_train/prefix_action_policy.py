@@ -6,6 +6,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributions import Categorical
+from torch.utils.checkpoint import checkpoint as activation_checkpoint
 
 from models import Qwen3VLBackbone, TimeSeriesProjector, VisionPrefixProjector
 from projection_train.action_space import ACTION_LIST, action_to_index
@@ -76,6 +77,7 @@ class PrefixActionPolicy(nn.Module):
         backbone: Optional[Qwen3VLBackbone] = None,
         backbone_fsdp_enabled: bool = False,
         backbone_fsdp_sharding_strategy: str = "full_shard",
+        action_eval_chunk_size: int = 0,
     ) -> None:
         super().__init__()
         self.device = _resolve_device(device)
@@ -83,6 +85,8 @@ class PrefixActionPolicy(nn.Module):
         self.seq_len = int(seq_len)
         self.input_dim = int(input_dim)
         self.with_value_head = bool(with_value_head)
+        self.action_eval_chunk_size = max(0, int(action_eval_chunk_size))
+        self.backbone_gradient_checkpointing = False
 
         if backbone is None:
             self.backbone = Qwen3VLBackbone(
@@ -167,7 +171,14 @@ class PrefixActionPolicy(nn.Module):
         if sequences.device != self.device:
             sequences = sequences.to(self.device)
         images = self.ts_projector(sequences)
-        vision_tokens = self.backbone.encode_vision_tokens(images)
+        if self.backbone_gradient_checkpointing and torch.is_grad_enabled():
+            vision_tokens = activation_checkpoint(
+                self.backbone.encode_vision_tokens,
+                images,
+                use_reentrant=False,
+            )
+        else:
+            vision_tokens = self.backbone.encode_vision_tokens(images)
         if vision_tokens.ndim == 2:
             vision_tokens = vision_tokens.unsqueeze(1)
         vision_pooled = vision_tokens.mean(dim=1)
@@ -291,25 +302,46 @@ class PrefixActionPolicy(nn.Module):
             "tag_lens": tag_len_tensor,
         }
 
-    def _forward_lm(
+    def _forward_lm_logits(
         self,
         inputs_embeds: torch.Tensor,
         attention_mask: torch.Tensor,
-    ):
+    ) -> torch.Tensor:
         position_ids = attention_mask.long().cumsum(dim=-1) - 1
         position_ids.masked_fill_(attention_mask == 0, 0)
-        forward_kwargs = {
-            "inputs_embeds": inputs_embeds,
-            "attention_mask": attention_mask,
-            "position_ids": position_ids,
-            "use_cache": False,
-            "return_dict": True,
-        }
-        try:
-            return self.backbone.model(**forward_kwargs)
-        except TypeError:
-            forward_kwargs.pop("position_ids", None)
-            return self.backbone.model(**forward_kwargs)
+
+        def _run_lm(
+            cur_inputs_embeds: torch.Tensor,
+            cur_attention_mask: torch.Tensor,
+            cur_position_ids: torch.Tensor,
+        ) -> torch.Tensor:
+            forward_kwargs = {
+                "inputs_embeds": cur_inputs_embeds,
+                "attention_mask": cur_attention_mask,
+                "position_ids": cur_position_ids,
+                "use_cache": False,
+                "return_dict": True,
+            }
+            try:
+                outputs = self.backbone.model(**forward_kwargs)
+            except TypeError:
+                forward_kwargs.pop("position_ids", None)
+                outputs = self.backbone.model(**forward_kwargs)
+            logits = getattr(outputs, "logits", None)
+            if logits is None:
+                raise RuntimeError("Missing logits from language-model forward.")
+            return logits
+
+        if self.backbone_gradient_checkpointing and torch.is_grad_enabled():
+            return activation_checkpoint(
+                _run_lm,
+                inputs_embeds,
+                attention_mask,
+                position_ids,
+                use_reentrant=False,
+            )
+
+        return _run_lm(inputs_embeds, attention_mask, position_ids)
 
     def action_tag_logprob_from_prepared(
         self,
@@ -317,11 +349,10 @@ class PrefixActionPolicy(nn.Module):
         actions: Sequence[int],
     ) -> torch.Tensor:
         tagged = self._build_tagged_inputs(prepared_batch, actions)
-        outputs = self._forward_lm(
+        logits = self._forward_lm_logits(
             inputs_embeds=tagged["inputs_embeds"],
             attention_mask=tagged["attention_mask"],
         )
-        logits = outputs.logits
         log_probs = F.log_softmax(logits, dim=-1)
 
         batch_size = logits.shape[0]
@@ -339,23 +370,31 @@ class PrefixActionPolicy(nn.Module):
         num_actions = len(ACTION_LIST)
         if batch_size == 0:
             return torch.empty((0, num_actions), device=self.device)
+        chunk_size = self.action_eval_chunk_size
+        if chunk_size <= 0:
+            chunk_size = num_actions
+        chunk_size = max(1, min(int(chunk_size), num_actions))
 
-        sample_indices = torch.arange(batch_size, device=self.device).repeat_interleave(num_actions)
-        expanded_batch = {
-            "prefix_tokens": prepared_batch["prefix_tokens"].index_select(0, sample_indices),
-            "prompt_embeds": prepared_batch["prompt_embeds"].index_select(0, sample_indices),
-            "prompt_lengths": [
-                prepared_batch["prompt_lengths"][int(idx)]
-                for idx in sample_indices.detach().cpu().tolist()
-            ],
-        }
-        expanded_actions = [
-            action_idx
-            for _sample_idx in range(batch_size)
-            for action_idx in range(num_actions)
-        ]
-        scores = self.action_tag_logprob_from_prepared(expanded_batch, expanded_actions)
-        return scores.view(batch_size, num_actions)
+        chunk_logits: List[torch.Tensor] = []
+        for start in range(0, num_actions, chunk_size):
+            action_chunk = list(range(start, min(num_actions, start + chunk_size)))
+            sample_indices = torch.arange(batch_size, device=self.device).repeat_interleave(len(action_chunk))
+            expanded_batch = {
+                "prefix_tokens": prepared_batch["prefix_tokens"].index_select(0, sample_indices),
+                "prompt_embeds": prepared_batch["prompt_embeds"].index_select(0, sample_indices),
+                "prompt_lengths": [
+                    prepared_batch["prompt_lengths"][int(idx)]
+                    for idx in sample_indices.detach().cpu().tolist()
+                ],
+            }
+            expanded_actions = [
+                action_idx
+                for _sample_idx in range(batch_size)
+                for action_idx in action_chunk
+            ]
+            scores = self.action_tag_logprob_from_prepared(expanded_batch, expanded_actions)
+            chunk_logits.append(scores.view(batch_size, len(action_chunk)))
+        return torch.cat(chunk_logits, dim=1)
 
     def get_action_logits(
         self,
@@ -483,6 +522,10 @@ class PrefixActionPolicy(nn.Module):
         if self.value_head is not None:
             params.extend(list(self.value_head.parameters()))
         return params
+
+    def set_backbone_gradient_checkpointing(self, enabled: bool) -> None:
+        self.backbone_gradient_checkpointing = bool(enabled)
+        self.backbone.set_gradient_checkpointing(enabled)
 
     def load_checkpoint(
         self,

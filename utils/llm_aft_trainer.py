@@ -1,10 +1,14 @@
 from pyexpat.errors import messages
 from utils.my_utils import dump_json, get_state_detail, state2text, getPrompt, action2code, code2action, eight_phase_list, four_phase_list, torch_gc, location_direction_dict
-from vllm import SamplingParams
 from src.TimeVLM.ts_image_adapter import TimeSeriesImageAdapter
 from layers.TimeSeries_To_Image import time_series_to_simple_image
 from layers.Learnable_TimeSeries_To_Image import LearnableTimeSeriesToImage
-import vllm
+try:
+    import vllm
+    from vllm import SamplingParams
+except Exception:
+    vllm = None
+    SamplingParams = None
 import os
 import fcntl
 import time
@@ -87,18 +91,41 @@ def _validate_jsonl_handle(handle, path):
             )
 
 
+_JSONL_APPEND_LAST_FSYNC = {}
+
+
+def _jsonl_append_fsync_interval_s():
+    raw_value = os.environ.get("JSONL_APPEND_FSYNC_INTERVAL_S", "30")
+    try:
+        return max(0.0, float(raw_value))
+    except (TypeError, ValueError):
+        return 30.0
+
+
+def _maybe_fsync_jsonl(handle, path):
+    interval_s = _jsonl_append_fsync_interval_s()
+    if interval_s <= 0:
+        return False
+    now = time.time()
+    last_fsync = float(_JSONL_APPEND_LAST_FSYNC.get(path, 0.0) or 0.0)
+    if last_fsync > 0.0 and (now - last_fsync) < interval_s:
+        return False
+    handle.flush()
+    os.fsync(handle.fileno())
+    _JSONL_APPEND_LAST_FSYNC[path] = now
+    return True
+
+
 def _append_jsonl_records(path, records):
     if not path or not records:
         return
     output_dir = os.path.dirname(path)
     if output_dir:
         os.makedirs(output_dir, exist_ok=True)
-    with _locked_file(path, "a+", encoding="utf-8") as handle:
+    with _locked_file(path, "a", encoding="utf-8") as handle:
         for record in records:
             handle.write(json.dumps(record, ensure_ascii=False) + "\n")
-        handle.flush()
-        os.fsync(handle.fileno())
-        _validate_jsonl_handle(handle, path)
+        _maybe_fsync_jsonl(handle, path)
 
 
 def _prepare_jsonl_file(path):
@@ -359,6 +386,23 @@ def _shared_maybe_take_snapshot(instance, current_time_s):
     import os
     import uuid
 
+    snapshot_enabled = True
+    for conf_name in ("dic_agent_conf", "dic_traffic_env_conf"):
+        conf = getattr(instance, conf_name, {}) or {}
+        if not isinstance(conf, dict) or "ENABLE_SNAPSHOT_GENERATION" not in conf:
+            continue
+        raw_value = conf.get("ENABLE_SNAPSHOT_GENERATION")
+        if isinstance(raw_value, str):
+            snapshot_enabled = raw_value.strip().lower() not in {"0", "false", "no", "off"}
+        else:
+            snapshot_enabled = bool(raw_value)
+
+    if not snapshot_enabled:
+        if not getattr(instance, "_snapshot_generation_disabled_logged", False):
+            print("Snapshot generation disabled; snapshot_path and candidate metrics may be empty.")
+            setattr(instance, "_snapshot_generation_disabled_logged", True)
+        return None
+
     snapshot_path = None
     interval = int(getattr(instance, "traffic_series_interval_s", 2) or 2)
     if interval <= 0:
@@ -481,6 +525,9 @@ class LLM_Inference_VLLM:
             self.traffic_series_window_s = 30
         self.traffic_series_output_dir = str(
             self.dic_agent_conf.get("TRAFFIC_SERIES_OUTPUT_DIR", "")
+        ).strip()
+        self.traffic_series_exact_output_dir = str(
+            self.dic_agent_conf.get("TRAFFIC_SERIES_EXACT_OUTPUT_DIR", "")
         ).strip()
         if not self.traffic_series_output_dir:
             self.traffic_series_output_dir = os.path.join("data", "recorded")
@@ -641,7 +688,7 @@ class LLM_Inference_VLLM:
                 "top_k": 50,
                 "top_p": 1.0,
                 "temperature": 0.1,
-                "max_tokens": 2048 + self.dic_agent_conf["NEW_MAX_TOKENS"]
+                "max_tokens": max(1, int(self.dic_agent_conf["NEW_MAX_TOKENS"]))
             }
             self.generation_kwargs = vllm.SamplingParams(**test_generation_kwargs)
             self.test_generation_kwargs = {}
@@ -729,7 +776,7 @@ class LLM_Inference_VLLM:
         responses = []
         for start in range(0, len(vllm_prompts), batch_size):
             batch = vllm_prompts[start:start + batch_size]
-            outputs = self.llm_model.generate(prompts=batch, sampling_params=sampling_params)
+            outputs = self.llm_model.generate(prompts=batch, sampling_params=sampling_params, use_tqdm=False)
             for output in outputs:
                 responses.append(output.outputs[0].text if output.outputs else "")
         return responses
@@ -930,9 +977,12 @@ class LLM_Inference_VLLM:
     def _ensure_traffic_series_config(self):
         if self._traffic_series_initialized:
             return
-        base_dir = self.traffic_series_output_dir or os.path.join("data", "recorded")
-        run_tag = self._traffic_series_run_tag()
-        output_dir = os.path.join(base_dir, run_tag)
+        if self.traffic_series_exact_output_dir:
+            output_dir = self.traffic_series_exact_output_dir
+        else:
+            base_dir = self.traffic_series_output_dir or os.path.join("data", "recorded")
+            run_tag = self._traffic_series_run_tag()
+            output_dir = os.path.join(base_dir, run_tag)
         os.makedirs(output_dir, exist_ok=True)
         suffix = self._traffic_count_suffix(self.traffic_series_interval_s)
         filename = f"{self.traffic_series_basename}_{suffix}.jsonl"
@@ -1167,7 +1217,7 @@ class LLM_Inference_VLLM:
             batch_size = max(1, int(self.clip_caption_batch_size or 1))
             for start in range(0, len(caption_prompts), batch_size):
                 batch = caption_prompts[start:start + batch_size]
-                outputs = self.llm_model.generate(prompts=batch, sampling_params=sampling_params)
+                outputs = self.llm_model.generate(prompts=batch, sampling_params=sampling_params, use_tqdm=False)
                 for out in outputs:
                     text = out.outputs[0].text if out.outputs else ""
                     captions.append(self._clean_clip_caption(text))
@@ -1689,6 +1739,9 @@ class LLM_Inference:
         self.traffic_series_output_dir = str(
             self.dic_agent_conf.get("TRAFFIC_SERIES_OUTPUT_DIR", "")
         ).strip()
+        self.traffic_series_exact_output_dir = str(
+            self.dic_agent_conf.get("TRAFFIC_SERIES_EXACT_OUTPUT_DIR", "")
+        ).strip()
         if not self.traffic_series_output_dir:
             self.traffic_series_output_dir = os.path.join("data", "recorded")
         self.traffic_series_basename = str(
@@ -1818,9 +1871,12 @@ class LLM_Inference:
     def _ensure_traffic_series_config(self):
         if self._traffic_series_initialized:
             return
-        base_dir = self.traffic_series_output_dir or os.path.join("data", "recorded")
-        run_tag = self._traffic_series_run_tag()
-        output_dir = os.path.join(base_dir, run_tag)
+        if self.traffic_series_exact_output_dir:
+            output_dir = self.traffic_series_exact_output_dir
+        else:
+            base_dir = self.traffic_series_output_dir or os.path.join("data", "recorded")
+            run_tag = self._traffic_series_run_tag()
+            output_dir = os.path.join(base_dir, run_tag)
         os.makedirs(output_dir, exist_ok=True)
         suffix = self._traffic_count_suffix(self.traffic_series_interval_s)
         filename = f"{self.traffic_series_basename}_{suffix}.jsonl"

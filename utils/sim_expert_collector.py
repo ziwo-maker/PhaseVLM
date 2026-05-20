@@ -15,6 +15,12 @@ class SimExpertCollector(LLM_Inference_VLLM):
     _SPILLBACK_BLOCK_WEIGHT = 0.5
 
     def initialize_llm(self):
+        if self.dic_agent_conf.get("SKIP_LLM_INIT", False):
+            self.llm_model = None
+            self.processor = None
+            self.tokenizer = None
+            print("SimExpert LLM initialization skipped; using simulator expert only.")
+            return
         # Load LLM model first, then proceed with simulation
         # Call parent class method to actually load the LLM model
         super().initialize_llm()
@@ -365,7 +371,11 @@ class SimExpertCollector(LLM_Inference_VLLM):
         start_time = time.time()
         state_action_log = [[] for _ in range(len(state))]
 
-        for step_num in tqdm(range(int(total_run_cnt / self.dic_traffic_env_conf["MIN_ACTION_TIME"]))):
+        progress_disabled = os.environ.get("SIM_EXPERT_PROGRESS", "").strip().lower() not in {"1", "true", "yes", "on"} and not os.isatty(2)
+        for step_num in tqdm(
+            range(int(total_run_cnt / self.dic_traffic_env_conf["MIN_ACTION_TIME"])),
+            disable=progress_disabled,
+        ):
             if done or current_time >= total_run_cnt:
                 break
 

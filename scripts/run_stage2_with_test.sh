@@ -18,7 +18,8 @@ LOG_PATH="${LOG_DIR}/nohup.log"
 mkdir -p "${LOG_DIR}"
 
 nohup "${TORCHRUN_BIN}" --nproc_per_node=8 projection_train/train_projection_bc.py \
-  --data_path data/recorded/align_train.cleaned.llm_caption.jsonl \
+  --train_data_path data/recorded/align_train.cleaned.jsonl \
+  --val_data_path data/recorded/align_val.cleaned.jsonl \
   --llm_path /home/data/model/qwen-vl-8B/ \
   --align_ckpt records/align/align_epoch_40.pt \
   --output_dir records/projection_bc_margin1_t1 \

@@ -297,6 +297,26 @@ python run_sim_expert_action.py \
   --clean_seq_len 16
 ```
 
+### 8.5 不生成快照
+
+默认会生成 CityFlow snapshot 文件，并基于 snapshot 做候选动作短时仿真。如果只想生成基础序列、不写 snapshot 文件，可以加：
+
+```bash
+python run_sim_expert_action.py \
+  --dataset newyork_28x7 \
+  --traffic_file anon_28_7_newyork_real_double.json \
+  --llm_model gemma-3-27B \
+  --llm_path /home/data/model/gemma-3-27B/ \
+  --tensor_parallel_size 2 \
+  --backfill_batch_size 4 \
+  --clean_seq_len 16 \
+  --clean_output data/recorded/align_train.cleaned_newyork.jsonl \
+  --backfill_output data/recorded/align_train.cleaned.llm_caption_newyork.jsonl \
+  --skip_snapshot_generation
+```
+
+关闭快照后，输出 JSONL 中的 `snapshot_path`、`candidate_action_waits` 和 `candidate_action_metrics` 会为空，`expert_action` 会退回当前基础动作。
+
 ## 9. 当前结论
 
 `run_sim_expert_action.py` 现在已经不再是“只能处理单个 flow 文件”的入口，而是一个支持：

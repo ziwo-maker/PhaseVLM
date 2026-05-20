@@ -42,6 +42,15 @@ def parse_args():
     parser.add_argument("--clip_caption_max_tokens", type=int, default=2048)
     parser.add_argument("--clip_caption_temperature", type=float, default=0.2)
     parser.add_argument("--clip_caption_top_p", type=float, default=0.9)
+    parser.add_argument(
+        "--skip_llm_init",
+        action="store_true",
+        default=False,
+        help=(
+            "Do not initialize the vLLM/transformers model during SimExpert collection. "
+            "Use this for pure simulator metric sweeps; clip captions fall back to rule-based summaries."
+        ),
+    )
     parser.add_argument("--expert_att_weight", type=float, default=1.0)
     parser.add_argument("--expert_aql_weight", type=float, default=1.0)
     parser.add_argument("--expert_awt_weight", type=float, default=1.0)
@@ -62,12 +71,43 @@ def parse_args():
     parser.add_argument("--skip_clean", action="store_true", default=False)
     parser.add_argument("--skip_llm_backfill", action="store_true", default=False)
     parser.add_argument(
+        "--skip_snapshot_generation",
+        "--no_snapshot_generation",
+        action="store_true",
+        default=False,
+        help=(
+            "Disable CityFlow snapshot file generation. By default snapshots are generated. "
+            "When disabled, snapshot_path and candidate simulation metrics will be empty."
+        ),
+    )
+    parser.add_argument(
         "--backfill_llm_path",
         type=str,
         default="",
         help="LLM path for caption backfill. Defaults to --llm_path when omitted.",
     )
     parser.add_argument("--backfill_batch_size", type=int, default=8)
+    parser.add_argument(
+        "--record_output_dir",
+        type=str,
+        default="",
+        help=(
+            "Optional exact directory for traffic_prompt_series_*.jsonl and snapshots. "
+            "When omitted, the legacy data/recorded/<run_tag>/ layout is used."
+        ),
+    )
+    parser.add_argument(
+        "--work_dir",
+        type=str,
+        default="",
+        help="Optional exact PATH_TO_WORK_DIRECTORY override.",
+    )
+    parser.add_argument(
+        "--model_dir",
+        type=str,
+        default="",
+        help="Optional exact PATH_TO_MODEL override.",
+    )
 
     return parser.parse_args()
 
@@ -231,10 +271,12 @@ def _print_eval_metrics_by_file(batch_summary):
         print(f"  {traffic_file}: ATT={att_text} | AQL={aql_text} | AWT={awt_text}")
 
 
-def _merge_batch_training_sets(batch_tag, batch_summary):
+def _merge_batch_training_sets(batch_tag, batch_summary, output_dir=""):
     if not batch_summary:
         return ""
-    output_dir = os.path.join("data", "recorded", f"batch_{batch_tag}")
+    output_dir = str(output_dir or "").strip()
+    if not output_dir:
+        output_dir = os.path.join("data", "recorded", f"batch_{batch_tag}")
     os.makedirs(output_dir, exist_ok=True)
     merged_output_path = os.path.join(output_dir, "traffic_prompt_series_2s.jsonl")
     merged_count = 0
@@ -370,8 +412,9 @@ def _run_single_traffic_file(in_args, dataset_spec, traffic_file, run_tag, batch
         "LLM_PATH": in_args.llm_path,
         "NEW_MAX_TOKENS": in_args.new_max_tokens,
         "TENSOR_PARALLEL_SIZE": in_args.tensor_parallel_size,
+        "SKIP_LLM_INIT": in_args.skip_llm_init,
         "SIM_WAIT_SPEED": in_args.sim_wait_speed,
-        "CLIP_CAPTION_MODE": in_args.clip_caption_mode,
+        "CLIP_CAPTION_MODE": "traffic_summary" if in_args.skip_llm_init else in_args.clip_caption_mode,
         "CLIP_CAPTION_LANGUAGE": in_args.clip_caption_language,
         "CLIP_CAPTION_MAX_TOKENS": in_args.clip_caption_max_tokens,
         "CLIP_CAPTION_TEMPERATURE": in_args.clip_caption_temperature,
@@ -380,6 +423,7 @@ def _run_single_traffic_file(in_args, dataset_spec, traffic_file, run_tag, batch
         "EXPERT_AQL_WEIGHT": in_args.expert_aql_weight,
         "EXPERT_AWT_WEIGHT": in_args.expert_awt_weight,
         "EXPERT_SPILLBACK_WEIGHT": in_args.expert_spillback_weight,
+        "ENABLE_SNAPSHOT_GENERATION": not in_args.skip_snapshot_generation,
     }
     if in_args.sim_horizon_s and int(in_args.sim_horizon_s) > 0:
         dic_agent_conf_extra["SIM_HORIZON_S"] = int(in_args.sim_horizon_s)
@@ -435,11 +479,22 @@ def _run_single_traffic_file(in_args, dataset_spec, traffic_file, run_tag, batch
     else:
         dic_agent_conf_extra["FIXED_TIME"] = [30, 30, 30, 30]
 
+    record_output_dir = str(getattr(in_args, "record_output_dir", "") or "").strip()
+    if record_output_dir:
+        if batch_tag is not None:
+            traffic_stem = os.path.splitext(os.path.basename(str(traffic_file)))[0]
+            record_output_dir = os.path.join(record_output_dir, traffic_stem)
+        dic_agent_conf_extra["TRAFFIC_SERIES_EXACT_OUTPUT_DIR"] = record_output_dir
+
     dic_traffic_env_conf_extra["NUM_AGENTS"] = dic_traffic_env_conf_extra["NUM_INTERSECTIONS"]
     if batch_tag is None:
         dic_path_extra = _build_single_run_paths(in_args.memo, traffic_file, run_tag)
     else:
         dic_path_extra = _build_batch_run_paths(in_args.memo, traffic_file, batch_tag)
+    if str(getattr(in_args, "work_dir", "") or "").strip():
+        dic_path_extra["PATH_TO_WORK_DIRECTORY"] = str(in_args.work_dir).strip()
+    if str(getattr(in_args, "model_dir", "") or "").strip():
+        dic_path_extra["PATH_TO_MODEL"] = str(in_args.model_dir).strip()
     dic_path_extra["PATH_TO_DATA"] = os.path.join("data", template, str(road_net))
 
     trainer = SimExpertCollector(
@@ -450,13 +505,18 @@ def _run_single_traffic_file(in_args, dataset_spec, traffic_file, run_tag, batch
         traffic_file.split(".")[0],
     )
     test_results = trainer.train_test()
-    traffic_series_run_tag = os.path.basename(dic_path_extra["PATH_TO_WORK_DIRECTORY"])
-    traffic_series_output_path = os.path.join(
-        "data",
-        "recorded",
-        traffic_series_run_tag,
-        "traffic_prompt_series_2s.jsonl",
-    )
+    traffic_series_output_path = str(getattr(trainer, "_traffic_series_output_path", "") or "").strip()
+    if not traffic_series_output_path:
+        traffic_series_run_tag = os.path.basename(dic_path_extra["PATH_TO_WORK_DIRECTORY"])
+        traffic_series_output_path = os.path.join(
+            "data",
+            "recorded",
+            traffic_series_run_tag,
+            "traffic_prompt_series_2s.jsonl",
+        )
+    print("path_to_model:", dic_path_extra["PATH_TO_MODEL"])
+    print("path_to_work_directory:", dic_path_extra["PATH_TO_WORK_DIRECTORY"])
+    print("traffic_series_output_path:", traffic_series_output_path)
     return {
         "traffic_file": traffic_file,
         "run_counts": int(count),
@@ -500,7 +560,11 @@ def main(in_args):
     _print_eval_metrics_by_file(batch_summary)
 
     if multi_file_mode:
-        merged_output_path = _merge_batch_training_sets(batch_tag, batch_summary)
+        merged_output_path = _merge_batch_training_sets(
+            batch_tag,
+            batch_summary,
+            output_dir=in_args.record_output_dir,
+        )
         for item in batch_summary:
             item["merged_traffic_series_output_path"] = merged_output_path
 

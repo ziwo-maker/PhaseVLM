@@ -7,6 +7,13 @@ OBJECTIVE_QUEUE = "queue"
 OBJECTIVE_WAIT = "wait"
 OBJECTIVE_TRAVEL = "travel"
 
+REWARD_MODE_LEGACY_ABSOLUTE = "legacy_absolute"
+REWARD_MODE_STABLE_DELTA = "stable_delta"
+REWARD_MODE_CHOICES = (
+    REWARD_MODE_LEGACY_ABSOLUTE,
+    REWARD_MODE_STABLE_DELTA,
+)
+
 WAIT_REDUCER_MEAN = "mean"
 WAIT_REDUCER_MAX = "max"
 WAIT_REDUCER_MIN = "min"
@@ -68,6 +75,17 @@ def reduce_wait_values(
     )
 
 
+def _clip(value: float, lower: float, upper: float) -> float:
+    return float(min(float(upper), max(float(lower), float(value))))
+
+
+def _positive_scale(value: float, fallback: float = 1.0) -> float:
+    resolved = abs(float(value))
+    if resolved <= 1e-8:
+        return float(fallback)
+    return resolved
+
+
 def compute_local_shaped_reward(
     queue_delta: float,
     wait_value: float,
@@ -80,7 +98,82 @@ def compute_local_shaped_reward(
     switch_penalty: float,
     starvation_penalty: float,
     objective_weights: Mapping[str, float],
+    wait_delta: float | None = None,
+    reward_mode: str = REWARD_MODE_LEGACY_ABSOLUTE,
+    queue_delta_scale: float = 4.0,
+    wait_delta_scale: float = 30.0,
+    active_delta_scale: float = 4.0,
+    throughput_scale: float = 2.0,
+    reward_clip: float = 3.0,
+    global_reward_scale: float = 1.0,
 ) -> Dict[str, float]:
+    resolved_mode = str(reward_mode or REWARD_MODE_LEGACY_ABSOLUTE).strip().lower()
+    if resolved_mode not in REWARD_MODE_CHOICES:
+        raise ValueError(f"Unsupported reward_mode: {reward_mode!r}. Expected one of {REWARD_MODE_CHOICES}.")
+
+    if resolved_mode == REWARD_MODE_STABLE_DELTA:
+        queue_term = -_clip(
+            float(queue_delta) / _positive_scale(queue_delta_scale),
+            -1.0,
+            1.0,
+        )
+        resolved_wait_delta = float(wait_value if wait_delta is None else wait_delta)
+        wait_term = -_clip(
+            resolved_wait_delta / _positive_scale(wait_delta_scale),
+            -1.0,
+            1.0,
+        )
+        active_vehicle_term = -_clip(
+            float(active_vehicle_delta) / _positive_scale(active_delta_scale),
+            -1.0,
+            1.0,
+        )
+        throughput_term = _clip(
+            float(throughput_count) / _positive_scale(throughput_scale),
+            0.0,
+            1.0,
+        )
+
+        queue_reward = float(objective_weights.get(OBJECTIVE_QUEUE, 0.0)) * queue_term
+        wait_reward = float(objective_weights.get(OBJECTIVE_WAIT, 0.0)) * wait_term
+        system_vehicle_reward = (
+            float(objective_weights.get(OBJECTIVE_TRAVEL, 0.0))
+            * 0.5
+            * active_vehicle_term
+        )
+        throughput_reward = (
+            float(objective_weights.get(OBJECTIVE_TRAVEL, 0.0))
+            * 0.5
+            * throughput_term
+        )
+        travel_reward = float(system_vehicle_reward + throughput_reward)
+        raw_reward = (
+            float(queue_reward)
+            + float(wait_reward)
+            + float(travel_reward)
+            - float(switch_penalty)
+            - float(starvation_penalty)
+        )
+        scaled_reward = float(raw_reward * float(global_reward_scale))
+        clip_value = abs(float(reward_clip))
+        reward = _clip(scaled_reward, -clip_value, clip_value) if clip_value > 0.0 else scaled_reward
+        return {
+            "queue_reward": float(queue_reward),
+            "wait_reward": float(wait_reward),
+            "system_vehicle_reward": float(system_vehicle_reward),
+            "throughput_reward": float(throughput_reward),
+            "travel_reward": float(travel_reward),
+            "raw_reward": float(raw_reward),
+            "scaled_reward": float(scaled_reward),
+            "clipped_reward": float(reward),
+            "reward": float(reward),
+            "queue_term": float(queue_term),
+            "wait_term": float(wait_term),
+            "active_vehicle_term": float(active_vehicle_term),
+            "throughput_term": float(throughput_term),
+            "wait_delta": float(resolved_wait_delta),
+        }
+
     queue_reward = float(objective_weights.get(OBJECTIVE_QUEUE, 0.0)) * float(queue_reward_coef) * float(queue_delta)
     wait_reward = float(objective_weights.get(OBJECTIVE_WAIT, 0.0)) * float(waiting_reward_coef) * float(wait_value)
     system_vehicle_reward = (
@@ -107,5 +200,13 @@ def compute_local_shaped_reward(
         "system_vehicle_reward": float(system_vehicle_reward),
         "throughput_reward": float(throughput_reward),
         "travel_reward": float(travel_reward),
+        "raw_reward": float(reward),
+        "scaled_reward": float(reward),
+        "clipped_reward": float(reward),
         "reward": float(reward),
+        "queue_term": float(queue_reward),
+        "wait_term": float(wait_reward),
+        "active_vehicle_term": float(system_vehicle_reward),
+        "throughput_term": float(throughput_reward),
+        "wait_delta": float(wait_value if wait_delta is None else wait_delta),
     }

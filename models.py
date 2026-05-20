@@ -1,3 +1,4 @@
+import inspect
 import math
 from typing import Any, Optional, Set, Tuple
 
@@ -118,6 +119,7 @@ class Qwen3VLBackbone(nn.Module):
         model_path = _normalize_pretrained_model_path(model_path)
         self.device = device or (torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu"))
         self.max_length = int(max_length)
+        print(f"[Qwen3VLBackbone] loading processor/tokenizer from {model_path}", flush=True)
         self.processor = AutoProcessor.from_pretrained(model_path, trust_remote_code=True)
         self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
         if self.tokenizer.pad_token_id is None:
@@ -126,17 +128,26 @@ class Qwen3VLBackbone(nn.Module):
         model_cls = self._select_model_class()
         if model_cls is None:
             raise RuntimeError("No compatible model class found for Qwen3-VL.")
-        self.model = model_cls.from_pretrained(
-            model_path,
-            torch_dtype=torch_dtype,
-            trust_remote_code=True,
-            low_cpu_mem_usage=True,
-        )
+        print(f"[Qwen3VLBackbone] loading model with {model_cls.__name__}", flush=True)
+        load_direct_to_device = (not fsdp_enabled) and self.device.type == "cuda"
+        load_kwargs = {
+            "torch_dtype": torch_dtype,
+            "trust_remote_code": True,
+            "low_cpu_mem_usage": True,
+        }
+        if load_direct_to_device:
+            load_kwargs["device_map"] = {"": str(self.device)}
+        self.model = model_cls.from_pretrained(model_path, **load_kwargs)
         self.is_fsdp = False
         if fsdp_enabled:
             self._maybe_wrap_fsdp(torch_dtype=torch_dtype, sharding=fsdp_sharding_strategy)
         # Ensure parameters/buffers are on the right device (FSDP shards or full params).
-        self.model.to(self.device)
+        if load_direct_to_device:
+            print(f"[Qwen3VLBackbone] model loaded directly on {self.device}", flush=True)
+        else:
+            print(f"[Qwen3VLBackbone] moving model to device {self.device}", flush=True)
+            self.model.to(self.device)
+            print("[Qwen3VLBackbone] model moved to device", flush=True)
         self.model.eval()
         model_for_freeze = self.model.module if self.is_fsdp and hasattr(self.model, "module") else self.model
         for p in model_for_freeze.parameters():
@@ -151,6 +162,7 @@ class Qwen3VLBackbone(nn.Module):
         self.vision_tower = self._find_vision_tower(model_for_setup)
         if self.vision_tower is None:
             raise RuntimeError("Failed to locate vision tower in Qwen3-VL model.")
+        self._vision_input_name, self._vision_grid_name = self._infer_vision_forward_signature(self.vision_tower)
 
     def _select_model_class(self):
         if Qwen3VLForConditionalGeneration is not None:
@@ -158,6 +170,27 @@ class Qwen3VLBackbone(nn.Module):
         if AutoModelForImageTextToText is not None:
             return AutoModelForImageTextToText
         return AutoModelForCausalLM
+
+    def _get_base_model(self) -> nn.Module:
+        return self.model.module if hasattr(self.model, "module") else self.model
+
+    def set_use_cache(self, enabled: bool) -> None:
+        model = self._get_base_model()
+        config = getattr(model, "config", None)
+        if config is not None:
+            config.use_cache = bool(enabled)
+
+    def set_gradient_checkpointing(self, enabled: bool) -> None:
+        model = self._get_base_model()
+        try:
+            if enabled:
+                self.set_use_cache(False)
+                model.gradient_checkpointing_enable()
+            else:
+                model.gradient_checkpointing_disable()
+        except Exception as exc:
+            action = "enable" if enabled else "disable"
+            print(f"Warning: failed to {action} gradient checkpointing: {exc}")
 
     @staticmethod
     def _find_vision_tower(model: nn.Module) -> Optional[nn.Module]:
@@ -212,6 +245,38 @@ class Qwen3VLBackbone(nn.Module):
                     continue
                 cls_set.add(cls)
         return cls_set
+
+    @staticmethod
+    def _infer_vision_forward_signature(vision_tower: nn.Module) -> Tuple[Optional[str], Optional[str]]:
+        target = vision_tower
+        for attr in ("module", "_fsdp_wrapped_module"):
+            inner = getattr(target, attr, None)
+            if isinstance(inner, nn.Module):
+                target = inner
+        try:
+            signature = inspect.signature(target.forward)
+        except (TypeError, ValueError):
+            return None, None
+
+        input_name = None
+        grid_name = None
+        valid_kinds = {
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            inspect.Parameter.KEYWORD_ONLY,
+        }
+        for name, param in signature.parameters.items():
+            if name == "self" or param.kind not in valid_kinds:
+                continue
+            if input_name is None and name in {"hidden_states", "pixel_values"}:
+                input_name = name
+            if grid_name is None and name in {"grid_thw", "image_grid_thw"}:
+                grid_name = name
+        return input_name, grid_name
+
+    def _vision_uses_patchified_inputs(self) -> bool:
+        # Qwen2/2.5/3-VL vision towers consume patchified hidden states plus grid metadata.
+        # Keep raw-image mode only for towers that explicitly advertise pixel_values-only input.
+        return not (self._vision_input_name == "pixel_values" and self._vision_grid_name is None)
 
     def _maybe_wrap_fsdp(self, torch_dtype: torch.dtype, sharding: str) -> None:
         if FSDP is None or ShardingStrategy is None:
@@ -412,16 +477,20 @@ class Qwen3VLBackbone(nn.Module):
         self, pixel_values: torch.Tensor, image_grid_thw: Optional[torch.Tensor]
     ) -> torch.Tensor:
         vt = self.vision_tower
-        try:
-            out = vt(pixel_values=pixel_values, image_grid_thw=image_grid_thw, return_dict=True)
-        except Exception:
-            try:
-                out = vt(pixel_values=pixel_values, image_grid_thw=image_grid_thw)
-            except Exception:
-                try:
-                    out = vt(pixel_values)
-                except Exception:
-                    out = vt(pixel_values, image_grid_thw)
+        kwargs = {}
+        if self._vision_input_name is not None:
+            kwargs[self._vision_input_name] = pixel_values
+        if self._vision_grid_name is not None:
+            if image_grid_thw is None:
+                raise ValueError("Vision tower requires grid metadata, but image_grid_thw is None.")
+            kwargs[self._vision_grid_name] = image_grid_thw
+
+        if kwargs:
+            out = vt(**kwargs)
+        elif image_grid_thw is None:
+            out = vt(pixel_values)
+        else:
+            out = vt(pixel_values, image_grid_thw)
 
         if isinstance(out, torch.Tensor):
             return out
@@ -539,14 +608,12 @@ class Qwen3VLBackbone(nn.Module):
         batch_size = normalized.shape[0]
         vision_cfg = getattr(getattr(self.model, "config", None), "vision_config", None)
         merge_size = max(1, int(getattr(vision_cfg, "spatial_merge_size", 1)))
-        try:
+        if self._vision_uses_patchified_inputs():
             pixel_values_out, image_grid_thw = self._patchify(normalized)
             tokens = self._vision_forward(pixel_values_out, image_grid_thw)
             return self._reshape_vision_tokens(tokens, image_grid_thw, batch_size, merge_size=merge_size)
-        except Exception:
-            # Fallback: feed normalized image directly (for towers expecting raw pixel_values)
-            tokens = self._vision_forward(normalized, None)
-            return self._reshape_vision_tokens(tokens, None, batch_size, merge_size=merge_size)
+        tokens = self._vision_forward(normalized, None)
+        return self._reshape_vision_tokens(tokens, None, batch_size, merge_size=merge_size)
 
 
 class AlignmentModel(nn.Module):
@@ -569,7 +636,7 @@ class AlignmentModel(nn.Module):
         self.device = device or (torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu"))
         init_logit = math.log(1.0 / max(float(init_temperature), 1e-6))
         self.logit_scale = nn.Parameter(
-            torch.tensor(init_logit, dtype=torch.float32),
+            torch.tensor(init_logit, dtype=torch.float32, device=self.device),
             requires_grad=bool(learnable_logit_scale),
         )
         self.backbone = Qwen3VLBackbone(
@@ -586,14 +653,20 @@ class AlignmentModel(nn.Module):
             device=self.device,
         )
 
-        # Infer vision dimension from a dummy forward on a single fake image.
-        with torch.no_grad():
-            dummy = torch.zeros(1, 3, image_size, image_size, device=self.device)
-            tokens = self.backbone.encode_vision_tokens(dummy)
-            if tokens.dim() == 2:
-                vision_dim = tokens.shape[-1]
-            else:
-                vision_dim = tokens.shape[-1]
+        # Prefer config-derived dims to avoid an expensive dummy vision forward during init.
+        vision_cfg = getattr(getattr(self.backbone.model, "config", None), "vision_config", None)
+        vision_dim = None
+        if vision_cfg is not None:
+            for attr in ("out_hidden_size", "hidden_size", "embed_dim"):
+                value = getattr(vision_cfg, attr, None)
+                if isinstance(value, int) and value > 0:
+                    vision_dim = int(value)
+                    break
+        if vision_dim is None:
+            with torch.no_grad():
+                dummy = torch.zeros(1, 3, image_size, image_size, device=self.device)
+                tokens = self.backbone.encode_vision_tokens(dummy)
+                vision_dim = int(tokens.shape[-1])
         self.vision_projector = VisionPrefixProjector(
             vision_dim=vision_dim,
             text_dim=self.backbone.text_dim,
@@ -601,8 +674,8 @@ class AlignmentModel(nn.Module):
             mode=prefix_mode,
         )
         projector_dtype = getattr(self.backbone.model, "dtype", torch_dtype)
+        self.ts_projector.to(self.device)
         self.vision_projector.to(device=self.device, dtype=projector_dtype)
-        self.to(self.device)
 
     def encode_image(self, sequences: torch.Tensor) -> torch.Tensor:
         images = self.ts_projector(sequences)

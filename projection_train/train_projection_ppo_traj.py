@@ -20,9 +20,12 @@ if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
 from projection_train.prefix_action_policy import PrefixActionPolicy
+from projection_train.action_space import ACTION_LIST
 from projection_train.reward_shaping import (
+    REWARD_MODE_CHOICES,
+    REWARD_MODE_STABLE_DELTA,
     WAIT_REDUCER_CHOICES,
-    WAIT_REDUCER_MIN_POSITIVE,
+    WAIT_REDUCER_MEAN,
     resolve_objective_weights,
 )
 from projection_train.rollout_buffer import TrajectoryRolloutBuffer
@@ -315,6 +318,7 @@ def build_policy(
     llm_fsdp_enabled: bool = False,
     fsdp_sharding_strategy: str = "full_shard",
     backbone: Any = None,
+    action_eval_chunk_size: int = 0,
 ) -> PrefixActionPolicy:
     return PrefixActionPolicy(
         model_path=runtime["llm_path"],
@@ -333,6 +337,7 @@ def build_policy(
         backbone=backbone,
         backbone_fsdp_enabled=llm_fsdp_enabled,
         backbone_fsdp_sharding_strategy=fsdp_sharding_strategy,
+        action_eval_chunk_size=action_eval_chunk_size,
     )
 
 
@@ -369,9 +374,16 @@ def rollout_once(
     queue_reward_trace: List[float] = []
     wait_reward_trace: List[float] = []
     wait_signal_trace: List[float] = []
+    wait_delta_trace: List[float] = []
     travel_reward_trace: List[float] = []
     starvation_penalty_trace: List[float] = []
     local_throughput_trace: List[float] = []
+    queue_term_trace: List[float] = []
+    wait_term_trace: List[float] = []
+    active_term_trace: List[float] = []
+    throughput_term_trace: List[float] = []
+    raw_reward_trace: List[float] = []
+    clipped_reward_trace: List[float] = []
 
     for step_idx in range(int(rollout_steps)):
         seq_tensor = torch.tensor(obs["sequences"], dtype=torch.float32, device=device)
@@ -407,9 +419,16 @@ def rollout_once(
         queue_reward_trace.append(float(info.get("queue_reward_mean", 0.0)))
         wait_reward_trace.append(float(info.get("wait_reward_mean", 0.0)))
         wait_signal_trace.append(float(info.get("wait_signal_mean", 0.0)))
+        wait_delta_trace.append(float(info.get("wait_delta_mean", 0.0)))
         travel_reward_trace.append(float(info.get("travel_reward_mean", 0.0)))
         starvation_penalty_trace.append(float(info.get("starvation_penalty_mean", 0.0)))
         local_throughput_trace.append(float(info.get("local_throughput_mean", 0.0)))
+        queue_term_trace.append(float(info.get("queue_term_mean", 0.0)))
+        wait_term_trace.append(float(info.get("wait_term_mean", 0.0)))
+        active_term_trace.append(float(info.get("active_vehicle_term_mean", 0.0)))
+        throughput_term_trace.append(float(info.get("throughput_term_mean", 0.0)))
+        raw_reward_trace.append(float(info.get("raw_reward_mean", 0.0)))
+        clipped_reward_trace.append(float(info.get("clipped_reward_mean", 0.0)))
         obs = next_obs
         if done and step_idx + 1 < int(rollout_steps):
             if episode_reset_fn is not None:
@@ -435,6 +454,7 @@ def rollout_once(
         "rollout_avg_queue_reward": float(np.mean(queue_reward_trace) if queue_reward_trace else 0.0),
         "rollout_avg_wait_reward": float(np.mean(wait_reward_trace) if wait_reward_trace else 0.0),
         "rollout_avg_wait_signal": float(np.mean(wait_signal_trace) if wait_signal_trace else 0.0),
+        "rollout_avg_wait_delta": float(np.mean(wait_delta_trace) if wait_delta_trace else 0.0),
         "rollout_avg_travel_reward": float(np.mean(travel_reward_trace) if travel_reward_trace else 0.0),
         "rollout_avg_starvation_penalty": float(
             np.mean(starvation_penalty_trace) if starvation_penalty_trace else 0.0
@@ -442,6 +462,22 @@ def rollout_once(
         "rollout_avg_local_throughput": float(
             np.mean(local_throughput_trace) if local_throughput_trace else 0.0
         ),
+        "rollout_avg_queue_term": float(np.mean(queue_term_trace) if queue_term_trace else 0.0),
+        "rollout_avg_wait_term": float(np.mean(wait_term_trace) if wait_term_trace else 0.0),
+        "rollout_avg_active_term": float(np.mean(active_term_trace) if active_term_trace else 0.0),
+        "rollout_avg_throughput_term": float(
+            np.mean(throughput_term_trace) if throughput_term_trace else 0.0
+        ),
+        "rollout_avg_raw_reward": float(np.mean(raw_reward_trace) if raw_reward_trace else 0.0),
+        "rollout_avg_clipped_reward": float(
+            np.mean(clipped_reward_trace) if clipped_reward_trace else 0.0
+        ),
+        "rollout_reward_mean": float(buffer.reward_mean),
+        "rollout_reward_std": float(buffer.reward_std),
+        "rollout_return_mean": float(buffer.return_mean),
+        "rollout_return_std": float(buffer.return_std),
+        "rollout_advantage_mean": float(buffer.advantage_mean),
+        "rollout_advantage_std": float(buffer.advantage_std),
         "rollout_steps": float(buffer.num_steps),
         "rollout_transitions": float(buffer.num_transitions),
     }
@@ -476,7 +512,12 @@ def ppo_update(
     shared_transition_count = resolve_shared_transition_count(buffer.num_transitions, device=device)
     if shared_transition_count <= 0:
         raise RuntimeError("Resolved zero shared transitions for PPO update.")
+    grad_accum_steps = max(1, int(getattr(args, "grad_accum_steps", 1)))
+    minibatches_per_epoch = math.ceil(shared_transition_count / max(1, int(args.mini_batch_size)))
+    total_minibatches = int(args.ppo_epochs) * int(minibatches_per_epoch)
+    optimizer.zero_grad(set_to_none=True)
 
+    batch_idx = 0
     for _ in range(int(args.ppo_epochs)):
         for batch in buffer.mini_batches(
             args.mini_batch_size,
@@ -494,7 +535,6 @@ def ppo_update(
                 raise RuntimeError("PPO update requires cached reference_logits from rollout.")
             reference_logits = batch["reference_logits"].to(device).float()
 
-            optimizer.zero_grad(set_to_none=True)
             with _autocast_context():
                 evaluated = policy.evaluate_actions(sequences, prompts, actions)
                 new_log_probs = evaluated["log_probs"]
@@ -528,19 +568,26 @@ def ppo_update(
                     - args.entropy_coef * entropy
                     + args.kl_coef * kl
                 )
+                loss = loss / grad_accum_steps
+
+            sync_step = ((batch_idx + 1) % grad_accum_steps == 0) or (batch_idx + 1 == total_minibatches)
 
             if scaler is not None:
                 scaler.scale(loss).backward()
-                scaler.unscale_(optimizer)
-                sync_gradients(policy.trainable_parameters())
-                torch.nn.utils.clip_grad_norm_(policy.trainable_parameters(), args.max_grad_norm)
-                scaler.step(optimizer)
-                scaler.update()
             else:
                 loss.backward()
+
+            if sync_step:
+                if scaler is not None:
+                    scaler.unscale_(optimizer)
                 sync_gradients(policy.trainable_parameters())
                 torch.nn.utils.clip_grad_norm_(policy.trainable_parameters(), args.max_grad_norm)
-                optimizer.step()
+                if scaler is not None:
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
 
             clip_frac = ((ratio - 1.0).abs() > args.clip_range).float().mean()
             stats["policy_loss"].append(float(policy_loss.detach().cpu().item()))
@@ -549,7 +596,8 @@ def ppo_update(
             stats["kl"].append(float(kl.detach().cpu().item()))
             stats["ratio"].append(float(ratio.detach().mean().cpu().item()))
             stats["clip_frac"].append(float(clip_frac.detach().cpu().item()))
-            stats["total_loss"].append(float(loss.detach().cpu().item()))
+            stats["total_loss"].append(float((loss.detach() * grad_accum_steps).cpu().item()))
+            batch_idx += 1
 
     return {
         key: float(np.mean(values) if values else 0.0)
@@ -695,9 +743,38 @@ def log_configuration_warnings(
             "mini_batch_size=%d gives the optimizer almost no averaging and can destabilize PPO.",
             int(args.mini_batch_size),
         )
+    if int(args.grad_accum_steps) > 1:
+        logger.info(
+            "Using grad_accum_steps=%d; effective optimizer batch is scaled without increasing per-step activation memory.",
+            int(args.grad_accum_steps),
+        )
+    if int(args.action_eval_chunk_size) > 0 and int(args.action_eval_chunk_size) < len(ACTION_LIST):
+        logger.info(
+            "Using action_eval_chunk_size=%d; action logits will be scored in chunks instead of all %d actions at once.",
+            int(args.action_eval_chunk_size),
+            len(ACTION_LIST),
+        )
+    if str(args.gradient_checkpointing or "").strip().lower() == "on":
+        logger.info("Backbone gradient checkpointing is enabled; expect lower memory usage with extra recompute.")
     if str(args.wait_reward_reducer or "").strip().lower() == "min":
         logger.warning(
             "wait_reward_reducer=min can make the wait signal collapse toward zero when any nearby approach has a fresh vehicle."
+        )
+    if abs(float(args.reward_alpha) - 0.1) > 1e-12:
+        logger.warning(
+            "reward_alpha is kept for CLI compatibility but does not affect Stage 3 shaped rewards; "
+            "use --global_reward_scale for reward scaling."
+        )
+    if str(args.reward_mode or "").strip().lower() == REWARD_MODE_STABLE_DELTA:
+        logger.info(
+            "Using stable_delta reward: queue_delta_scale=%.4f wait_delta_scale=%.4f "
+            "active_delta_scale=%.4f throughput_scale=%.4f reward_clip=%.4f global_reward_scale=%.4f",
+            float(args.queue_delta_scale),
+            float(args.wait_delta_scale),
+            float(args.active_delta_scale),
+            float(args.throughput_scale),
+            float(args.reward_clip),
+            float(args.global_reward_scale),
         )
 
 
@@ -734,6 +811,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--rollout_steps", type=int, default=8)
     parser.add_argument("--ppo_epochs", type=int, default=4)
     parser.add_argument("--mini_batch_size", type=int, default=1)
+    parser.add_argument("--grad_accum_steps", type=int, default=1)
+    parser.add_argument("--action_eval_chunk_size", type=int, default=0)
     parser.add_argument("--lr", type=float, default=5e-5)
     parser.add_argument("--weight_decay", type=float, default=1e-4)
     parser.add_argument("--gamma", type=float, default=0.99)
@@ -755,7 +834,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--waiting_reward_coef",
         type=float,
-        default=-0.02,
+        default=-0.01,
         help="Coefficient on the resolved wait statistic. Negative values reward lower wait signals.",
     )
     parser.add_argument(
@@ -784,10 +863,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--wait_reward_reducer",
         type=str,
-        default=WAIT_REDUCER_MIN_POSITIVE,
+        default=WAIT_REDUCER_MEAN,
         choices=list(WAIT_REDUCER_CHOICES),
         help="Reducer applied to the collected wait values before the wait reward coefficient is applied.",
     )
+    parser.add_argument(
+        "--reward_mode",
+        type=str,
+        default=REWARD_MODE_STABLE_DELTA,
+        choices=list(REWARD_MODE_CHOICES),
+        help="Reward shaping mode. stable_delta uses bounded delta terms; legacy_absolute keeps the old formula.",
+    )
+    parser.add_argument("--queue_delta_scale", type=float, default=4.0)
+    parser.add_argument("--wait_delta_scale", type=float, default=30.0)
+    parser.add_argument("--active_delta_scale", type=float, default=4.0)
+    parser.add_argument("--throughput_scale", type=float, default=2.0)
+    parser.add_argument("--reward_clip", type=float, default=3.0)
+    parser.add_argument("--global_reward_scale", type=float, default=1.0)
     parser.add_argument("--eval_every", type=int, default=10)
     parser.add_argument("--save_every", type=int, default=10)
     parser.add_argument(
@@ -823,6 +915,7 @@ def parse_args() -> argparse.Namespace:
         default="full_shard",
         choices=["full_shard", "shard_grad_op", "no_shard"],
     )
+    parser.add_argument("--gradient_checkpointing", type=str, default="off", choices=["off", "on"])
     parser.add_argument("--bf16", action="store_true", default=False)
     parser.add_argument("--fp16", action="store_true", default=False)
     return parser.parse_args()
@@ -836,6 +929,17 @@ def main() -> None:
         raise ValueError("Choose only one of --fp16 or --bf16.")
     if not (0.0 <= args.snapshot_reset_prob <= 1.0):
         raise ValueError("--snapshot_reset_prob must be within [0, 1].")
+    if int(args.grad_accum_steps) <= 0:
+        raise ValueError("--grad_accum_steps must be >= 1.")
+    if int(args.action_eval_chunk_size) < 0:
+        raise ValueError("--action_eval_chunk_size must be >= 0.")
+    for scale_name in ("queue_delta_scale", "wait_delta_scale", "active_delta_scale", "throughput_scale"):
+        if float(getattr(args, scale_name)) <= 0.0:
+            raise ValueError(f"--{scale_name} must be > 0.")
+    if float(args.reward_clip) < 0.0:
+        raise ValueError("--reward_clip must be >= 0.")
+    if float(args.global_reward_scale) <= 0.0:
+        raise ValueError("--global_reward_scale must be > 0.")
     objective_weights = resolve_objective_weights(
         queue_weight=args.selection_queue_weight,
         wait_weight=args.selection_wait_weight,
@@ -896,6 +1000,7 @@ def main() -> None:
         with_value_head=True,
         llm_fsdp_enabled=llm_fsdp_enabled,
         fsdp_sharding_strategy=args.fsdp_sharding_strategy,
+        action_eval_chunk_size=args.action_eval_chunk_size,
     )
     policy.load_checkpoint(args.stage2_ckpt, load_value_head=False)
     reference_policy = build_policy(
@@ -904,8 +1009,10 @@ def main() -> None:
         model_dtype,
         with_value_head=False,
         backbone=policy.backbone,
+        action_eval_chunk_size=args.action_eval_chunk_size,
     )
     reference_policy.load_checkpoint(args.stage2_ckpt, load_value_head=False)
+    policy.set_backbone_gradient_checkpointing(str(args.gradient_checkpointing).strip().lower() == "on")
     reference_policy.eval()
     for param in reference_policy.parameters():
         param.requires_grad = False
@@ -940,11 +1047,20 @@ def main() -> None:
         starvation_wait_threshold=args.starvation_wait_threshold,
         wait_reward_scope=args.wait_reward_scope,
         wait_reward_reducer=args.wait_reward_reducer,
+        reward_mode=args.reward_mode,
+        queue_delta_scale=args.queue_delta_scale,
+        wait_delta_scale=args.wait_delta_scale,
+        active_delta_scale=args.active_delta_scale,
+        throughput_scale=args.throughput_scale,
+        reward_clip=args.reward_clip,
+        global_reward_scale=args.global_reward_scale,
         selection_queue_weight=args.selection_queue_weight,
         selection_wait_weight=args.selection_wait_weight,
         selection_travel_weight=args.selection_travel_weight,
         reward_info=reward_info,
         run_counts=run_counts,
+        env_seed=args.seed + rank,
+        advance_seed_on_reset=True,
     )
     eval_env = TrajectoryCityFlowEnv(
         roadnet_path=roadnet_path,
@@ -969,11 +1085,20 @@ def main() -> None:
         starvation_wait_threshold=args.starvation_wait_threshold,
         wait_reward_scope=args.wait_reward_scope,
         wait_reward_reducer=args.wait_reward_reducer,
+        reward_mode=args.reward_mode,
+        queue_delta_scale=args.queue_delta_scale,
+        wait_delta_scale=args.wait_delta_scale,
+        active_delta_scale=args.active_delta_scale,
+        throughput_scale=args.throughput_scale,
+        reward_clip=args.reward_clip,
+        global_reward_scale=args.global_reward_scale,
         selection_queue_weight=args.selection_queue_weight,
         selection_wait_weight=args.selection_wait_weight,
         selection_travel_weight=args.selection_travel_weight,
         reward_info=reward_info,
         run_counts=run_counts,
+        env_seed=args.seed,
+        advance_seed_on_reset=False,
     )
 
     snapshot_jsonl_paths = resolve_snapshot_jsonl_paths(args)
@@ -1107,21 +1232,33 @@ def main() -> None:
         )
         if is_main_process():
             logger.info(
-                "[update %d/%d] reward=%.4f queue=%.4f wait=%.4f wait_sig=%.4f travel=%.4f active=%.4f "
-                "rq=%.4f rw=%.4f rt=%.4f starve=%.4f policy=%.4f value=%.4f entropy=%.4f kl=%.4f "
-                "transitions=%.0f",
+                "[update %d/%d] reward=%.4f mean_r=%.4f raw=%.4f clip=%.4f queue=%.4f wait=%.4f "
+                "wait_sig=%.4f wait_delta=%.4f travel=%.4f active=%.4f rq=%.4f rw=%.4f rt=%.4f "
+                "qterm=%.4f wterm=%.4f aterm=%.4f thterm=%.4f starve=%.4f ret_mean=%.4f "
+                "ret_std=%.4f adv_std=%.4f policy=%.4f value=%.4f entropy=%.4f kl=%.4f transitions=%.0f",
                 update_idx,
                 args.num_updates,
                 merged_metrics["rollout_reward"],
+                merged_metrics["rollout_reward_mean"],
+                merged_metrics["rollout_avg_raw_reward"],
+                merged_metrics["rollout_avg_clipped_reward"],
                 merged_metrics["rollout_avg_queue"],
                 merged_metrics["rollout_avg_waiting"],
                 merged_metrics["rollout_avg_wait_signal"],
+                merged_metrics["rollout_avg_wait_delta"],
                 merged_metrics["rollout_avg_travel_time"],
                 merged_metrics["rollout_avg_active_vehicles"],
                 merged_metrics["rollout_avg_queue_reward"],
                 merged_metrics["rollout_avg_wait_reward"],
                 merged_metrics["rollout_avg_travel_reward"],
+                merged_metrics["rollout_avg_queue_term"],
+                merged_metrics["rollout_avg_wait_term"],
+                merged_metrics["rollout_avg_active_term"],
+                merged_metrics["rollout_avg_throughput_term"],
                 merged_metrics["rollout_avg_starvation_penalty"],
+                merged_metrics["rollout_return_mean"],
+                merged_metrics["rollout_return_std"],
+                merged_metrics["rollout_advantage_std"],
                 merged_metrics["policy_loss"],
                 merged_metrics["value_loss"],
                 merged_metrics["entropy"],

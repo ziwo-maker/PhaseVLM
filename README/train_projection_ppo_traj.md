@@ -138,48 +138,63 @@ travel_reward = system_vehicle_reward + throughput_reward
 
 ## 当前 shaped reward 结构
 
-单个路口的 reward 现在可以概括为：
+Stage 3 默认使用 `--reward_mode stable_delta`。单个路口的 reward 现在可以概括为：
 
 ```text
-reward =
-  queue_weight  * queue_reward_coef            * (current_queue - previous_queue)
-  + wait_weight * waiting_reward_coef          * (current_wait - previous_wait)
-  + travel_weight * system_vehicle_reward_coef * (current_active - previous_active)
-  + travel_weight * throughput_reward_coef     * local_throughput_count
+queue_term      = -clip((current_queue - previous_queue) / queue_delta_scale, -1, 1)
+wait_term       = -clip((current_wait - previous_wait) / wait_delta_scale, -1, 1)
+active_term     = -clip((current_active - previous_active) / active_delta_scale, -1, 1)
+throughput_term =  clip(local_throughput_count / throughput_scale, 0, 1)
+
+travel_term = 0.5 * active_term + 0.5 * throughput_term
+
+raw_reward =
+  queue_weight  * queue_term
+  + wait_weight * wait_term
+  + travel_weight * travel_term
   - switch_penalty
   - starvation_penalty
+
+reward = clip(raw_reward * global_reward_scale, -reward_clip, reward_clip)
 ```
 
 其中：
 
 - `queue_weight / wait_weight / travel_weight` 来自 `selection_*`
+- `current_wait` 仍来自当前等待车辆的等待秒数聚合，但进入 reward 的是 `current_wait - previous_wait`
+- `queue_delta_scale / wait_delta_scale / active_delta_scale / throughput_scale` 用于把各分量压到相近量级
+- `reward_clip` 防止极端拥堵或 starvation penalty 让 value target 爆炸
 - `switch_penalty` 和 `starvation_penalty` 仍然保持原来的抑制作用
+
+如需复现实验旧行为，可以显式指定：
+
+```bash
+--reward_mode legacy_absolute
+```
+
+旧模式仍使用绝对 wait signal：
+
+```text
+wait_reward = wait_weight * waiting_reward_coef * current_wait
+```
 
 ## 日志变化
 
-`train_projection_ppo_traj.py` 的 `[update ...]` 日志现在除了原有的：
+`train_projection_ppo_traj.py` 的 `[update ...]` 日志现在会记录：
 
-- `dq`
-- `dw`
-- `starve`
-
-还会新增：
-
-- `sv`
-- `thr`
-- `trv`
-
-分别对应：
-
-- `system vehicle reward`
-- `throughput reward`
-- `travel reward`
+- `wait_sig`：当前聚合后的绝对 wait signal，仅用于观察交通状态
+- `wait_delta`：实际进入 stable reward 的 wait 变化量
+- `rq / rw / rt`：queue、wait、travel 三个 reward 分量
+- `qterm / wterm / aterm / thterm`：归一化后的 queue、wait、active、throughput term
+- `raw / clip / mean_r`：裁剪前单步均值、裁剪后单步均值、rollout buffer 中的 reward 均值
+- `ret_mean / ret_std / adv_std`：value target 和 advantage 的尺度
 
 这样训练时可以直接观察：
 
 - queue / wait 是否在按预期起作用
 - travel proxy 是否真的进入了 PPO reward
 - reward 是否被某一项单独主导
+- value target 是否仍然发生尺度爆炸
 
 ## 新增文件
 
@@ -200,6 +215,8 @@ reward =
 - 校验 objective weight 的归一化逻辑
 - 校验负号 reward coefficient 会真实奖励指标下降
 - 校验 `selection_*` 会真实改变 queue / wait / travel 的训练目标配比
+- 校验 `stable_delta` 不会因为绝对 wait signal 变大而漂移
+- 校验 `stable_delta` 的 reward clip 对极端输入生效
 
 ## 兼容性说明
 

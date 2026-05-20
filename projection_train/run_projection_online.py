@@ -1020,6 +1020,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--traffic_file", type=str, default="anon_3_4_jinan_real.json")
     parser.add_argument("--run_counts", type=int, default=0)
     parser.add_argument("--device", type=str, default="auto")
+    parser.add_argument("--seed", type=int, default=2024)
     parser.add_argument("--prompt_mode", type=str, default="")
     parser.add_argument("--seq_len", type=int, default=0)
     parser.add_argument("--image_size", type=int, default=0)
@@ -1059,9 +1060,11 @@ def main(args: argparse.Namespace) -> Dict[str, Any]:
     if args.eightphase:
         raise ValueError("Stage 2/3 projection checkpoints only support the four-phase action space.")
 
-    random.seed(2024)
-    torch.manual_seed(2024)
-    torch.cuda.manual_seed_all(2024)
+    seed = int(args.seed)
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
 
     default_count, road_net, traffic_file_list, template = _dataset_spec(args.dataset)
     if args.traffic_file not in traffic_file_list:
@@ -1112,6 +1115,7 @@ def main(args: argparse.Namespace) -> Dict[str, Any]:
         "NUM_ROUNDS": args.num_rounds,
         "NUM_ROW": num_row,
         "NUM_COL": num_col,
+        "CITYFLOW_SEED": seed,
         "MIN_ACTION_TIME": min_action_time,
         "MEASURE_TIME": min_action_time,
         "ENABLE_TRAFFIC_COUNT": True,
