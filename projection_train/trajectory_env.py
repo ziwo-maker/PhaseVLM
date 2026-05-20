@@ -139,6 +139,8 @@ class TrajectoryCityFlowEnv:
         reward_mode: str = REWARD_MODE_STABLE_DELTA,
         queue_delta_scale: float = 4.0,
         wait_delta_scale: float = 30.0,
+        wait_abs_coef: float = 0.0,
+        wait_abs_scale: float = 60.0,
         active_delta_scale: float = 4.0,
         throughput_scale: float = 2.0,
         reward_clip: float = 3.0,
@@ -189,6 +191,8 @@ class TrajectoryCityFlowEnv:
         self.reward_mode = resolved_reward_mode
         self.queue_delta_scale = max(1e-8, float(queue_delta_scale))
         self.wait_delta_scale = max(1e-8, float(wait_delta_scale))
+        self.wait_abs_coef = float(wait_abs_coef)
+        self.wait_abs_scale = max(1e-8, float(wait_abs_scale))
         self.active_delta_scale = max(1e-8, float(active_delta_scale))
         self.throughput_scale = max(1e-8, float(throughput_scale))
         self.reward_clip = max(0.0, float(reward_clip))
@@ -711,10 +715,14 @@ class TrajectoryCityFlowEnv:
         )
         waiting_times = [self.env.waiting_vehicle_list[veh]["time"] for veh in self.env.waiting_vehicle_list]
         waiting_time_mean = float(np.mean(waiting_times) if waiting_times else 0.0)
+        waiting_time_p95 = float(np.percentile(waiting_times, 95) if waiting_times else 0.0)
+        waiting_time_max = float(max(waiting_times) if waiting_times else 0.0)
         active_vehicle_count = float(len(self._collect_active_vehicle_ids(self.env)))
         return {
             "queue_sum": queue_sum,
             "waiting_time_mean": waiting_time_mean,
+            "waiting_time_p95": waiting_time_p95,
+            "waiting_time_max": waiting_time_max,
             "active_vehicle_count": active_vehicle_count,
         }
 
@@ -733,6 +741,26 @@ class TrajectoryCityFlowEnv:
         action_arr = np.asarray(actions, dtype=np.int64)
         switch_penalty = (action_arr != prev_actions).astype(np.float32)
         current_local_metrics = self._collect_local_metrics(self.env)
+        left_turn_action_indices = {
+            action_idx for action_idx, action_name in enumerate(ACTION_LIST) if "L" in action_name
+        }
+        phase_wait_values: List[float] = []
+        phase_queue_values: List[float] = []
+        left_turn_wait_values: List[float] = []
+        left_turn_queue_values: List[float] = []
+        for local_metrics in current_local_metrics.values():
+            phase_waits = local_metrics.get("phase_wait_means") or {}
+            phase_queues = local_metrics.get("phase_queue_sums") or {}
+            for action_idx in range(len(ACTION_LIST)):
+                wait_value_for_phase = float(phase_waits.get(action_idx, 0.0) or 0.0)
+                queue_value_for_phase = float(phase_queues.get(action_idx, 0.0) or 0.0)
+                phase_wait_values.append(wait_value_for_phase)
+                phase_queue_values.append(queue_value_for_phase)
+                if action_idx in left_turn_action_indices:
+                    left_turn_wait_values.append(wait_value_for_phase)
+                    left_turn_queue_values.append(queue_value_for_phase)
+        positive_phase_waits = [value for value in phase_wait_values if value > 0.0]
+        positive_left_turn_waits = [value for value in left_turn_wait_values if value > 0.0]
         current_metrics = self.current_metrics()
         current_metrics["travel_time_mean"] = float(self.episode_travel_time_mean(resolved_end_time=current_time_s))
         current_active_vehicle_ids = self._collect_active_vehicle_ids(self.env)
@@ -792,6 +820,8 @@ class TrajectoryCityFlowEnv:
                 reward_mode=self.reward_mode,
                 queue_delta_scale=self.queue_delta_scale,
                 wait_delta_scale=self.wait_delta_scale,
+                wait_abs_coef=self.wait_abs_coef,
+                wait_abs_scale=self.wait_abs_scale,
                 active_delta_scale=self.active_delta_scale,
                 throughput_scale=self.throughput_scale,
                 reward_clip=self.reward_clip,
@@ -843,6 +873,18 @@ class TrajectoryCityFlowEnv:
             "wait_signal_mean": float(np.mean(wait_signal_values) if wait_signal_values else 0.0),
             "wait_delta_values": wait_delta_values,
             "wait_delta_mean": float(np.mean(wait_delta_values) if wait_delta_values else 0.0),
+            "phase_wait_mean": float(np.mean(positive_phase_waits) if positive_phase_waits else 0.0),
+            "phase_wait_max": float(max(phase_wait_values) if phase_wait_values else 0.0),
+            "phase_queue_mean": float(np.mean(phase_queue_values) if phase_queue_values else 0.0),
+            "phase_queue_max": float(max(phase_queue_values) if phase_queue_values else 0.0),
+            "left_turn_wait_mean": float(
+                np.mean(positive_left_turn_waits) if positive_left_turn_waits else 0.0
+            ),
+            "left_turn_wait_max": float(max(left_turn_wait_values) if left_turn_wait_values else 0.0),
+            "left_turn_queue_mean": float(
+                np.mean(left_turn_queue_values) if left_turn_queue_values else 0.0
+            ),
+            "left_turn_queue_max": float(max(left_turn_queue_values) if left_turn_queue_values else 0.0),
             "local_throughput_counts": local_throughput_counts,
             "local_throughput_mean": float(np.mean(local_throughput_counts) if local_throughput_counts else 0.0),
             "queue_terms": queue_terms,

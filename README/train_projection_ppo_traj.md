@@ -22,6 +22,20 @@
 - 新增 reward shaping 的独立辅助模块
   - `projection_train/reward_shaping.py`
   - 负责 objective weight 归一化和局部 shaped reward 组装
+- 新增 Stage 3 checkpoint 选择保护：
+  - `--train_run_counts` 和 `--eval_run_counts` 可分离训练 rollout 长度与 best 评估长度
+  - `--selection_require_all_improved`
+  - `--selection_max_queue_ratio`
+  - `--selection_max_wait_ratio`
+  - `--selection_max_travel_ratio`
+  这些参数用于避免短评测或单项 trade-off 把长程不稳定 checkpoint 覆盖成 `best.pt`
+- 扩展 eval 指标：
+  - `eval_waiting_p95`
+  - `eval_waiting_max`
+  - `eval_phase_wait_max`
+  - `eval_left_turn_wait_mean`
+  - `eval_left_turn_wait_max`
+  用于暴露局部相位饥饿，尤其是左转方向长等待
 
 ## 修改目的
 
@@ -143,6 +157,7 @@ Stage 3 默认使用 `--reward_mode stable_delta`。单个路口的 reward 现�
 ```text
 queue_term      = -clip((current_queue - previous_queue) / queue_delta_scale, -1, 1)
 wait_term       = -clip((current_wait - previous_wait) / wait_delta_scale, -1, 1)
+wait_abs_term   = -clip(current_wait / wait_abs_scale, 0, 1)
 active_term     = -clip((current_active - previous_active) / active_delta_scale, -1, 1)
 throughput_term =  clip(local_throughput_count / throughput_scale, 0, 1)
 
@@ -150,7 +165,7 @@ travel_term = 0.5 * active_term + 0.5 * throughput_term
 
 raw_reward =
   queue_weight  * queue_term
-  + wait_weight * wait_term
+  + wait_weight * (wait_term + wait_abs_coef * wait_abs_term)
   + travel_weight * travel_term
   - switch_penalty
   - starvation_penalty
@@ -162,9 +177,30 @@ reward = clip(raw_reward * global_reward_scale, -reward_clip, reward_clip)
 
 - `queue_weight / wait_weight / travel_weight` 来自 `selection_*`
 - `current_wait` 仍来自当前等待车辆的等待秒数聚合，但进入 reward 的是 `current_wait - previous_wait`
+- `wait_abs_coef` 默认是 `0.0`，所以默认仍保持纯 delta wait；当需要惩罚“已经等很久但不再继续上升”的车辆时，可以显式打开绝对 wait 惩罚
 - `queue_delta_scale / wait_delta_scale / active_delta_scale / throughput_scale` 用于把各分量压到相近量级
 - `reward_clip` 防止极端拥堵或 starvation penalty 让 value target 爆炸
 - `switch_penalty` 和 `starvation_penalty` 仍然保持原来的抑制作用
+
+## 长程 best 选择建议
+
+如果训练为了省时间只跑短 rollout，但最终指标按 3600 秒评测，建议使用：
+
+```bash
+--train_run_counts 900 \
+--eval_run_counts 3600 \
+--selection_require_all_improved
+```
+
+如果允许某些指标有轻微 trade-off，可以不用 `--selection_require_all_improved`，改用上界：
+
+```bash
+--selection_max_queue_ratio 1.02 \
+--selection_max_wait_ratio 1.00 \
+--selection_max_travel_ratio 1.02
+```
+
+这会让 `best.pt` 的选择更接近最终在线测试，而不是只对前 900 秒的 composite score 负责。
 
 如需复现实验旧行为，可以显式指定：
 

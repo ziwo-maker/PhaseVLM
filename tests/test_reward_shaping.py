@@ -120,6 +120,48 @@ def test_stable_delta_wait_ignores_absolute_delay_when_delta_is_zero() -> None:
     assert high_absolute_wait["reward"] == pytest.approx(low_absolute_wait["reward"])
 
 
+def test_stable_delta_optional_absolute_wait_penalizes_high_delay() -> None:
+    weights = resolve_objective_weights(queue_weight=0.0, wait_weight=1.0, travel_weight=0.0)
+    low_absolute_wait = compute_local_shaped_reward(
+        queue_delta=0.0,
+        wait_value=30.0,
+        wait_delta=0.0,
+        active_vehicle_delta=0.0,
+        throughput_count=0.0,
+        queue_reward_coef=-0.35,
+        waiting_reward_coef=-0.01,
+        system_vehicle_reward_coef=-0.01,
+        throughput_reward_coef=0.02,
+        switch_penalty=0.0,
+        starvation_penalty=0.0,
+        objective_weights=weights,
+        reward_mode=REWARD_MODE_STABLE_DELTA,
+        wait_abs_coef=0.5,
+        wait_abs_scale=60.0,
+    )
+    high_absolute_wait = compute_local_shaped_reward(
+        queue_delta=0.0,
+        wait_value=90.0,
+        wait_delta=0.0,
+        active_vehicle_delta=0.0,
+        throughput_count=0.0,
+        queue_reward_coef=-0.35,
+        waiting_reward_coef=-0.01,
+        system_vehicle_reward_coef=-0.01,
+        throughput_reward_coef=0.02,
+        switch_penalty=0.0,
+        starvation_penalty=0.0,
+        objective_weights=weights,
+        reward_mode=REWARD_MODE_STABLE_DELTA,
+        wait_abs_coef=0.5,
+        wait_abs_scale=60.0,
+    )
+    assert low_absolute_wait["wait_abs_term"] == pytest.approx(-0.5)
+    assert high_absolute_wait["wait_abs_term"] == pytest.approx(-1.0)
+    assert high_absolute_wait["wait_reward"] < low_absolute_wait["wait_reward"]
+    assert high_absolute_wait["reward"] < low_absolute_wait["reward"]
+
+
 def test_stable_delta_wait_delta_penalizes_growth_and_rewards_reduction() -> None:
     weights = resolve_objective_weights(queue_weight=0.0, wait_weight=1.0, travel_weight=0.0)
     growing_wait = compute_local_shaped_reward(

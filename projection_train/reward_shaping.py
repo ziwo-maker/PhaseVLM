@@ -102,6 +102,8 @@ def compute_local_shaped_reward(
     reward_mode: str = REWARD_MODE_LEGACY_ABSOLUTE,
     queue_delta_scale: float = 4.0,
     wait_delta_scale: float = 30.0,
+    wait_abs_coef: float = 0.0,
+    wait_abs_scale: float = 60.0,
     active_delta_scale: float = 4.0,
     throughput_scale: float = 2.0,
     reward_clip: float = 3.0,
@@ -123,6 +125,11 @@ def compute_local_shaped_reward(
             -1.0,
             1.0,
         )
+        wait_abs_term = -_clip(
+            float(wait_value) / _positive_scale(wait_abs_scale),
+            0.0,
+            1.0,
+        )
         active_vehicle_term = -_clip(
             float(active_vehicle_delta) / _positive_scale(active_delta_scale),
             -1.0,
@@ -135,7 +142,9 @@ def compute_local_shaped_reward(
         )
 
         queue_reward = float(objective_weights.get(OBJECTIVE_QUEUE, 0.0)) * queue_term
-        wait_reward = float(objective_weights.get(OBJECTIVE_WAIT, 0.0)) * wait_term
+        wait_reward = float(objective_weights.get(OBJECTIVE_WAIT, 0.0)) * (
+            wait_term + float(wait_abs_coef) * wait_abs_term
+        )
         system_vehicle_reward = (
             float(objective_weights.get(OBJECTIVE_TRAVEL, 0.0))
             * 0.5
@@ -169,6 +178,7 @@ def compute_local_shaped_reward(
             "reward": float(reward),
             "queue_term": float(queue_term),
             "wait_term": float(wait_term),
+            "wait_abs_term": float(wait_abs_term),
             "active_vehicle_term": float(active_vehicle_term),
             "throughput_term": float(throughput_term),
             "wait_delta": float(resolved_wait_delta),
@@ -206,6 +216,7 @@ def compute_local_shaped_reward(
         "reward": float(reward),
         "queue_term": float(queue_reward),
         "wait_term": float(wait_reward),
+        "wait_abs_term": float(0.0),
         "active_vehicle_term": float(system_vehicle_reward),
         "throughput_term": float(throughput_reward),
         "wait_delta": float(wait_value if wait_delta is None else wait_delta),

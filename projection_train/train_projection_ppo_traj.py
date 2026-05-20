@@ -300,14 +300,31 @@ def resolve_snapshot_jsonl_paths(args: argparse.Namespace) -> List[str]:
     return []
 
 
-def build_env_paths(args: argparse.Namespace) -> tuple[str, str, int]:
+def _resolve_run_counts(default_count: int, traffic_file: str, override: int, fallback: int) -> int:
+    run_counts = int(override or fallback or default_count)
+    if "24h" in str(traffic_file or ""):
+        return 86400
+    return run_counts
+
+
+def build_env_paths(args: argparse.Namespace) -> tuple[str, str, int, int]:
     default_count, road_net, template = _dataset_spec(args.dataset)
     traffic_root = args.traffic_root or os.path.join("data", template, road_net)
     roadnet_path = args.roadnet_path or os.path.join(traffic_root, f"roadnet_{road_net}.json")
-    run_counts = int(args.run_counts or default_count)
-    if "24h" in str(args.traffic_file or ""):
-        run_counts = 86400
-    return roadnet_path, traffic_root, run_counts
+    shared_run_counts = int(args.run_counts or default_count)
+    train_run_counts = _resolve_run_counts(
+        default_count=default_count,
+        traffic_file=args.traffic_file,
+        override=args.train_run_counts,
+        fallback=shared_run_counts,
+    )
+    eval_run_counts = _resolve_run_counts(
+        default_count=default_count,
+        traffic_file=args.eval_traffic_file or args.traffic_file,
+        override=args.eval_run_counts,
+        fallback=shared_run_counts,
+    )
+    return roadnet_path, traffic_root, train_run_counts, eval_run_counts
 
 
 def build_policy(
@@ -618,6 +635,13 @@ def evaluate_full_episode(
     total_reward = 0.0
     queue_trace: List[float] = []
     wait_trace: List[float] = []
+    wait_p95_trace: List[float] = []
+    wait_max_trace: List[float] = []
+    phase_wait_max_trace: List[float] = []
+    phase_queue_max_trace: List[float] = []
+    left_turn_wait_trace: List[float] = []
+    left_turn_wait_max_trace: List[float] = []
+    starvation_penalty_trace: List[float] = []
     step_count = 0
 
     while not done:
@@ -629,6 +653,13 @@ def evaluate_full_episode(
         total_reward += float(sum(rewards))
         queue_trace.append(float(info.get("queue_sum", 0.0)))
         wait_trace.append(float(info.get("waiting_time_mean", 0.0)))
+        wait_p95_trace.append(float(info.get("waiting_time_p95", 0.0)))
+        wait_max_trace.append(float(info.get("waiting_time_max", 0.0)))
+        phase_wait_max_trace.append(float(info.get("phase_wait_max", 0.0)))
+        phase_queue_max_trace.append(float(info.get("phase_queue_max", 0.0)))
+        left_turn_wait_trace.append(float(info.get("left_turn_wait_mean", 0.0)))
+        left_turn_wait_max_trace.append(float(info.get("left_turn_wait_max", 0.0)))
+        starvation_penalty_trace.append(float(info.get("starvation_penalty_mean", 0.0)))
         step_count += 1
         if env.current_time_s >= env.run_counts:
             done = True
@@ -637,6 +668,15 @@ def evaluate_full_episode(
         "eval_reward": total_reward,
         "eval_avg_queue": float(np.mean(queue_trace) if queue_trace else 0.0),
         "eval_avg_waiting": float(np.mean(wait_trace) if wait_trace else 0.0),
+        "eval_waiting_p95": float(np.mean(wait_p95_trace) if wait_p95_trace else 0.0),
+        "eval_waiting_max": float(max(wait_max_trace) if wait_max_trace else 0.0),
+        "eval_phase_wait_max": float(max(phase_wait_max_trace) if phase_wait_max_trace else 0.0),
+        "eval_phase_queue_max": float(max(phase_queue_max_trace) if phase_queue_max_trace else 0.0),
+        "eval_left_turn_wait_mean": float(np.mean(left_turn_wait_trace) if left_turn_wait_trace else 0.0),
+        "eval_left_turn_wait_max": float(max(left_turn_wait_max_trace) if left_turn_wait_max_trace else 0.0),
+        "eval_starvation_penalty_mean": float(
+            np.mean(starvation_penalty_trace) if starvation_penalty_trace else 0.0
+        ),
         "eval_avg_travel_time": float(env.episode_travel_time_mean(resolved_end_time=env.run_counts)),
         "eval_steps": float(step_count),
     }
@@ -697,6 +737,32 @@ def resolve_selection_score(eval_metrics: Dict[str, float], args: argparse.Names
     if args.model_selection_metric == "reward":
         return float(eval_metrics.get("eval_reward", float("-inf")))
     return float(eval_metrics.get("eval_composite_score", float("-inf")))
+
+
+def _ratio_guardrail_failure(
+    eval_metrics: Dict[str, float],
+    metric_name: str,
+    limit: float,
+) -> str:
+    if float(limit) <= 0.0:
+        return ""
+    ratio_name = f"eval_{metric_name}_ratio"
+    ratio = float(eval_metrics.get(ratio_name, 0.0))
+    if ratio > float(limit):
+        return f"{ratio_name}={ratio:.4f} > {float(limit):.4f}"
+    return ""
+
+
+def selection_guardrail_failure(eval_metrics: Dict[str, float], args: argparse.Namespace) -> str:
+    if bool(args.selection_require_all_improved) and not bool(eval_metrics.get("eval_all_metrics_improved", 0.0)):
+        return "not all queue/wait/travel ratios improved"
+
+    failures = [
+        _ratio_guardrail_failure(eval_metrics, "queue", args.selection_max_queue_ratio),
+        _ratio_guardrail_failure(eval_metrics, "wait", args.selection_max_wait_ratio),
+        _ratio_guardrail_failure(eval_metrics, "travel", args.selection_max_travel_ratio),
+    ]
+    return "; ".join(item for item in failures if item)
 
 
 def save_checkpoint(
@@ -804,6 +870,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--value_hidden_dim", type=int, default=512)
     parser.add_argument("--prompt_mode", type=str, default="image_only_short")
     parser.add_argument("--run_counts", type=int, default=0)
+    parser.add_argument(
+        "--train_run_counts",
+        type=int,
+        default=0,
+        help="Optional PPO rollout episode length. Defaults to --run_counts or the dataset default.",
+    )
+    parser.add_argument(
+        "--eval_run_counts",
+        type=int,
+        default=0,
+        help="Optional checkpoint-selection evaluation length. Use 3600 for full Jinan/Non-24h evals.",
+    )
     parser.add_argument("--min_action_time", type=int, default=30)
     parser.add_argument("--traffic_series_interval", type=int, default=2)
     parser.add_argument("--window_s", type=int, default=30)
@@ -876,6 +954,13 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--queue_delta_scale", type=float, default=4.0)
     parser.add_argument("--wait_delta_scale", type=float, default=30.0)
+    parser.add_argument(
+        "--wait_abs_coef",
+        type=float,
+        default=0.0,
+        help="Optional stable_delta absolute-wait penalty multiplier. Zero preserves the pure-delta reward.",
+    )
+    parser.add_argument("--wait_abs_scale", type=float, default=60.0)
     parser.add_argument("--active_delta_scale", type=float, default=4.0)
     parser.add_argument("--throughput_scale", type=float, default=2.0)
     parser.add_argument("--reward_clip", type=float, default=3.0)
@@ -906,6 +991,30 @@ def parse_args() -> argparse.Namespace:
         default=1.0,
         help="Relative travel proxy weight used in PPO reward shaping and composite checkpoint selection.",
     )
+    parser.add_argument(
+        "--selection_require_all_improved",
+        action="store_true",
+        default=False,
+        help="Only update best.pt when queue, wait, and travel ratios all improve over baseline.",
+    )
+    parser.add_argument(
+        "--selection_max_queue_ratio",
+        type=float,
+        default=0.0,
+        help="Optional upper bound for eval_queue_ratio when updating best.pt. Non-positive disables it.",
+    )
+    parser.add_argument(
+        "--selection_max_wait_ratio",
+        type=float,
+        default=0.0,
+        help="Optional upper bound for eval_wait_ratio when updating best.pt. Non-positive disables it.",
+    )
+    parser.add_argument(
+        "--selection_max_travel_ratio",
+        type=float,
+        default=0.0,
+        help="Optional upper bound for eval_travel_ratio when updating best.pt. Non-positive disables it.",
+    )
     parser.add_argument("--seed", type=int, default=2024)
     parser.add_argument("--device", type=str, default="auto")
     parser.add_argument("--llm_fsdp", type=str, default="off", choices=["off", "on"])
@@ -933,7 +1042,13 @@ def main() -> None:
         raise ValueError("--grad_accum_steps must be >= 1.")
     if int(args.action_eval_chunk_size) < 0:
         raise ValueError("--action_eval_chunk_size must be >= 0.")
-    for scale_name in ("queue_delta_scale", "wait_delta_scale", "active_delta_scale", "throughput_scale"):
+    for scale_name in (
+        "queue_delta_scale",
+        "wait_delta_scale",
+        "wait_abs_scale",
+        "active_delta_scale",
+        "throughput_scale",
+    ):
         if float(getattr(args, scale_name)) <= 0.0:
             raise ValueError(f"--{scale_name} must be > 0.")
     if float(args.reward_clip) < 0.0:
@@ -946,7 +1061,7 @@ def main() -> None:
         travel_weight=args.selection_travel_weight,
     )
 
-    roadnet_path, traffic_root, run_counts = build_env_paths(args)
+    roadnet_path, traffic_root, train_run_counts, eval_run_counts = build_env_paths(args)
     runtime = resolve_runtime(args)
     runtime["value_hidden_dim"] = int(args.value_hidden_dim)
 
@@ -987,6 +1102,11 @@ def main() -> None:
     logger.info("Training arguments: %s", vars(args))
     logger.info("Resolved runtime: %s", runtime)
     logger.info("Resolved PPO objective weights: %s", objective_weights)
+    logger.info(
+        "Resolved episode lengths: train_run_counts=%d eval_run_counts=%d",
+        train_run_counts,
+        eval_run_counts,
+    )
 
     reward_info = {
         "queue_length": float(args.queue_reward_coef),
@@ -1050,6 +1170,8 @@ def main() -> None:
         reward_mode=args.reward_mode,
         queue_delta_scale=args.queue_delta_scale,
         wait_delta_scale=args.wait_delta_scale,
+        wait_abs_coef=args.wait_abs_coef,
+        wait_abs_scale=args.wait_abs_scale,
         active_delta_scale=args.active_delta_scale,
         throughput_scale=args.throughput_scale,
         reward_clip=args.reward_clip,
@@ -1058,7 +1180,7 @@ def main() -> None:
         selection_wait_weight=args.selection_wait_weight,
         selection_travel_weight=args.selection_travel_weight,
         reward_info=reward_info,
-        run_counts=run_counts,
+        run_counts=train_run_counts,
         env_seed=args.seed + rank,
         advance_seed_on_reset=True,
     )
@@ -1088,6 +1210,8 @@ def main() -> None:
         reward_mode=args.reward_mode,
         queue_delta_scale=args.queue_delta_scale,
         wait_delta_scale=args.wait_delta_scale,
+        wait_abs_coef=args.wait_abs_coef,
+        wait_abs_scale=args.wait_abs_scale,
         active_delta_scale=args.active_delta_scale,
         throughput_scale=args.throughput_scale,
         reward_clip=args.reward_clip,
@@ -1096,7 +1220,7 @@ def main() -> None:
         selection_wait_weight=args.selection_wait_weight,
         selection_travel_weight=args.selection_travel_weight,
         reward_info=reward_info,
-        run_counts=run_counts,
+        run_counts=eval_run_counts,
         env_seed=args.seed,
         advance_seed_on_reset=False,
     )
@@ -1155,10 +1279,14 @@ def main() -> None:
     if is_main_process():
         baseline_score = resolve_selection_score(baseline_eval_metrics, args)
         logger.info(
-            "[eval 0] reward=%.4f avg_queue=%.4f avg_wait=%.4f avg_travel=%.4f score=%.4f",
+            "[eval 0] reward=%.4f avg_queue=%.4f avg_wait=%.4f p95_wait=%.4f "
+            "phase_wait_max=%.4f left_wait=%.4f avg_travel=%.4f score=%.4f",
             baseline_eval_metrics["eval_reward"],
             baseline_eval_metrics["eval_avg_queue"],
             baseline_eval_metrics["eval_avg_waiting"],
+            baseline_eval_metrics["eval_waiting_p95"],
+            baseline_eval_metrics["eval_phase_wait_max"],
+            baseline_eval_metrics["eval_left_turn_wait_mean"],
             baseline_eval_metrics["eval_avg_travel_time"],
             baseline_score,
         )
@@ -1300,11 +1428,15 @@ def main() -> None:
             merged_metrics.update(eval_metrics)
             if is_main_process():
                 logger.info(
-                    "[eval %d] reward=%.4f avg_queue=%.4f avg_wait=%.4f avg_travel=%.4f score=%.4f",
+                    "[eval %d] reward=%.4f avg_queue=%.4f avg_wait=%.4f p95_wait=%.4f "
+                    "phase_wait_max=%.4f left_wait=%.4f avg_travel=%.4f score=%.4f",
                     update_idx,
                     eval_metrics["eval_reward"],
                     eval_metrics["eval_avg_queue"],
                     eval_metrics["eval_avg_waiting"],
+                    eval_metrics["eval_waiting_p95"],
+                    eval_metrics["eval_phase_wait_max"],
+                    eval_metrics["eval_left_turn_wait_mean"],
                     eval_metrics["eval_avg_travel_time"],
                     resolve_selection_score(eval_metrics, args),
                 )
@@ -1318,7 +1450,14 @@ def main() -> None:
                     metrics=merged_metrics,
                 )
                 selection_score = resolve_selection_score(eval_metrics, args)
-                if selection_score > best_metric:
+                guardrail_failure = selection_guardrail_failure(eval_metrics, args)
+                if guardrail_failure:
+                    logger.info(
+                        "[eval %d] skip best update: %s",
+                        update_idx,
+                        guardrail_failure,
+                    )
+                elif selection_score > best_metric:
                     best_metric = selection_score
                     save_checkpoint(
                         output_dir=args.output_dir,
