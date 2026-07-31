@@ -1,0 +1,63 @@
+FROM nvidia/cuda:13.1.1-devel-ubuntu24.04 
+
+# 防止安装过程中的交互式提示
+ENV DEBIAN_FRONTEND=noninteractive
+
+# 设置基础环境变量
+ENV LANG=C.UTF-8 LC_ALL=C.UTF-8
+ENV PATH /opt/conda/bin:$PATH
+
+# 1. 安装系统依赖和 CUDA 工具包
+# 合并 apt install 以减少镜像层数,安装完成后清理缓存
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+    build-essential \
+    vim \
+    cmake \
+    wget \
+    git \
+    ca-certificates \
+    nvidia-cuda-toolkit \
+    && apt-get clean && \
+    rm -rf /var/lib/apt/lists/*
+
+# 2. 安装 Miniconda (Python 3.10 版本)
+# 使用 Miniconda3-py310 指定 Python 3.10
+RUN wget -P /tmp/ https://repo.anaconda.com/miniconda/Miniconda3-py310_23.10.0-1-Linux-x86_64.sh && \
+    /bin/bash /tmp/Miniconda3-py310_23.10.0-1-Linux-x86_64.sh -b -p /opt/conda && \
+    rm /tmp/Miniconda3-py310_23.10.0-1-Linux-x86_64.sh && \
+    ln -s /opt/conda/etc/profile.d/conda.sh /etc/profile.d/conda.sh && \
+    echo ". /opt/conda/etc/profile.d/conda.sh" >> ~/.bashrc && \
+    conda clean -afy
+
+
+RUN python -m pip install --upgrade pip
+
+
+RUN pip3 install torch torchvision --index-url https://download.pytorch.org/whl/cu130
+# 4. 安装 CityFlow
+# 先安装 Flask 依赖,再编译安装 CityFlow
+RUN git clone https://github.com/cityflow-project/CityFlow.git /home/CityFlow && \
+    pip install --no-cache-dir flask && \
+    cd /home/CityFlow && \
+    pip install --no-cache-dir .
+# 5. 安装业务依赖
+# 复制 requirements.txt 并安装
+
+
+COPY requirements.txt /home/requirements.txt
+RUN pip install --no-cache-dir -r /home/requirements.txt -i https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple
+
+# 6. 安装深度学习框架 (PyTorch & TensorFlow)
+# 注意:cu130 目前通常不可用,已替换为稳定的 cu118 (CUDA 11.8)
+# 如果你的宿主机驱动支持 CUDA 12,也可以改为 cu121
+RUN pip install --no-cache-dir tensorflow && \
+    pip install --no-cache-dir rich typing_extensions
+RUN pip install tf-keras -i https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple
+
+# RUN pip install flash-attn --no-build-isolation
+RUN pip install PyWavelets -i https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple
+RUN pip install matplotlib -i https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple
+RUN pip install pytorch_wavelets -i https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple
+RUN pip install flash-attn --no-build-isolation
+WORKDIR /home/code
