@@ -1,4 +1,26 @@
-LLMLight: Large Language Models as Traffic Signal Control Agents
+# PhaseVLM
+
+This is the official repository for **PhaseVLM: Topology-Aware Vision-Language
+Modeling with Time Series Traffic Images for Traffic Signal Control**.
+
+The paper is submitted to **AAAI 2027**.
+
+## Basic Usage
+
+Install the Python dependencies:
+
+```bash
+pip install -r requirements.txt
+```
+
+Run a basic experiment:
+
+```bash
+python run.py
+```
+
+For projection-stage training, see `train_align.py` and the scripts under
+`projection_train/`.
 
 ## 开发注意事项
 
