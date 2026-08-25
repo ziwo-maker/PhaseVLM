@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import copy
 import fcntl
+import hashlib
 import json
 import logging
 import os
@@ -55,6 +56,14 @@ def configure_stdio() -> None:
                 reconfigure(line_buffering=True, write_through=True)
             except TypeError:
                 reconfigure(line_buffering=True)
+
+
+def sha256_file(path: str) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def setup_logger(log_path: str) -> logging.Logger:
@@ -438,6 +447,9 @@ def _dataset_spec(dataset: str) -> tuple[int, str, list[str], str]:
                 "anon_4_4_hangzhou_real.json",
                 "anon_4_4_hangzhou_real_5816.json",
                 "anon_4_4_hangzhou_synthetic_24000_60min.json",
+                "anon_4_4_hangzhou_real_t0000_1200.json",
+                "anon_4_4_hangzhou_real_t1200_2400.json",
+                "anon_4_4_hangzhou_real_t2400_3600.json",
             ],
             "Hangzhou",
         )
@@ -476,6 +488,7 @@ class ProjectionPolicyRunner:
         max_phase_override_target_queue_floor: float = 0.0,
         max_phase_override_total_queue_floor: float = 0.0,
         inference_batch_size: int = 0,
+        collect_states_output: str = "",
     ) -> None:
         self.dic_agent_conf = dic_agent_conf
         self.dic_traffic_env_conf = dic_traffic_env_conf_local
@@ -497,6 +510,8 @@ class ProjectionPolicyRunner:
         self.max_phase_override_target_queue_floor = float(max_phase_override_target_queue_floor or 0.0)
         self.max_phase_override_total_queue_floor = float(max_phase_override_total_queue_floor or 0.0)
         self.inference_batch_size = max(0, int(inference_batch_size or 0))
+        self.collect_states_output = str(collect_states_output or "")
+        self._collect_states_fh = None
         self.env: Optional[CityFlowEnv] = None
         self.policy = None
         self.tokenizer = None
@@ -549,6 +564,47 @@ class ProjectionPolicyRunner:
             queues[phase] = float(sum(lane_queues))
             waits[phase] = float(sum(lane_waits) / len(lane_waits)) if lane_waits else 0.0
         return queues, waits
+
+    def _phase_wait_tail(self, intersection_id: str) -> tuple[dict[str, float], dict[str, float]]:
+        """Measure direct per-phase p95/max waits at the decision boundary."""
+        assert self.env is not None
+        roads = (self.env.intersection_dict.get(intersection_id) or {}).get("roads") or {}
+        lane_vehicles = (self.env.system_states or {}).get("get_lane_vehicles") or {}
+        waiting = self.env.waiting_vehicle_list or {}
+        movement_waits: dict[str, list[float]] = {
+            movement: [] for movement in ("ET", "WT", "NT", "ST", "EL", "WL", "NL", "SL")
+        }
+        direction_prefix = {"East": "E", "West": "W", "North": "N", "South": "S"}
+        for road_id, road in roads.items():
+            if road.get("type") != "outgoing":
+                continue
+            prefix = direction_prefix.get(str(road.get("location") or ""))
+            if not prefix:
+                continue
+            for lane_kind, suffix in (("go_straight", "T"), ("turn_left", "L")):
+                movement = f"{prefix}{suffix}"
+                for lane_index in (road.get("lanes") or {}).get(lane_kind) or []:
+                    lane_id = f"{road_id}_{lane_index}"
+                    for vehicle_id in lane_vehicles.get(lane_id) or []:
+                        info = waiting.get(vehicle_id)
+                        if not isinstance(info, dict) or info.get("link") != lane_id:
+                            continue
+                        try:
+                            wait_s = float(info.get("time", 0.0) or 0.0)
+                        except (TypeError, ValueError):
+                            continue
+                        if np.isfinite(wait_s) and wait_s >= 0.0:
+                            movement_waits[movement].append(wait_s)
+        phase_lanes = {
+            "ETWT": ("ET", "WT"), "NTST": ("NT", "ST"),
+            "ELWL": ("EL", "WL"), "NLSL": ("NL", "SL"),
+        }
+        p95, maximum = {}, {}
+        for phase, movements in phase_lanes.items():
+            values = [value for movement in movements for value in movement_waits[movement]]
+            p95[phase] = float(np.quantile(values, 0.95)) if values else 0.0
+            maximum[phase] = float(max(values)) if values else 0.0
+        return p95, maximum
 
     def _apply_max_phase_override(
         self,
@@ -875,11 +931,34 @@ class ProjectionPolicyRunner:
         output_dir = os.path.dirname(self._traffic_series_output_path) or self.dic_path["PATH_TO_WORK_DIRECTORY"]
         snapshot_dir = os.path.join(output_dir, "snapshots")
         os.makedirs(snapshot_dir, exist_ok=True)
-        rand_tag = uuid.uuid4().hex[:8]
-        snapshot_name = f"snapshot_t{int(current_time_s)}_b{current_bin}_{rand_tag}.json"
-        snapshot_path = os.path.join(snapshot_dir, snapshot_name)
-        archive = self.env.eng.snapshot()
-        archive.dump(snapshot_path)
+
+        # CityFlow's Archive.dump() is intermittently flaky (writes empty or
+        # truncated files, e.g. 0-byte or mid-JSON cutoffs). Re-snapshot + re-dump
+        # to a fresh path until we produce a complete, parseable JSON file so the
+        # downstream relabel/train steps never read a corrupt snapshot.
+        snapshot_path = None
+        for _attempt in range(5):
+            rand_tag = uuid.uuid4().hex[:8]
+            candidate = os.path.join(
+                snapshot_dir,
+                f"snapshot_t{int(current_time_s)}_b{current_bin}_{rand_tag}.json",
+            )
+            archive = self.env.eng.snapshot()
+            archive.dump(candidate)
+            try:
+                with open(candidate, "rb") as _fh:
+                    json.load(_fh)
+                snapshot_path = candidate
+                break
+            except Exception:
+                continue
+
+        if snapshot_path is None:
+            snapshot_path = candidate
+            self.logger.warning(
+                "snapshot dump still invalid at t=%s after retries", current_time_s,
+            )
+
         self._snapshot_last_written_bin = current_bin
         # self.env.eng.load_from_file(snapshot_path)
         return snapshot_path
@@ -906,54 +985,35 @@ class ProjectionPolicyRunner:
             window = [list(pad_item) for _ in range(self.runtime.seq_len - len(window))] + window
         return window
 
-    def _predict_actions(
+    def predict_from_sequences(
         self,
-        current_states: Sequence[Dict[str, Any]],
-        current_time_s: float,
+        sequences: Sequence[Sequence[Sequence[float]]],
+        policy_prompts: Sequence[str],
     ) -> Dict[str, Any]:
-        _, movement_keys = self._resolve_series_movement_keys()
-        if not self._movement_keys_checked:
-            if len(movement_keys) != self.runtime.input_dim:
-                raise ValueError(
-                    f"Traffic series feature dim {len(movement_keys)} does not match "
-                    f"projection input_dim {self.runtime.input_dim}."
-                )
-            self._movement_keys_checked = True
+        """Score action tags for policy inputs prepared outside the online loop.
 
-        raw_prompts: list[str] = []
-        policy_prompts: list[str] = []
-        prompt_contexts: list[str] = []
-        phase_queues: list[dict[str, float]] = []
-        phase_waits: list[dict[str, float]] = []
-        sequences: list[list[list[float]]] = []
-        assert self.env is not None
-        for idx, state in enumerate(current_states):
-            raw_prompt = self._build_raw_prompt(state)
-            phase_queue, phase_wait = self._phase_queue_wait(state)
-            prompt_context = build_phase_queue_wait_context(
-                state=state,
-                phase_queue=phase_queue,
-                phase_wait=phase_wait,
+        Counterfactual replay seeds each intersection's sequence from a saved
+        decision record, then advances it in an alternate CityFlow branch.  It
+        must invoke the same model, batching, and action decoding as online
+        control, so the model call lives in this reusable method.
+        """
+        if len(sequences) != len(policy_prompts):
+            raise ValueError(
+                f"sequences/prompts length mismatch: {len(sequences)} != {len(policy_prompts)}"
             )
-            policy_prompt = build_task_prompt(
-                raw_prompt,
-                mode=self.prompt_mode,
-                action_tags=ACTION_LIST,
-                traffic_context=prompt_context,
-            )
-            history = self._build_traffic_series_history(self.env.list_intersection[idx].inter_name, current_time_s)
-            sequences.append(self._history_to_sequence(history, movement_keys))
-            raw_prompts.append(raw_prompt)
-            policy_prompts.append(policy_prompt)
-            prompt_contexts.append(prompt_context)
-            phase_queues.append(phase_queue)
-            phase_waits.append(phase_wait)
+        if not sequences:
+            return {
+                "action_indices": [],
+                "predicted_actions": [],
+                "logits": [],
+                "probs": [],
+            }
 
-        assert self.policy is not None
         batch_size = self.inference_batch_size or len(sequences)
         action_indices: list[int] = []
         logits_payload: list[dict[str, float]] = []
         probs_payload: list[dict[str, float]] = []
+        assert self.policy is not None
         for start_idx in range(0, len(sequences), batch_size):
             end_idx = min(start_idx + batch_size, len(sequences))
             sequence_tensor = torch.tensor(
@@ -977,17 +1037,72 @@ class ProjectionPolicyRunner:
                 for row_idx in range(probs.shape[0])
             )
 
-        predicted_actions = [index_to_action(index) for index in action_indices]
+        return {
+            "action_indices": action_indices,
+            "predicted_actions": [index_to_action(index) for index in action_indices],
+            "logits": logits_payload,
+            "probs": probs_payload,
+        }
+
+    def _predict_actions(
+        self,
+        current_states: Sequence[Dict[str, Any]],
+        current_time_s: float,
+    ) -> Dict[str, Any]:
+        _, movement_keys = self._resolve_series_movement_keys()
+        if not self._movement_keys_checked:
+            if len(movement_keys) != self.runtime.input_dim:
+                raise ValueError(
+                    f"Traffic series feature dim {len(movement_keys)} does not match "
+                    f"projection input_dim {self.runtime.input_dim}."
+                )
+            self._movement_keys_checked = True
+
+        raw_prompts: list[str] = []
+        policy_prompts: list[str] = []
+        prompt_contexts: list[str] = []
+        phase_queues: list[dict[str, float]] = []
+        phase_waits: list[dict[str, float]] = []
+        phase_wait_p95s: list[dict[str, float]] = []
+        phase_wait_maxes: list[dict[str, float]] = []
+        sequences: list[list[list[float]]] = []
+        assert self.env is not None
+        for idx, state in enumerate(current_states):
+            raw_prompt = self._build_raw_prompt(state)
+            phase_queue, phase_wait = self._phase_queue_wait(state)
+            phase_wait_p95, phase_wait_max = self._phase_wait_tail(self.env.list_intersection[idx].inter_name)
+            prompt_context = build_phase_queue_wait_context(
+                state=state,
+                phase_queue=phase_queue,
+                phase_wait=phase_wait,
+            )
+            policy_prompt = build_task_prompt(
+                raw_prompt,
+                mode=self.prompt_mode,
+                action_tags=ACTION_LIST,
+                traffic_context=prompt_context,
+            )
+            history = self._build_traffic_series_history(self.env.list_intersection[idx].inter_name, current_time_s)
+            sequences.append(self._history_to_sequence(history, movement_keys))
+            raw_prompts.append(raw_prompt)
+            policy_prompts.append(policy_prompt)
+            prompt_contexts.append(prompt_context)
+            phase_queues.append(phase_queue)
+            phase_waits.append(phase_wait)
+            phase_wait_p95s.append(phase_wait_p95)
+            phase_wait_maxes.append(phase_wait_max)
+
+        policy_output = self.predict_from_sequences(sequences, policy_prompts)
         return {
             "raw_prompts": raw_prompts,
             "policy_prompts": policy_prompts,
             "prompt_contexts": prompt_contexts,
             "phase_queues": phase_queues,
             "phase_waits": phase_waits,
-            "action_indices": action_indices,
-            "predicted_actions": predicted_actions,
-            "logits": logits_payload,
-            "probs": probs_payload,
+            "phase_wait_p95s": phase_wait_p95s,
+            "phase_wait_maxes": phase_wait_maxes,
+            "sequences": sequences,
+            **policy_output,
         }
 
     def get_norm_reward(self, state: Sequence[Dict[str, Any]]) -> list[float]:
@@ -1023,6 +1138,10 @@ class ProjectionPolicyRunner:
         total_reward = 0.0
         queue_length_episode: list[float] = []
         waiting_time_episode: list[float] = []
+        # One value per vehicle: the longest continuous stopped interval that
+        # CityFlow exposed at an action boundary. This is distinct from the
+        # existing time-average over the current waiting set.
+        vehicle_max_observed_wait: Dict[str, float] = {}
         current_time = self.env.get_current_time()
 
         start_time = time.time()
@@ -1063,6 +1182,9 @@ class ProjectionPolicyRunner:
             prompt_contexts = prediction.get("prompt_contexts", [])
             phase_queues = prediction.get("phase_queues", [])
             phase_waits = prediction.get("phase_waits", [])
+            phase_wait_p95s = prediction.get("phase_wait_p95s", [])
+            phase_wait_maxes = prediction.get("phase_wait_maxes", [])
+            sequences = prediction.get("sequences", [])
             logits_payload = prediction["logits"]
             probs_payload = prediction["probs"]
             snapshot_paths = [snapshot_path or "" for _ in range(len(action_list))]
@@ -1080,6 +1202,10 @@ class ProjectionPolicyRunner:
                     state_action_log[idx][-1]["phase_queue"] = phase_queues[idx]
                 if idx < len(phase_waits):
                     state_action_log[idx][-1]["phase_wait"] = phase_waits[idx]
+                if idx < len(phase_wait_p95s):
+                    state_action_log[idx][-1]["phase_wait_p95"] = phase_wait_p95s[idx]
+                if idx < len(phase_wait_maxes):
+                    state_action_log[idx][-1]["phase_wait_max"] = phase_wait_maxes[idx]
                 state_action_log[idx][-1]["action_logits"] = logits_payload[idx]
                 state_action_log[idx][-1]["action_probs"] = probs_payload[idx]
                 if idx < len(override_diagnostics):
@@ -1097,6 +1223,44 @@ class ProjectionPolicyRunner:
                 phase_waits=phase_waits,
             )
 
+            # Collect states for Stage 3 cross-network adaptation (SimExpert relabeling)
+            if self.collect_states_output:
+                for idx in range(len(state)):
+                    inter_id = self.env.list_intersection[idx].inter_name
+                    # Serialize the EXACT canonical sequence fed to the policy
+                    seq = sequences[idx] if idx < len(sequences) else []
+                    # Also build movement_counts dict for SimExpert compatibility
+                    movement_keys_list = (
+                        self._traffic_series_movement_keys
+                        or ["NT", "NL", "ST", "SL", "ET", "EL", "WT", "WL"]
+                    )
+                    movement_counts = {}
+                    if seq and len(seq) > 0 and len(seq[-1]) == len(movement_keys_list):
+                        last_row = seq[-1]
+                        for mk_idx, key in enumerate(movement_keys_list):
+                            movement_counts[key] = float(last_row[mk_idx])
+                    record = {
+                        "intersection_id": inter_id,
+                        "time_s": float(current_time),
+                        "movement_counts": movement_counts,
+                        "sequences": seq,  # The exact canonical 16x8 tensor rows
+                        "movement_keys": movement_keys_list,
+                        "prompt": policy_prompts[idx] if idx < len(policy_prompts) else "",
+                        "prompt_context": prompt_contexts[idx] if idx < len(prompt_contexts) else "",
+                        "phase_queue": phase_queues[idx] if idx < len(phase_queues) else {},
+                        "phase_wait": phase_waits[idx] if idx < len(phase_waits) else {},
+                        "phase_wait_p95": phase_wait_p95s[idx] if idx < len(phase_wait_p95s) else {},
+                        "phase_wait_max": phase_wait_maxes[idx] if idx < len(phase_wait_maxes) else {},
+                        "policy_action": policy_predicted_actions[idx] if idx < len(policy_predicted_actions) else "",
+                        "snapshot_path": snapshot_paths[idx] if idx < len(snapshot_paths) else "",
+                        "traffic_file": str(self.trafficflow),
+                        "dataset": str(self.roadnet),
+                    }
+                    if self._collect_states_fh is None:
+                        os.makedirs(os.path.dirname(self.collect_states_output) or ".", exist_ok=True)
+                        self._collect_states_fh = open(self.collect_states_output, "a", encoding="utf-8")
+                    self._collect_states_fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+
             next_state, _, done, _ = self.env.step(action_list)
             rewards = self.get_norm_reward(next_state)
             current_time = self.env.get_current_time()
@@ -1112,6 +1276,14 @@ class ProjectionPolicyRunner:
                 self.env.waiting_vehicle_list[veh]["time"] for veh in self.env.waiting_vehicle_list
             ]
             waiting_time_episode.append(np.mean(waiting_times) if waiting_times else 0.0)
+            for vehicle_id, vehicle_info in self.env.waiting_vehicle_list.items():
+                vehicle_id = str(vehicle_id)
+                if "shadow" in vehicle_id:
+                    continue
+                wait_s = float(vehicle_info.get("time", 0.0) or 0.0)
+                vehicle_max_observed_wait[vehicle_id] = max(
+                    vehicle_max_observed_wait.get(vehicle_id, 0.0), wait_s
+                )
             self.logger.info("Queuing Vehicles: %s", sum(queue_length_episode))
 
         vehicle_travel_times: Dict[str, list[float]] = {}
@@ -1138,6 +1310,13 @@ class ProjectionPolicyRunner:
             "test_queuing_vehicle_num_over": float(np.sum(queue_length_episode) if queue_length_episode else 0.0),
             "test_avg_waiting_time_over": float(np.mean(waiting_time_episode) if waiting_time_episode else 0.0),
             "test_avg_travel_time_over": float(total_travel_time),
+            "test_vehicle_wait_p95_over": float(
+                np.percentile(list(vehicle_max_observed_wait.values()), 95)
+                if vehicle_max_observed_wait
+                else 0.0
+            ),
+            "test_vehicle_wait_max_over": float(max(vehicle_max_observed_wait.values(), default=0.0)),
+            "test_vehicle_wait_observed_vehicle_count": float(len(vehicle_max_observed_wait)),
         }
         self.logger.info(
             "Test results: %s",
@@ -1174,6 +1353,10 @@ class ProjectionPolicyRunner:
         dump_json(state_action_log, state_action_path)
         self.logger.info("Testing time: %.4f", time.time() - start_time)
         self.env.batch_log_2()
+        if self._collect_states_fh is not None:
+            self._collect_states_fh.close()
+            self._collect_states_fh = None
+            self.logger.info("Collected states written to %s", self.collect_states_output)
         return results
 
     def train_test(self) -> Dict[str, float]:
@@ -1259,8 +1442,26 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--bf16", action="store_true", default=False)
     parser.add_argument("--fp16", action="store_true", default=False)
+    parser.add_argument(
+        "--deterministic",
+        action="store_true",
+        default=False,
+        help="Require deterministic PyTorch CUDA kernels for comparable online seed runs.",
+    )
     parser.add_argument("--use_wandb", action="store_true", default=False)
     parser.add_argument("--eightphase", action="store_true", default=False)
+    parser.add_argument(
+        "--collect_states_output",
+        type=str,
+        default="",
+        help="If set, write decision-point states to this JSONL file for SimExpert relabeling.",
+    )
+    parser.add_argument(
+        "--disable_snapshots",
+        action="store_true",
+        default=False,
+        help="Skip CityFlow archive snapshots when the run only needs closed-loop metrics.",
+    )
     return parser.parse_args()
 
 
@@ -1271,8 +1472,16 @@ def _write_result_json(path: str, payload: Dict[str, Any]) -> None:
     output_dir = os.path.dirname(target)
     if output_dir:
         os.makedirs(output_dir, exist_ok=True)
-    with open(target, "w", encoding="utf-8") as handle:
-        json.dump(payload, handle, indent=2, ensure_ascii=False)
+    temporary = f"{target}.tmp.{os.getpid()}"
+    try:
+        with open(temporary, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2, ensure_ascii=False)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, target)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
 
 
 def main(args: argparse.Namespace) -> Dict[str, Any]:
@@ -1281,12 +1490,17 @@ def main(args: argparse.Namespace) -> Dict[str, Any]:
         raise ValueError("Choose only one of --fp16 or --bf16.")
     if args.eightphase:
         raise ValueError("Stage 2/3 projection checkpoints only support the four-phase action space.")
+    if args.deterministic:
+        # Must be configured before the first CUDA kernel is launched.
+        os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
 
     seed = int(args.seed)
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
+    if args.deterministic:
+        torch.use_deterministic_algorithms(True)
 
     default_count, road_net, traffic_file_list, template = _dataset_spec(args.dataset)
     if args.traffic_file not in traffic_file_list:
@@ -1368,8 +1582,9 @@ def main(args: argparse.Namespace) -> Dict[str, Any]:
     torch_dtype = _resolve_torch_dtype(args, device)
     if device.type == "cuda":
         torch.cuda.set_device(device)
-        torch.backends.cudnn.benchmark = True
-        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.benchmark = not args.deterministic
+        torch.backends.cudnn.deterministic = bool(args.deterministic)
+        torch.backends.cuda.matmul.allow_tf32 = not args.deterministic
 
     runner = ProjectionPolicyRunner(
         dic_agent_conf=dic_agent_conf_extra,
@@ -1388,6 +1603,8 @@ def main(args: argparse.Namespace) -> Dict[str, Any]:
         max_phase_override_target_queue_floor=args.max_phase_override_target_queue_floor,
         max_phase_override_total_queue_floor=args.max_phase_override_total_queue_floor,
         inference_batch_size=args.inference_batch_size,
+        collect_states_output=args.collect_states_output,
+        record_snapshots=not args.disable_snapshots,
     )
     if runtime.input_dim != len(location_direction_dict):
         runner.logger.warning(
@@ -1398,7 +1615,31 @@ def main(args: argparse.Namespace) -> Dict[str, Any]:
     results = runner.train_test()
     payload = {
         "results": results,
+        "metric_semantics": {
+            "test_vehicle_wait_p95_over": (
+                "p95 across unique non-shadow vehicles of each vehicle's maximum continuous "
+                "waiting time observed at an action boundary"
+            ),
+            "test_vehicle_wait_max_over": (
+                "maximum across unique non-shadow vehicles of maximum continuous waiting "
+                "time observed at an action boundary"
+            ),
+            "test_vehicle_wait_observed_vehicle_count": (
+                "unique non-shadow vehicles observed waiting at least once at an action boundary"
+            ),
+        },
         "args": vars(args),
+        "artifact_hashes": {
+            "projection_ckpt_sha256": sha256_file(args.projection_ckpt),
+            "online_evaluator_sha256": sha256_file(__file__),
+        },
+        "determinism": {
+            "requested": bool(args.deterministic),
+            "torch_deterministic_algorithms": bool(torch.are_deterministic_algorithms_enabled()),
+            "cudnn_benchmark": bool(torch.backends.cudnn.benchmark),
+            "cudnn_deterministic": bool(torch.backends.cudnn.deterministic),
+            "allow_tf32": bool(torch.backends.cuda.matmul.allow_tf32),
+        },
         "runtime": asdict(runtime),
         "prompt_mode": prompt_mode,
         "work_dir": runner.dic_path["PATH_TO_WORK_DIRECTORY"],

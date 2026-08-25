@@ -170,10 +170,10 @@ def test_stable_delta_wait_delta_penalizes_growth_and_rewards_reduction() -> Non
         wait_delta=30.0,
         active_vehicle_delta=0.0,
         throughput_count=0.0,
-        queue_reward_coef=-0.35,
-        waiting_reward_coef=-0.01,
-        system_vehicle_reward_coef=-0.01,
-        throughput_reward_coef=0.02,
+        queue_reward_coef=-1.0,        # full magnitude (stable_delta uses abs)
+        waiting_reward_coef=-1.0,       # full magnitude
+        system_vehicle_reward_coef=-1.0,
+        throughput_reward_coef=1.0,
         switch_penalty=0.0,
         starvation_penalty=0.0,
         objective_weights=weights,
@@ -186,10 +186,10 @@ def test_stable_delta_wait_delta_penalizes_growth_and_rewards_reduction() -> Non
         wait_delta=-30.0,
         active_vehicle_delta=0.0,
         throughput_count=0.0,
-        queue_reward_coef=-0.35,
-        waiting_reward_coef=-0.01,
-        system_vehicle_reward_coef=-0.01,
-        throughput_reward_coef=0.02,
+        queue_reward_coef=-1.0,
+        waiting_reward_coef=-1.0,
+        system_vehicle_reward_coef=-1.0,
+        throughput_reward_coef=1.0,
         switch_penalty=0.0,
         starvation_penalty=0.0,
         objective_weights=weights,
@@ -209,16 +209,17 @@ def test_stable_delta_reward_is_clipped_for_extreme_inputs() -> None:
         wait_delta=-1000.0,
         active_vehicle_delta=-1000.0,
         throughput_count=1000.0,
-        queue_reward_coef=-0.35,
-        waiting_reward_coef=-0.01,
-        system_vehicle_reward_coef=-0.01,
-        throughput_reward_coef=0.02,
+        queue_reward_coef=-1.0,         # full magnitude
+        waiting_reward_coef=-1.0,
+        system_vehicle_reward_coef=-1.0,
+        throughput_reward_coef=1.0,
         switch_penalty=0.0,
         starvation_penalty=0.0,
         objective_weights=weights,
         reward_mode=REWARD_MODE_STABLE_DELTA,
         reward_clip=0.5,
     )
+    # With coefficient magnitudes all 1.0, terms sum to ~2.5 before clip.
     assert result["raw_reward"] > 0.5
     assert result["reward"] == pytest.approx(0.5)
 

@@ -141,18 +141,28 @@ def compute_local_shaped_reward(
             1.0,
         )
 
-        queue_reward = float(objective_weights.get(OBJECTIVE_QUEUE, 0.0)) * queue_term
-        wait_reward = float(objective_weights.get(OBJECTIVE_WAIT, 0.0)) * (
+        # In stable_delta the sign is already correct (negative for costs we
+        # want to decrease, positive for throughput).  The coefficient args
+        # act as *magnitude* scalars (abs) so that e.g. --queue_reward_coef -0.7
+        # makes the queue term 0.7× as strong, not -0.7× (which would flip the
+        # intended direction).
+        q_mag = abs(float(queue_reward_coef)) if abs(float(queue_reward_coef)) > 1e-8 else 0.0
+        w_mag = abs(float(waiting_reward_coef)) if abs(float(waiting_reward_coef)) > 1e-8 else 0.0
+        sv_mag = abs(float(system_vehicle_reward_coef)) if abs(float(system_vehicle_reward_coef)) > 1e-8 else 0.0
+        th_mag = abs(float(throughput_reward_coef)) if abs(float(throughput_reward_coef)) > 1e-8 else 0.0
+
+        queue_reward = float(objective_weights.get(OBJECTIVE_QUEUE, 0.0)) * q_mag * queue_term
+        wait_reward = float(objective_weights.get(OBJECTIVE_WAIT, 0.0)) * w_mag * (
             wait_term + float(wait_abs_coef) * wait_abs_term
         )
         system_vehicle_reward = (
             float(objective_weights.get(OBJECTIVE_TRAVEL, 0.0))
-            * 0.5
+            * sv_mag * 0.5
             * active_vehicle_term
         )
         throughput_reward = (
             float(objective_weights.get(OBJECTIVE_TRAVEL, 0.0))
-            * 0.5
+            * th_mag * 0.5
             * throughput_term
         )
         travel_reward = float(system_vehicle_reward + throughput_reward)

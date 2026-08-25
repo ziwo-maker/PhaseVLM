@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import math
 import os
@@ -23,6 +24,13 @@ if _REPO_ROOT not in sys.path:
 
 from data_split import blocked_group_subset, stratified_label_subset
 from projection_train.action_space import ACTION_LIST, action_to_index
+from projection_train.cost_ranking import (
+    DEFAULT_COST_WEIGHTS,
+    base_action_kl_loss,
+    build_candidate_costs,
+    cost_soft_targets,
+    pairwise_cost_ranking_loss,
+)
 from projection_train.grouped_dataset import GroupedTrafficActionDataset, grouped_action_collate
 from projection_train.prefix_action_policy import PrefixActionPolicy
 from projection_train.prompt_utils import PROMPT_MODES, build_task_prompt
@@ -128,11 +136,16 @@ def split_dataset(
     val_ratio: float,
     seed: int,
     split_strategy: str,
+    validation_purge_samples: int = 0,
 ) -> Tuple[Subset, Subset | None]:
     if len(dataset) == 0:
         raise RuntimeError("No grouped samples found for Stage 2 training.")
     if split_strategy == "blocked":
-        return blocked_group_subset(dataset, val_ratio=val_ratio)
+        return blocked_group_subset(
+            dataset,
+            val_ratio=val_ratio,
+            purge_samples=validation_purge_samples,
+        )
     if split_strategy == "stratified":
         return stratified_label_subset(
             dataset,
@@ -212,6 +225,35 @@ def _compute_overconf_penalty(logits: torch.Tensor) -> torch.Tensor:
     return excess.sum()
 
 
+def base_policy_kl_mask(
+    base_actions: Sequence[str],
+    expert_actions: Sequence[str],
+    sample_weights: torch.Tensor,
+    mode: str,
+    low_weight_threshold: float,
+    device: torch.device,
+) -> torch.Tensor:
+    """Select rows where the conservative base-action prior should apply."""
+    if mode == "all":
+        return torch.ones((len(base_actions),), dtype=torch.bool, device=device)
+
+    match_mask = torch.tensor(
+        [
+            str(base_action) in ACTION_LIST and str(base_action) == str(expert_action)
+            for base_action, expert_action in zip(base_actions, expert_actions)
+        ],
+        dtype=torch.bool,
+        device=device,
+    )
+    if mode == "expert_match":
+        return match_mask
+    if mode == "low_weight":
+        return sample_weights <= float(low_weight_threshold)
+    if mode == "match_or_low_weight":
+        return match_mask | (sample_weights <= float(low_weight_threshold))
+    raise ValueError(f"Unsupported base policy KL mode: {mode}")
+
+
 def build_soft_targets(
     raw_waits_batch: Sequence[Dict[str, float]],
     device: torch.device,
@@ -257,6 +299,10 @@ def build_soft_targets(
     scaled = scaled.masked_fill(~finite_mask, float("-inf"))
     soft_targets = torch.softmax(scaled, dim=-1)
     return soft_targets, valid_mask
+
+
+def weighted_mean(values: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
+    return (values * weights).sum() / weights.sum().clamp_min(1e-8)
 
 
 def format_prompts(
@@ -313,9 +359,10 @@ def sync_epoch_stats(
     class_correct: torch.Tensor,
     class_total: torch.Tensor,
     class_pred_total: torch.Tensor,
-) -> Tuple[float, int, int, torch.Tensor, torch.Tensor, torch.Tensor]:
+    cost_stats: torch.Tensor,
+) -> Tuple[float, int, int, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     if not ddp:
-        return total_loss, total_correct, total_count, class_correct, class_total, class_pred_total
+        return total_loss, total_correct, total_count, class_correct, class_total, class_pred_total, cost_stats
 
     stats = torch.tensor([total_loss, float(total_correct), float(total_count)], device=device, dtype=torch.float64)
     dist.all_reduce(stats, op=dist.ReduceOp.SUM)
@@ -324,7 +371,17 @@ def sync_epoch_stats(
         tensor = item.to(device=device, dtype=torch.long)
         dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
         tensors.append(tensor.cpu())
-    return float(stats[0].item()), int(stats[1].item()), int(stats[2].item()), tensors[0], tensors[1], tensors[2]
+    synced_cost_stats = cost_stats.to(device=device, dtype=torch.float64)
+    dist.all_reduce(synced_cost_stats, op=dist.ReduceOp.SUM)
+    return (
+        float(stats[0].item()),
+        int(stats[1].item()),
+        int(stats[2].item()),
+        tensors[0],
+        tensors[1],
+        tensors[2],
+        synced_cost_stats.cpu(),
+    )
 
 
 def save_checkpoint(
@@ -341,15 +398,33 @@ def save_checkpoint(
     checkpoint = {
         "ts_projector": model.ts_projector.state_dict(),
         "vision_projector": model.vision_projector.state_dict(),
-        "optimizer": optimizer.state_dict(),
         "epoch": epoch,
         "metrics": metrics,
         "args": vars(args),
     }
+    if not getattr(args, "checkpoint_slim", False):
+        checkpoint["optimizer"] = optimizer.state_dict()
+    if model.topology_encoder is not None:
+        checkpoint["topology_encoder"] = model.topology_encoder.state_dict()
     if selection is not None:
         checkpoint["checkpoint_selection"] = selection
     path = os.path.join(output_dir, filename)
     torch.save(checkpoint, path)
+    return path
+
+
+def append_metrics_jsonl(
+    output_dir: str,
+    epoch: int,
+    metrics: Dict[str, float],
+    selection: Dict[str, Any],
+) -> str:
+    os.makedirs(output_dir, exist_ok=True)
+    path = os.path.join(output_dir, "metrics.jsonl")
+    payload = {"epoch": int(epoch), "selection": selection}
+    payload.update({key: float(value) for key, value in sorted(metrics.items())})
+    with open(path, "a", encoding="utf-8") as handle:
+        handle.write(json.dumps(payload, sort_keys=True) + "\n")
     return path
 
 
@@ -368,7 +443,7 @@ def resolve_best_monitor(metrics: Dict[str, float], args: argparse.Namespace) ->
 
     mode = str(args.best_mode or "auto").strip().lower()
     if mode == "auto":
-        mode = "min" if metric_name.endswith("_loss") else "max"
+        mode = "min" if metric_name.endswith(("_loss", "_cost", "_regret")) else "max"
     if mode not in {"max", "min"}:
         raise ValueError(f"Unsupported best checkpoint mode: {args.best_mode}")
     return metric_name, mode, float(metrics[metric_name])
@@ -439,6 +514,7 @@ def run_epoch(
     class_correct = torch.zeros(len(ACTION_LIST), dtype=torch.long)
     class_total = torch.zeros(len(ACTION_LIST), dtype=torch.long)
     class_pred_total = torch.zeros(len(ACTION_LIST), dtype=torch.long)
+    cost_stats = torch.zeros(9, dtype=torch.float64)  # [8] = invalid-pred count
     global_step = global_step_start
     num_batches = len(loader)
     epoch_started_at = time.time()
@@ -469,24 +545,120 @@ def run_epoch(
         with sync_context:
             with torch.set_grad_enabled(is_train):
                 with torch.cuda.amp.autocast(enabled=amp_dtype is not None, dtype=amp_dtype):
-                    logits = model(sequences, prompts)
-                    hard_loss = F.cross_entropy(logits, labels, weight=class_weights)
-                    raw_loss = hard_loss
+                    intersection_ids = batch.get("intersection_id", None)
+                    traffic_files = batch.get("traffic_file", None)
+                    # Derive dataset hints for topology adapter
+                    dataset_hints = None
+                    _model = model.module if hasattr(model, "module") else model
+                    if traffic_files and _model.enable_topology_adapter:
+                        from projection_train.topology_adapter import IntersectionTopologyEncoder
+                        dataset_hints = IntersectionTopologyEncoder.dataset_hints_from_batch(
+                            list(traffic_files), intersection_ids
+                        )
+                    logits = model(
+                        sequences, prompts,
+                        intersection_ids=intersection_ids,
+                        dataset_hints=dataset_hints,
+                    )
+                    raw_sample_weights = batch.get("sample_weight")
+                    if raw_sample_weights is None:
+                        sample_weight_values = torch.ones(labels.size(0), device=device, dtype=torch.float32)
+                    else:
+                        sample_weight_values = raw_sample_weights.to(device=device, dtype=torch.float32).clamp_min(0.0)
+                    loss_weights = (
+                        sample_weight_values
+                        if is_train
+                        else torch.ones(labels.size(0), device=device, dtype=torch.float32)
+                    )
+                    hard_loss_all = F.cross_entropy(
+                        logits,
+                        labels,
+                        weight=class_weights,
+                        reduction="none",
+                    )
+                    raw_loss_all = hard_loss_all
+                    candidate_costs = None
+                    candidate_valid = None
                     if args.target_mode != "hard":
-                        soft_targets, soft_valid = build_soft_targets(
+                        candidate_costs, candidate_valid = build_candidate_costs(
+                            batch.get("candidate_action_metrics", []),
                             batch["candidate_action_waits"],
                             device=device,
-                            temperature=args.soft_label_temperature,
+                            weights={
+                                "att": args.cost_att_weight,
+                                "aql": args.cost_aql_weight,
+                                "awt": args.cost_awt_weight,
+                                "spillback": args.cost_spillback_weight,
+                                "tail_wait": args.cost_tail_wait_weight,
+                            },
+                            pareto_feasible_batch=batch.get("pareto_feasible"),
                         )
-                        if soft_targets is not None and soft_valid is not None:
+                        soft_valid = candidate_valid.sum(dim=-1) >= 2
+                        if bool(soft_valid.any().item()):
+                            soft_targets = cost_soft_targets(
+                                candidate_costs,
+                                candidate_valid,
+                                temperature=args.soft_label_temperature,
+                            )
                             log_probs = F.log_softmax(logits, dim=-1)
                             soft_loss_all = -(soft_targets * log_probs).sum(dim=-1)
-                            soft_loss = soft_loss_all[soft_valid].mean()
                             if args.target_mode == "soft":
-                                raw_loss = soft_loss
+                                raw_loss_all = torch.where(soft_valid, soft_loss_all, hard_loss_all)
                             else:
                                 alpha = float(args.soft_target_alpha)
-                                raw_loss = (1.0 - alpha) * hard_loss + alpha * soft_loss
+                                mixed_loss = (1.0 - alpha) * hard_loss_all + alpha * soft_loss_all
+                                raw_loss_all = torch.where(soft_valid, mixed_loss, hard_loss_all)
+
+                    if args.ranking_loss_weight > 0.0:
+                        if candidate_costs is None or candidate_valid is None:
+                            candidate_costs, candidate_valid = build_candidate_costs(
+                                batch.get("candidate_action_metrics", []),
+                                batch["candidate_action_waits"],
+                                device=device,
+                                weights={
+                                    "att": args.cost_att_weight,
+                                    "aql": args.cost_aql_weight,
+                                    "awt": args.cost_awt_weight,
+                                    "spillback": args.cost_spillback_weight,
+                                    "tail_wait": args.cost_tail_wait_weight,
+                                },
+                                pareto_feasible_batch=batch.get("pareto_feasible"),
+                            )
+                        ranking_loss_all, ranking_valid = pairwise_cost_ranking_loss(
+                            logits,
+                            candidate_costs,
+                            candidate_valid,
+                            min_gap=args.ranking_min_cost_gap,
+                            margin=args.ranking_margin,
+                        )
+                        raw_loss_all = raw_loss_all + args.ranking_loss_weight * torch.where(
+                            ranking_valid,
+                            ranking_loss_all,
+                            torch.zeros_like(ranking_loss_all),
+                        )
+
+                    if args.base_policy_kl_weight > 0.0:
+                        kl_loss_all, kl_valid = base_action_kl_loss(
+                            logits,
+                            batch.get("base_action", []),
+                            prior_mass=args.base_policy_prior_mass,
+                        )
+                        kl_mask = base_policy_kl_mask(
+                            batch.get("base_action", []),
+                            batch.get("expert_action", []),
+                            sample_weight_values,
+                            mode=args.base_policy_kl_mode,
+                            low_weight_threshold=args.base_policy_kl_low_weight_threshold,
+                            device=device,
+                        )
+                        kl_valid = kl_valid & kl_mask
+                        raw_loss_all = raw_loss_all + args.base_policy_kl_weight * torch.where(
+                            kl_valid,
+                            kl_loss_all,
+                            torch.zeros_like(kl_loss_all),
+                        )
+
+                    raw_loss = weighted_mean(raw_loss_all, loss_weights)
                     if getattr(args, "action_balance_weight", 0.0) > 0:
                         raw_loss = raw_loss + args.action_balance_weight * _compute_action_balance_loss(logits)
                     if getattr(args, "overconf_penalty_weight", 0.0) > 0:
@@ -519,6 +691,70 @@ def run_epoch(
             total_correct += int((preds == labels).sum().item())
             total_count += int(labels.size(0))
             update_class_stats(preds, labels, class_correct, class_total, class_pred_total)
+            if candidate_costs is None or candidate_valid is None:
+                candidate_costs, candidate_valid = build_candidate_costs(
+                    batch.get("candidate_action_metrics", []),
+                    batch["candidate_action_waits"],
+                    device=device,
+                    weights={
+                        "att": args.cost_att_weight,
+                        "aql": args.cost_aql_weight,
+                        "awt": args.cost_awt_weight,
+                        "spillback": args.cost_spillback_weight,
+                        "tail_wait": args.cost_tail_wait_weight,
+                    },
+                    pareto_feasible_batch=batch.get("pareto_feasible"),
+                )
+            metric_valid = candidate_valid.sum(dim=-1) >= 2
+            if bool(metric_valid.any().item()):
+                safe_costs = candidate_costs.masked_fill(~candidate_valid, float("inf"))
+                oracle_cost = safe_costs.amin(dim=-1)
+                pred_cost_raw = candidate_costs.gather(1, preds.view(-1, 1)).squeeze(1)
+                label_cost = candidate_costs.gather(1, labels.view(-1, 1)).squeeze(1)
+                pred_valid = candidate_valid.gather(1, preds.view(-1, 1)).squeeze(1)
+                label_valid = candidate_valid.gather(1, labels.view(-1, 1)).squeeze(1)
+                # Infeasible predictions are penalized, NOT dropped: cost =
+                # worst feasible cost + one feasible-range gap + 1.0. Dropping
+                # them lets a model game the selection metric by predicting
+                # infeasible actions (they disappear from the regret).
+                worst_feasible = (
+                    candidate_costs.masked_fill(~candidate_valid, float("-inf")).amax(dim=-1)
+                )
+                infeasible_penalty = (
+                    (worst_feasible - oracle_cost).clamp_min(0.0) + 1.0
+                )
+                pred_cost = torch.where(
+                    pred_valid, pred_cost_raw, worst_feasible + infeasible_penalty
+                )
+                probs = F.softmax(logits.float(), dim=-1)
+                valid_probs = probs * candidate_valid.to(dtype=probs.dtype)
+                valid_prob_mass = valid_probs.sum(dim=-1).clamp_min(1e-8)
+                expected_cost = (
+                    valid_probs * candidate_costs.masked_fill(~candidate_valid, 0.0)
+                ).sum(dim=-1) / valid_prob_mass
+                metric_valid = (
+                    metric_valid
+                    & label_valid
+                    & torch.isfinite(oracle_cost)
+                    & torch.isfinite(pred_cost)
+                    & torch.isfinite(label_cost)
+                    & torch.isfinite(expected_cost)
+                )
+                if bool(metric_valid.any().item()):
+                    selected_oracle = oracle_cost[metric_valid].double()
+                    selected_top1 = pred_cost[metric_valid].double()
+                    selected_label = label_cost[metric_valid].double()
+                    selected_expected = expected_cost[metric_valid].double()
+                    selected_pred_valid = pred_valid[metric_valid]
+                    cost_stats[0] += float(metric_valid.sum().item())
+                    cost_stats[1] += selected_top1.sum().cpu()
+                    cost_stats[2] += selected_oracle.sum().cpu()
+                    cost_stats[3] += selected_label.sum().cpu()
+                    cost_stats[4] += selected_expected.sum().cpu()
+                    cost_stats[5] += (selected_top1 - selected_oracle).sum().cpu()
+                    cost_stats[6] += (selected_expected - selected_oracle).sum().cpu()
+                    cost_stats[7] += (selected_label - selected_oracle).sum().cpu()
+                    cost_stats[8] += float((~selected_pred_valid).sum().item())
 
         should_log_step = (
             rank == 0
@@ -546,7 +782,7 @@ def run_epoch(
                 global_step,
             )
 
-    total_loss, total_correct, total_count, class_correct, class_total, class_pred_total = sync_epoch_stats(
+    total_loss, total_correct, total_count, class_correct, class_total, class_pred_total, cost_stats = sync_epoch_stats(
         ddp=ddp,
         device=device,
         total_loss=total_loss,
@@ -555,12 +791,28 @@ def run_epoch(
         class_correct=class_correct,
         class_total=class_total,
         class_pred_total=class_pred_total,
+        cost_stats=cost_stats,
     )
     metrics = {
         "loss": total_loss / max(1, total_count),
         "acc": total_correct / max(1, total_count),
         "macro_f1": macro_f1(class_correct, class_total, class_pred_total),
     }
+    cost_count = float(cost_stats[0].item())
+    if cost_count > 0.0:
+        metrics.update(
+            {
+                "cost_count": cost_count,
+                "top1_cost": float(cost_stats[1].item() / cost_count),
+                "oracle_cost": float(cost_stats[2].item() / cost_count),
+                "label_cost": float(cost_stats[3].item() / cost_count),
+                "expected_cost": float(cost_stats[4].item() / cost_count),
+                "top1_cost_regret": float(cost_stats[5].item() / cost_count),
+                "expected_cost_regret": float(cost_stats[6].item() / cost_count),
+                "label_cost_regret": float(cost_stats[7].item() / cost_count),
+                "invalid_action_rate": float(cost_stats[8].item() / cost_count),
+            }
+        )
     return metrics, global_step
 
 
@@ -571,6 +823,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--val_data_path", type=str, nargs="+", default=None)
     parser.add_argument("--llm_path", type=str, required=True)
     parser.add_argument("--align_ckpt", type=str, required=True)
+    parser.add_argument(
+        "--allow_mismatched_align_projectors",
+        action="store_true",
+        default=False,
+        help=(
+            "Allow cross-architecture alignment transfer by skipping incompatible "
+            "projector tensors. Intended only for explicit capacity ablations."
+        ),
+    )
+    parser.add_argument(
+        "--init_policy_ckpt", type=str, default="",
+        help="Optional Stage 2 checkpoint to initialize trainable weights from. "
+             "Loads prefix/TS2I weights (not optimizer state) for few-shot adaptation.",
+    )
     parser.add_argument("--output_dir", type=str, default="records/projection_bc")
     parser.add_argument("--intersection_id", type=str, default="")
     parser.add_argument("--seq_len", type=int, default=16)
@@ -598,6 +864,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max_grad_norm", type=float, default=1.0)
     parser.add_argument("--val_ratio", type=float, default=0.1)
     parser.add_argument(
+        "--validation_purge_samples",
+        type=int,
+        default=0,
+        help=(
+            "For blocked validation, discard this many boundary samples before "
+            "the held-out suffix so temporal histories cannot cross the split."
+        ),
+    )
+    parser.add_argument(
         "--split_strategy",
         type=str,
         default="stratified",
@@ -613,6 +888,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--log_interval", type=int, default=20)
     parser.add_argument("--save_every", type=int, default=1)
     parser.add_argument(
+        "--checkpoint_slim",
+        action="store_true",
+        default=False,
+        help="Omit optimizer state from saved checkpoints (reproduce/eval only, no resume).",
+    )
+    parser.add_argument(
         "--best_metric",
         type=str,
         default="val_macro_f1",
@@ -620,9 +901,15 @@ def parse_args() -> argparse.Namespace:
             "val_macro_f1",
             "val_acc",
             "val_loss",
+            "val_top1_cost_regret",
+            "val_expected_cost_regret",
+            "val_top1_cost",
             "train_macro_f1",
             "train_acc",
             "train_loss",
+            "train_top1_cost_regret",
+            "train_expected_cost_regret",
+            "train_top1_cost",
         ],
         help="Metric used to update best.pt during offline BC training.",
     )
@@ -645,13 +932,51 @@ def parse_args() -> argparse.Namespace:
         default="mixed",
         choices=["hard", "soft", "mixed"],
     )
-    parser.add_argument("--soft_target_alpha", type=float, default=0.5)
-    parser.add_argument("--soft_label_temperature", type=float, default=0.5)
-    parser.add_argument("--disable_class_balance", action="store_true", default=False)
+    parser.add_argument("--soft_target_alpha", type=float, default=0.3)
+    parser.add_argument("--soft_label_temperature", type=float, default=0.35)
+    parser.add_argument(
+        "--enable_class_balance",
+        action="store_true",
+        default=False,
+        help="Opt in to inverse-frequency class weights. Disabled by default to preserve demand-conditioned priors.",
+    )
+    parser.add_argument(
+        "--disable_class_balance",
+        action="store_true",
+        default=False,
+        help="Deprecated compatibility flag; class balancing is already disabled by default.",
+    )
     parser.add_argument("--action_balance_weight", type=float, default=0.0)
     parser.add_argument("--overconf_penalty_weight", type=float, default=0.0)
     parser.add_argument("--global_action_weights", type=str, default=None)
+    parser.add_argument("--ranking_loss_weight", type=float, default=0.15)
+    parser.add_argument("--ranking_margin", type=float, default=0.0)
+    parser.add_argument("--ranking_min_cost_gap", type=float, default=0.02)
+    parser.add_argument("--base_policy_kl_weight", type=float, default=0.02)
+    parser.add_argument("--base_policy_prior_mass", type=float, default=0.70)
+    parser.add_argument(
+        "--base_policy_kl_mode",
+        type=str,
+        default="match_or_low_weight",
+        choices=["all", "expert_match", "low_weight", "match_or_low_weight"],
+        help="Rows where KL(policy || base-action prior) is applied.",
+    )
+    parser.add_argument(
+        "--base_policy_kl_low_weight_threshold",
+        type=float,
+        default=1.0,
+        help="Sample-weight threshold treated as non-DAgger/low-priority for conditional KL.",
+    )
+    parser.add_argument("--cost_att_weight", type=float, default=DEFAULT_COST_WEIGHTS["att"])
+    parser.add_argument("--cost_aql_weight", type=float, default=DEFAULT_COST_WEIGHTS["aql"])
+    parser.add_argument("--cost_awt_weight", type=float, default=DEFAULT_COST_WEIGHTS["awt"])
+    parser.add_argument("--cost_spillback_weight", type=float, default=DEFAULT_COST_WEIGHTS["spillback"])
+    parser.add_argument("--cost_tail_wait_weight", type=float, default=DEFAULT_COST_WEIGHTS["tail_wait"])
     parser.add_argument("--ddp_timeout_seconds", type=int, default=1800)
+    parser.add_argument("--enable_topology_adapter", action="store_true", default=False,
+                        help="Enable topology-conditioned intersection adapter (Ablation E)")
+    parser.add_argument("--topology_roadnet_configs", type=str, default="",
+                        help="JSON string mapping dataset names to {rows, cols} for topology adapter")
     return parser.parse_args()
 
 
@@ -662,6 +987,25 @@ def main() -> None:
         raise ValueError("Choose only one of --fp16 or --bf16")
     if args.min_lr < 0 or args.min_lr > args.lr:
         raise ValueError("--min_lr must be within [0, lr]")
+    if args.validation_purge_samples < 0:
+        raise ValueError("--validation_purge_samples must be non-negative")
+    if args.enable_class_balance and args.disable_class_balance:
+        raise ValueError("Choose at most one of --enable_class_balance and --disable_class_balance")
+    if not 0.25 <= args.base_policy_prior_mass < 1.0:
+        raise ValueError("--base_policy_prior_mass must be in [0.25, 1.0)")
+    if min(
+        args.ranking_loss_weight,
+        args.ranking_margin,
+        args.ranking_min_cost_gap,
+        args.base_policy_kl_weight,
+        args.cost_att_weight,
+        args.cost_aql_weight,
+        args.cost_awt_weight,
+        args.cost_spillback_weight,
+        args.cost_tail_wait_weight,
+        args.base_policy_kl_low_weight_threshold,
+    ) < 0.0:
+        raise ValueError("Ranking, KL, and cost weights must be non-negative")
     if bool(args.data_path) == bool(args.train_data_path):
         raise ValueError("Provide exactly one of --data_path or --train_data_path")
     if args.val_data_path and not args.train_data_path:
@@ -687,6 +1031,17 @@ def main() -> None:
             args.output_dir,
             args.log_interval,
             args.grad_accum_steps,
+        )
+        logger.info(
+            "Loss config: target_mode=%s soft_alpha=%.3f soft_temp=%.3f ranking_weight=%.3f "
+            "base_kl_weight=%.3f base_kl_mode=%s low_weight_threshold=%.3f",
+            args.target_mode,
+            args.soft_target_alpha,
+            args.soft_label_temperature,
+            args.ranking_loss_weight,
+            args.base_policy_kl_weight,
+            args.base_policy_kl_mode,
+            args.base_policy_kl_low_weight_threshold,
         )
         logger.info("Distributed timeout: %ds", args.ddp_timeout_seconds)
         if args.train_data_path:
@@ -744,6 +1099,7 @@ def main() -> None:
             val_ratio=args.val_ratio,
             seed=args.seed,
             split_strategy=args.split_strategy,
+            validation_purge_samples=args.validation_purge_samples,
         )
     if rank == 0:
         train_distribution = action_distribution(train_set)
@@ -753,10 +1109,11 @@ def main() -> None:
         else:
             total_distribution = action_distribution(dataset)
             logger.info(
-                "Split strategy: %s val_ratio=%.4f seed=%d",
+                "Split strategy: %s val_ratio=%.4f seed=%d validation_purge_samples=%d",
                 args.split_strategy,
                 args.val_ratio,
                 args.seed,
+                args.validation_purge_samples,
             )
             logger.info("Action distribution total: %s", format_action_distribution(total_distribution))
         logger.info("Action distribution train: %s", format_action_distribution(train_distribution))
@@ -771,8 +1128,10 @@ def main() -> None:
         else:
             logger.info("Action distribution val: none")
     class_weights = None
-    if not args.disable_class_balance:
+    if args.enable_class_balance:
         class_weights = compute_class_weights(train_set)
+    elif rank == 0:
+        logger.info("Class balancing: disabled (default demand-conditioned policy prior).")
     if args.global_action_weights:
         global_w = _parse_global_action_weights(args.global_action_weights)
         if global_w is not None:
@@ -862,10 +1221,33 @@ def main() -> None:
         torch_dtype=torch_dtype,
         device=device,
         with_value_head=False,
+        enable_topology_adapter=args.enable_topology_adapter,
+        topology_roadnet_configs=(
+            json.loads(args.topology_roadnet_configs)
+            if args.topology_roadnet_configs
+            else None
+        ),
     )
-    model.load_checkpoint(args.align_ckpt, load_value_head=False)
+    model.load_checkpoint(
+        args.align_ckpt,
+        load_value_head=False,
+        allow_mismatched_projectors=args.allow_mismatched_align_projectors,
+    )
     if rank == 0:
-        logger.info("Loaded alignment checkpoint and initialized trainable projectors.")
+        logger.info(
+            "Loaded alignment checkpoint and initialized trainable projectors "
+            "(allow_mismatched_align_projectors=%s).",
+            args.allow_mismatched_align_projectors,
+        )
+
+    # Optional: initialize trainable weights from a source Stage 2 checkpoint
+    # (used for few-shot target-network adaptation)
+    if args.init_policy_ckpt:
+        if rank == 0:
+            logger.info("Loading source policy weights from %s", args.init_policy_ckpt)
+        model.load_checkpoint(args.init_policy_ckpt, load_value_head=False)
+        if rank == 0:
+            logger.info("Initialized trainable weights from source Stage 2 checkpoint.")
 
     optimizer = torch.optim.AdamW(
         model.trainable_parameters(),
@@ -957,22 +1339,20 @@ def main() -> None:
                     val_metrics["acc"],
                     val_metrics["macro_f1"],
                 )
+                if "top1_cost_regret" in val_metrics:
+                    logger.info(
+                        "[epoch %d] val_top1_cost_regret=%.6f val_expected_cost_regret=%.6f val_top1_cost=%.6f",
+                        epoch + 1,
+                        val_metrics["top1_cost_regret"],
+                        val_metrics["expected_cost_regret"],
+                        val_metrics["top1_cost"],
+                    )
 
         if rank == 0:
             base_model: PrefixActionPolicy = model.module if hasattr(model, "module") else model
-            metrics = {
-                "train_loss": train_metrics["loss"],
-                "train_acc": train_metrics["acc"],
-                "train_macro_f1": train_metrics["macro_f1"],
-            }
+            metrics = {f"train_{key}": value for key, value in train_metrics.items()}
             if val_metrics is not None:
-                metrics.update(
-                    {
-                        "val_loss": val_metrics["loss"],
-                        "val_acc": val_metrics["acc"],
-                        "val_macro_f1": val_metrics["macro_f1"],
-                    }
-                )
+                metrics.update({f"val_{key}": value for key, value in val_metrics.items()})
             monitor_metric, monitor_mode, monitor_value = resolve_best_monitor(metrics, args)
             selection = {
                 "type": "offline_metric",
@@ -981,6 +1361,13 @@ def main() -> None:
                 "value": monitor_value,
                 "min_delta": float(args.best_min_delta),
             }
+            metrics_path = append_metrics_jsonl(
+                output_dir=args.output_dir,
+                epoch=epoch + 1,
+                metrics=metrics,
+                selection=selection,
+            )
+            logger.info("Wrote metrics: %s", metrics_path)
 
             last_path = save_checkpoint(
                 output_dir=args.output_dir,

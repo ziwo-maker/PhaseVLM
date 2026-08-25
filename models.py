@@ -6,7 +6,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.distributed as dist
-from transformers import AutoProcessor, AutoTokenizer
+from transformers import AutoConfig, AutoProcessor, AutoTokenizer
 
 try:
     from transformers import Qwen3VLForConditionalGeneration
@@ -120,15 +120,20 @@ class Qwen3VLBackbone(nn.Module):
         self.device = device or (torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu"))
         self.max_length = int(max_length)
         print(f"[Qwen3VLBackbone] loading processor/tokenizer from {model_path}", flush=True)
+        config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
         self.processor = AutoProcessor.from_pretrained(model_path, trust_remote_code=True)
         self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
         if self.tokenizer.pad_token_id is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
-        model_cls = self._select_model_class()
+        self.model_family = self._infer_model_family(model_path, config)
+        model_cls = self._select_model_class(self.model_family)
         if model_cls is None:
             raise RuntimeError("No compatible model class found for Qwen3-VL.")
-        print(f"[Qwen3VLBackbone] loading model with {model_cls.__name__}", flush=True)
+        print(
+            f"[Qwen3VLBackbone] loading model family={self.model_family} with {model_cls.__name__}",
+            flush=True,
+        )
         load_direct_to_device = (not fsdp_enabled) and self.device.type == "cuda"
         load_kwargs = {
             "torch_dtype": torch_dtype,
@@ -164,8 +169,21 @@ class Qwen3VLBackbone(nn.Module):
             raise RuntimeError("Failed to locate vision tower in Qwen3-VL model.")
         self._vision_input_name, self._vision_grid_name = self._infer_vision_forward_signature(self.vision_tower)
 
-    def _select_model_class(self):
-        if Qwen3VLForConditionalGeneration is not None:
+    @staticmethod
+    def _infer_model_family(model_path: str, config: Optional[Any]) -> str:
+        text = str(model_path or "").lower()
+        model_type = str(getattr(config, "model_type", "") or "").lower()
+        archs = [str(item).lower() for item in (getattr(config, "architectures", None) or [])]
+        hint = " ".join([model_type, *archs, text])
+        if "qwen3_vl" in hint or "qwen3-vl" in hint or "qwen-vl" in hint:
+            return "qwen3_vl"
+        if "qwen3_5" in hint or "qwen3.5" in hint:
+            return "qwen3_5"
+        return "auto"
+
+    @staticmethod
+    def _select_model_class(model_family: str):
+        if model_family == "qwen3_vl" and Qwen3VLForConditionalGeneration is not None:
             return Qwen3VLForConditionalGeneration
         if AutoModelForImageTextToText is not None:
             return AutoModelForImageTextToText
@@ -474,7 +492,10 @@ class Qwen3VLBackbone(nn.Module):
         return pixel_values_out, image_grid_thw
 
     def _vision_forward(
-        self, pixel_values: torch.Tensor, image_grid_thw: Optional[torch.Tensor]
+        self,
+        pixel_values: torch.Tensor,
+        image_grid_thw: Optional[torch.Tensor],
+        output_mode: str = "last_hidden_state",
     ) -> torch.Tensor:
         vt = self.vision_tower
         kwargs = {}
@@ -494,6 +515,15 @@ class Qwen3VLBackbone(nn.Module):
 
         if isinstance(out, torch.Tensor):
             return out
+        if output_mode == "pooler_output":
+            pooled = getattr(out, "pooler_output", None)
+            if isinstance(pooled, torch.Tensor):
+                return pooled
+            raise RuntimeError(
+                "Vision backbone does not expose pooler_output required by this checkpoint."
+            )
+        if output_mode != "last_hidden_state":
+            raise ValueError(f"Unsupported vision output mode: {output_mode!r}")
         if hasattr(out, "last_hidden_state"):
             return out.last_hidden_state
         if hasattr(out, "hidden_states") and out.hidden_states is not None:
@@ -603,16 +633,24 @@ class Qwen3VLBackbone(nn.Module):
         pooled = (token_states * mask).sum(dim=1) / mask.sum(dim=1).clamp_min(1.0)
         return pooled
 
-    def encode_vision_tokens(self, images: torch.Tensor) -> torch.Tensor:
+    def encode_vision_tokens(
+        self,
+        images: torch.Tensor,
+        output_mode: str = "last_hidden_state",
+    ) -> torch.Tensor:
         normalized = self._normalize_images(images)
         batch_size = normalized.shape[0]
         vision_cfg = getattr(getattr(self.model, "config", None), "vision_config", None)
         merge_size = max(1, int(getattr(vision_cfg, "spatial_merge_size", 1)))
         if self._vision_uses_patchified_inputs():
             pixel_values_out, image_grid_thw = self._patchify(normalized)
-            tokens = self._vision_forward(pixel_values_out, image_grid_thw)
+            tokens = self._vision_forward(
+                pixel_values_out,
+                image_grid_thw,
+                output_mode=output_mode,
+            )
             return self._reshape_vision_tokens(tokens, image_grid_thw, batch_size, merge_size=merge_size)
-        tokens = self._vision_forward(normalized, None)
+        tokens = self._vision_forward(normalized, None, output_mode=output_mode)
         return self._reshape_vision_tokens(tokens, None, batch_size, merge_size=merge_size)
 
 
@@ -657,7 +695,7 @@ class AlignmentModel(nn.Module):
         vision_cfg = getattr(getattr(self.backbone.model, "config", None), "vision_config", None)
         vision_dim = None
         if vision_cfg is not None:
-            for attr in ("out_hidden_size", "hidden_size", "embed_dim"):
+            for attr in ("hidden_size", "out_hidden_size", "embed_dim"):
                 value = getattr(vision_cfg, attr, None)
                 if isinstance(value, int) and value > 0:
                     vision_dim = int(value)

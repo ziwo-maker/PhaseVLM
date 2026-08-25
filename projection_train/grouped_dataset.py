@@ -41,11 +41,15 @@ class TrafficActionSample:
     traffic_file: str
     source_path: str
     candidate_action_waits: Dict[str, float]
+    candidate_action_metrics: Dict[str, Dict[str, float]]
     expert_action_margin: Optional[float]
     base_action: str
+    sample_weight: float
     phase_queue: Dict[str, float]
     phase_wait: Dict[str, float]
+    pareto_feasible: Dict[str, bool]  # Per-action Pareto feasibility from SimExpert
     meta: Dict
+    has_explicit_sequence: bool = False
 
 
 class GroupedTrafficActionDataset(Dataset):
@@ -83,6 +87,39 @@ class GroupedTrafficActionDataset(Dataset):
                 continue
         return parsed
 
+    @classmethod
+    def _parse_candidate_metrics(cls, raw_metrics: object) -> Dict[str, Dict[str, float]]:
+        if not isinstance(raw_metrics, dict):
+            return {}
+        parsed: Dict[str, Dict[str, float]] = {}
+        for action, raw_values in raw_metrics.items():
+            values = cls._parse_candidate_waits(raw_values)
+            if values:
+                parsed[str(action)] = values
+        return parsed
+
+    @staticmethod
+    def _parse_pareto_feasible(raw_pareto: object) -> Dict[str, bool]:
+        """Parse pareto_feasible dict from JSONL record."""
+        if not isinstance(raw_pareto, dict):
+            return {}
+        parsed: Dict[str, bool] = {}
+        for action, value in raw_pareto.items():
+            if isinstance(value, bool):
+                parsed[str(action)] = value
+            elif isinstance(value, (int, float)):
+                parsed[str(action)] = bool(value)
+        return parsed
+
+    @staticmethod
+    def _sample_weight(record: Dict) -> float:
+        raw_weight = record.get("sample_weight", 1.0)
+        try:
+            weight = float(raw_weight)
+        except (TypeError, ValueError):
+            weight = 1.0
+        return max(0.0, min(weight, 100.0))
+
     @staticmethod
     def _resolve_margin(record: Dict, candidate_waits: Dict[str, float]) -> Optional[float]:
         explicit = record.get("expert_action_margin")
@@ -117,11 +154,36 @@ class GroupedTrafficActionDataset(Dataset):
                     if len(history) > self.seq_len:
                         del history[:-self.seq_len]
 
+                    # Prefer explicit canonical sequence (from evaluator hook).
+                    # This guarantees parity: the dataset feeds the same tensor
+                    # the policy received during collection.
+                    explicit_sequence: Optional[List[List[float]]] = None
+                    raw_sequences = record.get("sequences")
+                    if isinstance(raw_sequences, list) and len(raw_sequences) > 0:
+                        parsed_rows: List[List[float]] = []
+                        for row in raw_sequences:
+                            if not isinstance(row, list):
+                                parsed_rows = []
+                                break
+                            try:
+                                parsed_rows.append([float(v) for v in row])
+                            except (TypeError, ValueError):
+                                parsed_rows = []
+                                break
+                        if (
+                            parsed_rows
+                            and len(parsed_rows) == self.seq_len
+                            and len(parsed_rows[0]) == len(self.movement_keys)
+                        ):
+                            explicit_sequence = parsed_rows
+
                     raw_prompt = str(record.get("prompt") or "")
                     prompt_context = str(record.get("prompt_context") or record.get("traffic_context") or "")
                     expert_action = str(record.get("expert_action") or "")
                     clip_caption = str(record.get("clip_caption") or "")
                     candidate_waits = self._parse_candidate_waits(record.get("candidate_action_waits"))
+                    candidate_metrics = self._parse_candidate_metrics(record.get("candidate_action_metrics"))
+                    pareto_feasible = self._parse_pareto_feasible(record.get("pareto_feasible"))
                     phase_queue = self._parse_candidate_waits(record.get("phase_queue"))
                     phase_wait = self._parse_candidate_waits(record.get("phase_wait"))
                     action_margin = self._resolve_margin(record, candidate_waits)
@@ -138,7 +200,8 @@ class GroupedTrafficActionDataset(Dataset):
 
                     self.samples.append(
                         TrafficActionSample(
-                            sequence=self._build_sequence(history),
+                            sequence=explicit_sequence if explicit_sequence is not None
+                                     else self._build_sequence(history),
                             raw_prompt=raw_prompt,
                             prompt_context=prompt_context,
                             expert_action=expert_action,
@@ -151,11 +214,15 @@ class GroupedTrafficActionDataset(Dataset):
                             ),
                             source_path=str(path),
                             candidate_action_waits=candidate_waits,
+                            candidate_action_metrics=candidate_metrics,
                             expert_action_margin=action_margin,
                             base_action=str(record.get("base_action") or ""),
+                            sample_weight=self._sample_weight(record),
                             phase_queue=phase_queue,
                             phase_wait=phase_wait,
+                            pareto_feasible=pareto_feasible,
                             meta=record.get("meta") or {},
+                            has_explicit_sequence=explicit_sequence is not None,
                         )
                     )
 
@@ -192,10 +259,13 @@ class GroupedTrafficActionDataset(Dataset):
             "traffic_file": sample.traffic_file,
             "source_path": sample.source_path,
             "candidate_action_waits": sample.candidate_action_waits,
+            "candidate_action_metrics": sample.candidate_action_metrics,
             "expert_action_margin": sample.expert_action_margin,
             "base_action": sample.base_action,
+            "sample_weight": sample.sample_weight,
             "phase_queue": sample.phase_queue,
             "phase_wait": sample.phase_wait,
+            "pareto_feasible": sample.pareto_feasible,
             "meta": sample.meta,
         }
 
@@ -213,8 +283,11 @@ def grouped_action_collate(batch: Sequence[Dict]) -> Dict:
         "traffic_file": [item["traffic_file"] for item in batch],
         "source_path": [item["source_path"] for item in batch],
         "candidate_action_waits": [item["candidate_action_waits"] for item in batch],
+        "candidate_action_metrics": [item["candidate_action_metrics"] for item in batch],
+        "pareto_feasible": [item["pareto_feasible"] for item in batch],
         "expert_action_margin": [item["expert_action_margin"] for item in batch],
         "base_action": [item["base_action"] for item in batch],
+        "sample_weight": torch.tensor([item["sample_weight"] for item in batch], dtype=torch.float32),
         "phase_queue": [item["phase_queue"] for item in batch],
         "phase_wait": [item["phase_wait"] for item in batch],
         "meta": [item["meta"] for item in batch],

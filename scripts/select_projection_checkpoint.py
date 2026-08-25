@@ -23,6 +23,8 @@ RESULT_KEYS = {
     "queue": "test_avg_queue_len_over",
     "waiting": "test_avg_waiting_time_over",
     "travel": "test_avg_travel_time_over",
+    "p95_wait": "test_vehicle_wait_p95_over",
+    "max_wait": "test_vehicle_wait_max_over",
 }
 
 
@@ -277,13 +279,21 @@ def _find_state_action(repo_root: Path, work_dir: str) -> Path | None:
     return matches[0] if matches else direct
 
 
-def _result_score(results: Dict[str, Any], ranking_metric: str) -> float:
+def _result_score(results: Dict[str, Any], args: argparse.Namespace) -> float:
+    ranking_metric = str(args.ranking_metric)
     if ranking_metric == "composite":
         reward = float(results.get(RESULT_KEYS["reward"], float("-inf")))
         queue = float(results.get(RESULT_KEYS["queue"], float("inf")))
         waiting = float(results.get(RESULT_KEYS["waiting"], float("inf")))
         travel = float(results.get(RESULT_KEYS["travel"], float("inf")))
         return reward - 0.05 * queue - 0.05 * waiting - 0.01 * travel
+    if ranking_metric == "tail_risk":
+        reward = float(results.get(RESULT_KEYS["reward"], float("-inf")))
+        p95_wait = float(results.get(RESULT_KEYS["p95_wait"], float("inf")))
+        max_wait = float(results.get(RESULT_KEYS["max_wait"], float("inf")))
+        return reward - float(args.tail_p95_weight) * p95_wait - float(args.tail_max_weight) * max_wait
+    if ranking_metric == "reward_topk_tail":
+        return -_tail_cost(results, args)
     key = RESULT_KEYS[ranking_metric]
     value = float(results.get(key, float("nan")))
     if math.isnan(value):
@@ -300,6 +310,27 @@ def _tie_breakers(results: Dict[str, Any]) -> List[float]:
         -float(results.get(RESULT_KEYS["travel"], float("inf"))),
         -float(results.get(RESULT_KEYS["waiting"], float("inf"))),
     ]
+
+
+def _reward_value(results: Dict[str, Any]) -> float:
+    return float(results.get(RESULT_KEYS["reward"], float("-inf")))
+
+
+def _tail_cost(results: Dict[str, Any], args: argparse.Namespace) -> float:
+    p95_wait = float(results.get(RESULT_KEYS["p95_wait"], float("inf")))
+    max_wait = float(results.get(RESULT_KEYS["max_wait"], float("inf")))
+    return float(args.tail_cost_p95_weight) * p95_wait + float(args.tail_cost_max_weight) * max_wait
+
+
+def _constrained_tail_key(candidate: Dict[str, Any]) -> Tuple[float, float, float, float, float]:
+    results = candidate.get("results") or {}
+    return (
+        float(candidate.get("tail_cost", float("inf"))),
+        -float(candidate.get("reward_score", float("-inf"))),
+        float(results.get(RESULT_KEYS["queue"], float("inf"))),
+        float(results.get(RESULT_KEYS["travel"], float("inf"))),
+        float(results.get(RESULT_KEYS["waiting"], float("inf"))),
+    )
 
 
 def _constraint_reasons(candidate: Dict[str, Any], args: argparse.Namespace) -> List[str]:
@@ -412,8 +443,13 @@ def parse_args() -> argparse.Namespace:
         "--ranking_metric",
         type=str,
         default="reward",
-        choices=["reward", "queue", "waiting", "travel", "composite"],
+        choices=["reward", "queue", "waiting", "travel", "composite", "tail_risk", "reward_topk_tail"],
     )
+    parser.add_argument("--tail_p95_weight", type=float, default=0.10)
+    parser.add_argument("--tail_max_weight", type=float, default=0.02)
+    parser.add_argument("--reward_top_k", type=int, default=3)
+    parser.add_argument("--tail_cost_p95_weight", type=float, default=1.0)
+    parser.add_argument("--tail_cost_max_weight", type=float, default=0.05)
     parser.add_argument("--max_etwt", type=float, default=None)
     parser.add_argument("--max_ntst", type=float, default=None)
     parser.add_argument("--max_elwl", type=float, default=None)
@@ -476,7 +512,9 @@ def main() -> None:
                 strong_miss_gap=float(args.strong_miss_gap),
                 window_seconds=int(args.window_seconds),
             ),
-            "score": _result_score(results, args.ranking_metric),
+            "reward_score": _reward_value(results),
+            "tail_cost": _tail_cost(results, args),
+            "score": _result_score(results, args),
             "ranking_metric": args.ranking_metric,
         }
         reasons = []
@@ -511,7 +549,21 @@ def main() -> None:
         output_json.write_text(_json_dump(report) + "\n", encoding="utf-8")
         raise SystemExit(f"No eligible checkpoint found. Wrote report: {output_json}")
 
-    selected = max(eligible, key=lambda item: (float(item["score"]), *_tie_breakers(item.get("results") or {})))
+    if args.ranking_metric == "reward_topk_tail":
+        reward_top_k = max(1, int(args.reward_top_k))
+        reward_ranked = sorted(
+            eligible,
+            key=lambda item: (float(item.get("reward_score", float("-inf"))), *_tie_breakers(item.get("results") or {})),
+            reverse=True,
+        )
+        constrained_pool = reward_ranked[:reward_top_k]
+        pool_ids = {id(candidate) for candidate in constrained_pool}
+        for rank, candidate in enumerate(reward_ranked, start=1):
+            candidate["reward_rank"] = rank
+            candidate["in_constrained_pool"] = id(candidate) in pool_ids
+        selected = min(constrained_pool, key=_constrained_tail_key)
+    else:
+        selected = max(eligible, key=lambda item: (float(item["score"]), *_tie_breakers(item.get("results") or {})))
     promotion: Dict[str, Any] | None = None
     if args.promote_to_best:
         promotion = _promote_to_best(selected, stage_root, args)
@@ -546,6 +598,13 @@ def main() -> None:
             "strong_miss_gap": args.strong_miss_gap,
             "window_seconds": args.window_seconds,
             "forbid_monotonic_late_queue_rise": bool(args.forbid_monotonic_late_queue_rise),
+        },
+        "scoring": {
+            "tail_p95_weight": float(args.tail_p95_weight),
+            "tail_max_weight": float(args.tail_max_weight),
+            "reward_top_k": max(1, int(args.reward_top_k)),
+            "tail_cost_p95_weight": float(args.tail_cost_p95_weight),
+            "tail_cost_max_weight": float(args.tail_cost_max_weight),
         },
         "used_constraint_fallback": used_constraint_fallback,
         "selected": selected,

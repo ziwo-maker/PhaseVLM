@@ -124,6 +124,22 @@ def resolve_rank_work_dir(base_dir: str, rank: int) -> str:
     return os.path.join(text, f"rank{rank}")
 
 
+def _check_split_overlap(splits: Dict[str, str]) -> str | None:
+    """Return an error message if any two split files are identical, else None."""
+    names = list(splits.keys())
+    for i in range(len(names)):
+        for j in range(i + 1, len(names)):
+            a_name, a_file = names[i], splits[names[i]]
+            b_name, b_file = names[j], splits[names[j]]
+            if a_file and b_file and a_file == b_file:
+                return (
+                    f"--{a_name}_traffic_file == --{b_name}_traffic_file "
+                    f"('{a_file}').  Train/eval/test flow files must be disjoint "
+                    f"for honest evaluation."
+                )
+    return None
+
+
 def sync_gradients(parameters: Sequence[torch.nn.Parameter]) -> None:
     if not (dist.is_available() and dist.is_initialized()):
         return
@@ -855,6 +871,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dataset", type=str, default="jinan")
     parser.add_argument("--traffic_file", type=str, default="anon_3_4_jinan_real.json")
     parser.add_argument("--eval_traffic_file", type=str, default="")
+    parser.add_argument(
+        "--test_traffic_file",
+        type=str,
+        default="",
+        help="Held-out flow for one-shot final evaluation.  Must differ from "
+        "--eval_traffic_file for a paper-ready result.",
+    )
+    parser.add_argument(
+        "--allow_overlapping_splits",
+        action="store_true",
+        default=False,
+        help="Suppress the fatal error when train/eval/test flows overlap.  "
+        "For debugging only — do NOT use for paper results.",
+    )
     parser.add_argument("--roadnet_path", type=str, default="")
     parser.add_argument("--traffic_root", type=str, default="")
     parser.add_argument("--work_root", type=str, default="records/projection_ppo_traj/env_work")
@@ -1258,6 +1288,7 @@ def main() -> None:
     barrier()
     best_metric = float("-inf")
     eval_traffic_file = args.eval_traffic_file or args.traffic_file
+    test_traffic_file = args.test_traffic_file or ""
     rng = random.Random(args.seed + rank)
 
     if is_main_process():
@@ -1270,6 +1301,41 @@ def main() -> None:
             llm_fsdp_enabled,
             getattr(policy.backbone, "is_fsdp", False),
         )
+        if eval_traffic_file == args.traffic_file and not args.eval_traffic_file:
+            msg = (
+                "⚠️  EVALUATION LEAKAGE: --eval_traffic_file is not set; "
+                "checkpoint selection reuses --traffic_file=%s. "
+                "This can inflate apparent PPO gains.  Set --eval_traffic_file "
+                "to a held-out flow for honest checkpoint selection."
+            ) % args.traffic_file
+            logger.warning(msg)
+        if not test_traffic_file:
+            logger.warning(
+                "⚠️  NO TEST SET: --test_traffic_file is not set. "
+                "The final best.pt will be scored on the same episode used for "
+                "checkpoint selection.  For a paper-ready result, freeze the "
+                "checkpoint first, then evaluate once on a held-out test flow."
+            )
+
+        # Fail fast when any two of train/eval/test are the same file.
+        splits = {
+            "train": args.traffic_file,
+            "eval": eval_traffic_file,
+            "test": test_traffic_file,
+        }
+        overlap_msg = _check_split_overlap(splits)
+        if overlap_msg:
+            if args.allow_overlapping_splits:
+                logger.warning("⚠️  SPLIT OVERLAP (allowed by flag): %s", overlap_msg)
+            else:
+                logger.error("FATAL: %s", overlap_msg)
+                logger.error(
+                    "Use --allow_overlapping_splits to override (debug only)."
+                )
+                raise SystemExit(
+                    "Train/eval/test flow files must be disjoint for paper-ready "
+                    "results.  Pass --allow_overlapping_splits to bypass."
+                )
 
     baseline_eval_metrics = evaluate_full_episode(
         policy=policy,
@@ -1476,6 +1542,177 @@ def main() -> None:
                         metrics=merged_metrics,
                     )
         barrier()
+
+    # ── Final held-out test evaluation ──────────────────────────────
+    if is_main_process() and test_traffic_file:
+        logger.info("=== Final held-out test on %s ===", test_traffic_file)
+
+        # 1. Reload best.pt (the checkpoint selected on validation), not the
+        #    live in-memory policy which may have drifted after the last eval.
+        best_path = os.path.join(args.output_dir, "best.pt")
+        if os.path.exists(best_path):
+            logger.info("Reloading best checkpoint from %s", best_path)
+            policy.load_checkpoint(best_path)
+        else:
+            logger.warning(
+                "best.pt not found at %s; falling back to live policy. "
+                "This may not reflect the checkpoint that would be deployed.",
+                best_path,
+            )
+
+        # 2. Evaluate the frozen Stage 2 baseline ON THE SAME TEST FILE
+        #    so that ratios compare identical traffic demand.
+        test_env = TrajectoryCityFlowEnv(
+            roadnet_path=roadnet_path,
+            traffic_root=traffic_root,
+            work_root=os.path.join(resolve_rank_work_dir(args.work_root, rank), "test"),
+            default_traffic_file=test_traffic_file,
+            seq_len=runtime["seq_len"],
+            movement_keys=["NT", "NL", "ST", "SL", "ET", "EL", "WT", "WL"],
+            prompt_mode=args.prompt_mode,
+            traffic_series_interval=args.traffic_series_interval,
+            window_s=args.window_s,
+            min_action_time=args.min_action_time,
+            reward_alpha=args.reward_alpha,
+            switch_penalty_beta=args.switch_penalty_beta,
+            queue_reward_coef=args.queue_reward_coef,
+            waiting_reward_coef=args.waiting_reward_coef,
+            system_vehicle_reward_coef=args.system_vehicle_reward_coef,
+            throughput_reward_coef=args.throughput_reward_coef,
+            starvation_penalty_coef=args.starvation_penalty_coef,
+            starvation_threshold_steps=args.starvation_threshold_steps,
+            starvation_queue_threshold=args.starvation_queue_threshold,
+            starvation_wait_threshold=args.starvation_wait_threshold,
+            wait_reward_scope=args.wait_reward_scope,
+            wait_reward_reducer=args.wait_reward_reducer,
+            reward_mode=args.reward_mode,
+            queue_delta_scale=args.queue_delta_scale,
+            wait_delta_scale=args.wait_delta_scale,
+            wait_abs_coef=args.wait_abs_coef,
+            wait_abs_scale=args.wait_abs_scale,
+            active_delta_scale=args.active_delta_scale,
+            throughput_scale=args.throughput_scale,
+            reward_clip=args.reward_clip,
+            global_reward_scale=args.global_reward_scale,
+            selection_queue_weight=args.selection_queue_weight,
+            selection_wait_weight=args.selection_wait_weight,
+            selection_travel_weight=args.selection_travel_weight,
+            reward_info=reward_info,
+            run_counts=eval_run_counts,
+            env_seed=args.seed + 9999,
+            advance_seed_on_reset=False,
+        )
+        test_baseline_metrics = evaluate_full_episode(
+            policy=policy,  # frozen Stage 2 (best.pt reloaded above if available)
+            env=test_env,
+            device=device,
+            traffic_file=test_traffic_file,
+        )
+        del test_env
+
+        # 3. Now evaluate the PPO policy on the same test file.
+        test_env2 = TrajectoryCityFlowEnv(
+            roadnet_path=roadnet_path,
+            traffic_root=traffic_root,
+            work_root=os.path.join(resolve_rank_work_dir(args.work_root, rank), "test_ppo"),
+            default_traffic_file=test_traffic_file,
+            seq_len=runtime["seq_len"],
+            movement_keys=["NT", "NL", "ST", "SL", "ET", "EL", "WT", "WL"],
+            prompt_mode=args.prompt_mode,
+            traffic_series_interval=args.traffic_series_interval,
+            window_s=args.window_s,
+            min_action_time=args.min_action_time,
+            reward_alpha=args.reward_alpha,
+            switch_penalty_beta=args.switch_penalty_beta,
+            queue_reward_coef=args.queue_reward_coef,
+            waiting_reward_coef=args.waiting_reward_coef,
+            system_vehicle_reward_coef=args.system_vehicle_reward_coef,
+            throughput_reward_coef=args.throughput_reward_coef,
+            starvation_penalty_coef=args.starvation_penalty_coef,
+            starvation_threshold_steps=args.starvation_threshold_steps,
+            starvation_queue_threshold=args.starvation_queue_threshold,
+            starvation_wait_threshold=args.starvation_wait_threshold,
+            wait_reward_scope=args.wait_reward_scope,
+            wait_reward_reducer=args.wait_reward_reducer,
+            reward_mode=args.reward_mode,
+            queue_delta_scale=args.queue_delta_scale,
+            wait_delta_scale=args.wait_delta_scale,
+            wait_abs_coef=args.wait_abs_coef,
+            wait_abs_scale=args.wait_abs_scale,
+            active_delta_scale=args.active_delta_scale,
+            throughput_scale=args.throughput_scale,
+            reward_clip=args.reward_clip,
+            global_reward_scale=args.global_reward_scale,
+            selection_queue_weight=args.selection_queue_weight,
+            selection_wait_weight=args.selection_wait_weight,
+            selection_travel_weight=args.selection_travel_weight,
+            reward_info=reward_info,
+            run_counts=eval_run_counts,
+            env_seed=args.seed + 9999,
+            advance_seed_on_reset=False,
+        )
+        # Reload the PPO best checkpoint for the PPO test
+        ppo_best_path = os.path.join(args.output_dir, "best.pt")
+        if os.path.exists(ppo_best_path):
+            policy.load_checkpoint(ppo_best_path)
+
+        test_ppo_metrics = evaluate_full_episode(
+            policy=policy,
+            env=test_env2,
+            device=device,
+            traffic_file=test_traffic_file,
+        )
+        del test_env2
+
+        # Paired BC-vs-PPO deltas on the SAME test flow
+        queue_delta = test_ppo_metrics["eval_avg_queue"] - test_baseline_metrics["eval_avg_queue"]
+        wait_delta = test_ppo_metrics["eval_avg_waiting"] - test_baseline_metrics["eval_avg_waiting"]
+        travel_delta = test_ppo_metrics["eval_avg_travel_time"] - test_baseline_metrics["eval_avg_travel_time"]
+
+        logger.info(
+            "[final_test] BC:  queue=%.4f wait=%.4f travel=%.4f",
+            test_baseline_metrics["eval_avg_queue"],
+            test_baseline_metrics["eval_avg_waiting"],
+            test_baseline_metrics["eval_avg_travel_time"],
+        )
+        logger.info(
+            "[final_test] PPO: queue=%.4f wait=%.4f travel=%.4f",
+            test_ppo_metrics["eval_avg_queue"],
+            test_ppo_metrics["eval_avg_waiting"],
+            test_ppo_metrics["eval_avg_travel_time"],
+        )
+        logger.info(
+            "[final_test] Δ(PPO−BC): queue=%+.4f wait=%+.4f travel=%+.4f",
+            queue_delta,
+            wait_delta,
+            travel_delta,
+        )
+
+        test_summary = {
+            "test_traffic_file": test_traffic_file,
+            "bc": {
+                "avg_queue": round(test_baseline_metrics["eval_avg_queue"], 4),
+                "avg_waiting": round(test_baseline_metrics["eval_avg_waiting"], 4),
+                "avg_travel_time": round(test_baseline_metrics["eval_avg_travel_time"], 4),
+            },
+            "ppo": {
+                "avg_queue": round(test_ppo_metrics["eval_avg_queue"], 4),
+                "avg_waiting": round(test_ppo_metrics["eval_avg_waiting"], 4),
+                "avg_travel_time": round(test_ppo_metrics["eval_avg_travel_time"], 4),
+            },
+            "delta_ppo_minus_bc": {
+                "avg_queue": round(queue_delta, 4),
+                "avg_waiting": round(wait_delta, 4),
+                "avg_travel_time": round(travel_delta, 4),
+            },
+            "checkpoint_reloaded": os.path.exists(ppo_best_path),
+            "update_idx_at_save": getattr(policy, "_loaded_update_idx", None),
+        }
+        test_metrics_path = os.path.join(args.output_dir, "test_metrics.json")
+        import json as _json
+        with open(test_metrics_path, "w", encoding="utf-8") as _fh:
+            _json.dump(test_summary, _fh, indent=2, default=str)
+        logger.info("Test metrics written to %s", test_metrics_path)
 
     if ddp:
         dist.destroy_process_group()

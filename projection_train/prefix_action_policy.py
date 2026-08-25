@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import inspect
+import logging
 from typing import Any, Dict, List, Optional, Sequence
 
 import torch
@@ -40,23 +41,90 @@ def _maybe_load_module(
     if not load:
         return False
     state = checkpoint.get(key)
-    if isinstance(state, dict):
-        module.load_state_dict(state, strict=False)
+    def _load_exact(state_dict: Dict[str, torch.Tensor]) -> bool:
+        incompatible = module.load_state_dict(state_dict, strict=False)
+        if incompatible.missing_keys or incompatible.unexpected_keys:
+            raise RuntimeError(
+                f"Checkpoint module {key!r} is incompatible: "
+                f"missing_keys={incompatible.missing_keys}, "
+                f"unexpected_keys={incompatible.unexpected_keys}."
+            )
         return True
+
+    if isinstance(state, dict):
+        return _load_exact(state)
     if isinstance(checkpoint.get("state_dict"), dict):
         nested = _strip_state_prefix(checkpoint["state_dict"], f"{key}.")
         if nested:
-            module.load_state_dict(nested, strict=False)
-            return True
+            return _load_exact(nested)
     nested = _strip_state_prefix(checkpoint, f"{key}.")
     if nested:
-        module.load_state_dict(nested, strict=False)
-        return True
+        return _load_exact(nested)
     module_prefix = _strip_state_prefix(checkpoint, f"module.{key}.")
     if module_prefix:
-        module.load_state_dict(module_prefix, strict=False)
-        return True
+        return _load_exact(module_prefix)
     return False
+
+
+def _extract_module_state(checkpoint: Dict[str, Any], key: str) -> Dict[str, torch.Tensor]:
+    state = checkpoint.get(key)
+    if isinstance(state, dict):
+        return state
+    if isinstance(checkpoint.get("state_dict"), dict):
+        nested = _strip_state_prefix(checkpoint["state_dict"], f"{key}.")
+        if nested:
+            return nested
+    nested = _strip_state_prefix(checkpoint, f"{key}.")
+    if nested:
+        return nested
+    return _strip_state_prefix(checkpoint, f"module.{key}.")
+
+
+def _load_module_with_shape_intersection(
+    module: nn.Module,
+    checkpoint: Dict[str, Any],
+    key: str,
+) -> list[str]:
+    source_state = _extract_module_state(checkpoint, key)
+    if not source_state:
+        return [f"{key}:missing_source_state"]
+
+    current_state = module.state_dict()
+    adapted_state: Dict[str, torch.Tensor] = {}
+    notes: list[str] = []
+    for name, current_tensor in current_state.items():
+        source_tensor = source_state.get(name)
+        if not isinstance(source_tensor, torch.Tensor):
+            adapted_state[name] = current_tensor
+            notes.append(f"{key}.{name}:kept_current_missing_source")
+            continue
+        if tuple(source_tensor.shape) == tuple(current_tensor.shape):
+            adapted_state[name] = source_tensor.to(dtype=current_tensor.dtype)
+            continue
+        if source_tensor.ndim != current_tensor.ndim:
+            adapted_state[name] = current_tensor
+            notes.append(
+                f"{key}.{name}:kept_current_rank_mismatch "
+                f"source={tuple(source_tensor.shape)} current={tuple(current_tensor.shape)}"
+            )
+            continue
+        target = current_tensor.detach().cpu().clone()
+        source_cpu = source_tensor.detach().cpu().to(dtype=target.dtype)
+        slices = tuple(slice(0, min(int(src), int(dst))) for src, dst in zip(source_cpu.shape, target.shape))
+        target[slices].copy_(source_cpu[slices])
+        adapted_state[name] = target
+        notes.append(
+            f"{key}.{name}:copied_overlap "
+            f"source={tuple(source_tensor.shape)} current={tuple(current_tensor.shape)}"
+        )
+    incompatible = module.load_state_dict(adapted_state, strict=True)
+    if incompatible.missing_keys or incompatible.unexpected_keys:
+        raise RuntimeError(
+            f"Adapted checkpoint module {key!r} is incompatible: "
+            f"missing_keys={incompatible.missing_keys}, "
+            f"unexpected_keys={incompatible.unexpected_keys}."
+        )
+    return notes
 
 
 class PrefixActionPolicy(nn.Module):
@@ -79,15 +147,19 @@ class PrefixActionPolicy(nn.Module):
         backbone_fsdp_enabled: bool = False,
         backbone_fsdp_sharding_strategy: str = "full_shard",
         action_eval_chunk_size: int = 0,
+        enable_topology_adapter: bool = False,
+        topology_roadnet_configs: Optional[Dict[str, Dict]] = None,
     ) -> None:
         super().__init__()
         self.device = _resolve_device(device)
         self.max_length = int(max_length)
         self.seq_len = int(seq_len)
+        self.image_size = int(image_size)
         self.input_dim = int(input_dim)
         self.with_value_head = bool(with_value_head)
         self.action_eval_chunk_size = max(0, int(action_eval_chunk_size))
         self.backbone_gradient_checkpointing = False
+        self._vision_feature_mode = "last_hidden_state"
 
         if backbone is None:
             self.backbone = Qwen3VLBackbone(
@@ -129,6 +201,25 @@ class PrefixActionPolicy(nn.Module):
         projector_dtype = getattr(self.backbone.model, "dtype", torch_dtype)
         self.vision_projector.to(device=self.device, dtype=projector_dtype)
         self.ts_projector.to(self.device)
+
+        # Topology-conditioned adapter for cross-network adaptation
+        self.enable_topology_adapter = bool(enable_topology_adapter)
+        self.topology_encoder: Optional[nn.Module] = None
+        self._vision_adapter: Optional[nn.Module] = None
+
+        if self.enable_topology_adapter:
+            from projection_train.topology_adapter import IntersectionTopologyEncoder
+            self.topology_encoder = IntersectionTopologyEncoder(
+                vision_dim=vision_dim,
+                hidden_dim=32,
+                roadnet_configs=topology_roadnet_configs,
+            )
+            self.topology_encoder.to(device=self.device, dtype=projector_dtype)
+            # Concat fusion: vision_pooled [vision_dim] + topo_emb [vision_dim] → adapter
+            adapter_in = vision_dim * 2
+            adapter_out = vision_dim
+            self._vision_adapter = nn.Linear(adapter_in, adapter_out, bias=False)
+            self._vision_adapter.to(device=self.device, dtype=projector_dtype)
 
         tokenizer = self.backbone.tokenizer
         tokenizer.padding_side = "right"
@@ -174,21 +265,43 @@ class PrefixActionPolicy(nn.Module):
             formatted.append(text)
         return formatted
 
-    def _encode_sequences(self, sequences: torch.Tensor) -> Dict[str, torch.Tensor]:
+    def _encode_sequences(
+        self,
+        sequences: torch.Tensor,
+        intersection_ids: Optional[List[str]] = None,
+        dataset_hints: Optional[List[str]] = None,
+    ) -> Dict[str, torch.Tensor]:
         if sequences.device != self.device:
             sequences = sequences.to(self.device)
         images = self.ts_projector(sequences)
         if self.backbone_gradient_checkpointing and torch.is_grad_enabled():
             vision_tokens = activation_checkpoint(
-                self.backbone.encode_vision_tokens,
+                lambda batch: self.backbone.encode_vision_tokens(
+                    batch,
+                    output_mode=self._vision_feature_mode,
+                ),
                 images,
                 use_reentrant=False,
             )
         else:
-            vision_tokens = self.backbone.encode_vision_tokens(images)
+            vision_tokens = self.backbone.encode_vision_tokens(
+                images,
+                output_mode=self._vision_feature_mode,
+            )
         if vision_tokens.ndim == 2:
             vision_tokens = vision_tokens.unsqueeze(1)
         vision_pooled = vision_tokens.mean(dim=1)
+        # Topology conditioning with concat fusion (handles dimension mismatch
+        # between vision_dim=1152 and adapter_out=4096 for old checkpoints).
+        if self.topology_encoder is not None and intersection_ids is not None:
+            topo_emb = self.topology_encoder(
+                intersection_ids,
+                dataset_hints=dataset_hints,
+            )
+            topo_emb = topo_emb.to(device=vision_pooled.device, dtype=vision_pooled.dtype)
+            vision_pooled = torch.cat([vision_pooled, topo_emb], dim=-1)
+        if self._vision_adapter is not None:
+            vision_pooled = self._vision_adapter(vision_pooled)
         prefix_vec, prefix_tokens = self.vision_projector(vision_pooled)
         prefix_tokens = prefix_tokens.to(device=self.device, dtype=self._model_dtype())
         return {
@@ -227,8 +340,14 @@ class PrefixActionPolicy(nn.Module):
         self,
         sequences: torch.Tensor,
         prompts: Sequence[str],
+        intersection_ids: Optional[List[str]] = None,
+        dataset_hints: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
-        seq_features = self._encode_sequences(sequences)
+        seq_features = self._encode_sequences(
+            sequences,
+            intersection_ids=intersection_ids,
+            dataset_hints=dataset_hints,
+        )
         prompt_features = self._encode_prompts(prompts)
         prepared = {**seq_features, **prompt_features}
         if self.value_head is not None:
@@ -431,8 +550,14 @@ class PrefixActionPolicy(nn.Module):
         sequences: torch.Tensor,
         prompts: Sequence[str],
         prepared_batch: Optional[Dict[str, Any]] = None,
+        intersection_ids: Optional[List[str]] = None,
+        dataset_hints: Optional[List[str]] = None,
     ) -> torch.Tensor:
-        prepared = prepared_batch or self.prepare_policy_batch(sequences, prompts)
+        prepared = prepared_batch or self.prepare_policy_batch(
+            sequences, prompts,
+            intersection_ids=intersection_ids,
+            dataset_hints=dataset_hints,
+        )
         return self.get_action_logits_from_prepared(prepared)
 
     def forward(
@@ -440,8 +565,15 @@ class PrefixActionPolicy(nn.Module):
         sequences: torch.Tensor,
         prompts: Sequence[str],
         prepared_batch: Optional[Dict[str, Any]] = None,
+        intersection_ids: Optional[List[str]] = None,
+        dataset_hints: Optional[List[str]] = None,
     ) -> torch.Tensor:
-        return self.get_action_logits(sequences, prompts, prepared_batch=prepared_batch)
+        return self.get_action_logits(
+            sequences, prompts,
+            prepared_batch=prepared_batch,
+            intersection_ids=intersection_ids,
+            dataset_hints=dataset_hints,
+        )
 
     def action_distribution(
         self,
@@ -549,6 +681,10 @@ class PrefixActionPolicy(nn.Module):
         params: List[nn.Parameter] = []
         params.extend(list(self.ts_projector.parameters()))
         params.extend(list(self.vision_projector.parameters()))
+        if self._vision_adapter is not None:
+            params.extend(list(self._vision_adapter.parameters()))
+        if self.topology_encoder is not None:
+            params.extend(list(self.topology_encoder.parameters()))
         if self.value_head is not None:
             params.extend(list(self.value_head.parameters()))
         return params
@@ -561,13 +697,153 @@ class PrefixActionPolicy(nn.Module):
         self,
         checkpoint_path: str,
         load_value_head: bool = True,
+        allow_mismatched_projectors: bool = False,
     ) -> Dict[str, Any]:
         checkpoint = torch.load(checkpoint_path, map_location="cpu")
         if not isinstance(checkpoint, dict):
             raise RuntimeError(f"Unsupported checkpoint format: {checkpoint_path}")
 
-        _maybe_load_module(self.ts_projector, checkpoint, "ts_projector", load=True)
-        _maybe_load_module(self.vision_projector, checkpoint, "vision_projector", load=True)
+        # A Qwen3-VL API change exposed raw visual states (1152) as
+        # ``last_hidden_state`` while historical checkpoints were trained on the
+        # vision merger output (4096).  Select a real backbone feature path that
+        # matches the serialized projector; never install an untrained adapter.
+        vp_state = checkpoint.get("vision_projector")
+        if isinstance(vp_state, dict) and "proj.weight" in vp_state:
+            stored_weight = vp_state["proj.weight"]
+            current_weight = self.vision_projector.proj.weight
+            if stored_weight.shape != current_weight.shape:
+                stored_in_dim = int(stored_weight.shape[1])
+                stored_out_dim = int(stored_weight.shape[0])
+                stored_prefix_tokens = 1
+                if self.vision_projector.mode == "prefix":
+                    checkpoint_args = checkpoint.get("args")
+                    if isinstance(checkpoint_args, dict):
+                        stored_prefix_tokens = int(
+                            checkpoint_args.get("prefix_tokens", self.vision_projector.prefix_tokens)
+                        )
+                    if stored_prefix_tokens <= 0 or stored_out_dim % stored_prefix_tokens != 0:
+                        raise RuntimeError(
+                            "Vision projector prefix-token metadata is incompatible with the checkpoint: "
+                            f"prefix_tokens={stored_prefix_tokens}, output_dim={stored_out_dim}."
+                        )
+                stored_text_dim = stored_out_dim // stored_prefix_tokens
+                if stored_text_dim != self.backbone.text_dim:
+                    raise RuntimeError(
+                        "Vision projector text dimension does not match the loaded backbone: "
+                        f"checkpoint={stored_text_dim}, backbone={self.backbone.text_dim}."
+                    )
+
+                if stored_in_dim != int(current_weight.shape[1]):
+                    with torch.no_grad():
+                        dummy = torch.zeros(
+                            1,
+                            3,
+                            self.image_size,
+                            self.image_size,
+                            device=self.device,
+                        )
+                        pooled_dim = int(
+                            self.backbone.encode_vision_tokens(
+                                dummy,
+                                output_mode="pooler_output",
+                            ).shape[-1]
+                        )
+                    if pooled_dim != stored_in_dim:
+                        raise RuntimeError(
+                            "Checkpoint vision dimension is incompatible with this backbone: "
+                            f"checkpoint={stored_in_dim}, raw={current_weight.shape[1]}, "
+                            f"pooler_output={pooled_dim}. Refusing to use an untrained adapter."
+                        )
+
+                    self._vision_feature_mode = "pooler_output"
+                    logging.getLogger("projection_train.policy").info(
+                        "Using Qwen3-VL pooler_output (%d dims) for historical vision projector.",
+                        pooled_dim,
+                    )
+                    new_projector = VisionPrefixProjector(
+                        vision_dim=stored_in_dim,
+                        text_dim=stored_text_dim,
+                        prefix_tokens=self.vision_projector.prefix_tokens,
+                        mode=self.vision_projector.mode,
+                    )
+                    new_projector.to(
+                        device=self.vision_projector.proj.weight.device,
+                        dtype=self.vision_projector.proj.weight.dtype,
+                    )
+                    self.vision_projector = new_projector
+
+                current_prefix_tokens = self.vision_projector.prefix_tokens
+                if (
+                    self.vision_projector.mode == "prefix"
+                    and stored_prefix_tokens != current_prefix_tokens
+                ):
+                    copied_tokens = min(stored_prefix_tokens, current_prefix_tokens)
+                    with torch.no_grad():
+                        source_weight = stored_weight.reshape(
+                            stored_prefix_tokens, stored_text_dim, stored_in_dim
+                        )
+                        target_weight = self.vision_projector.proj.weight.reshape(
+                            current_prefix_tokens, stored_text_dim, stored_in_dim
+                        )
+                        target_weight[:copied_tokens].copy_(
+                            source_weight[:copied_tokens].to(
+                                device=target_weight.device,
+                                dtype=target_weight.dtype,
+                            )
+                        )
+                        if "proj.bias" in vp_state:
+                            source_bias = vp_state["proj.bias"].reshape(
+                                stored_prefix_tokens, stored_text_dim
+                            )
+                            target_bias = self.vision_projector.proj.bias.reshape(
+                                current_prefix_tokens, stored_text_dim
+                            )
+                            target_bias[:copied_tokens].copy_(
+                                source_bias[:copied_tokens].to(
+                                    device=target_bias.device,
+                                    dtype=target_bias.dtype,
+                                )
+                            )
+
+                    # _maybe_load_module below is strict about tensor shapes, so replace
+                    # the checkpoint state with the prefix-compatible initialization.
+                    checkpoint = dict(checkpoint)
+                    checkpoint["vision_projector"] = {
+                        **vp_state,
+                        "proj.weight": self.vision_projector.proj.weight.detach().cpu().clone(),
+                        "proj.bias": self.vision_projector.proj.bias.detach().cpu().clone(),
+                    }
+                    logging.getLogger("projection_train.policy").info(
+                        "Adapted vision projector prefix tokens from %d to %d; copied %d token blocks.",
+                        stored_prefix_tokens,
+                        current_prefix_tokens,
+                        copied_tokens,
+                    )
+
+        try:
+            _maybe_load_module(self.ts_projector, checkpoint, "ts_projector", load=True)
+        except RuntimeError:
+            if not allow_mismatched_projectors:
+                raise
+            notes = _load_module_with_shape_intersection(self.ts_projector, checkpoint, "ts_projector")
+            logging.getLogger("projection_train.policy").warning(
+                "Loaded ts_projector from %s with shape-intersection adaptation: %s",
+                checkpoint_path,
+                "; ".join(notes),
+            )
+        try:
+            _maybe_load_module(self.vision_projector, checkpoint, "vision_projector", load=True)
+        except RuntimeError:
+            if not allow_mismatched_projectors:
+                raise
+            notes = _load_module_with_shape_intersection(self.vision_projector, checkpoint, "vision_projector")
+            logging.getLogger("projection_train.policy").warning(
+                "Loaded vision_projector from %s with shape-intersection adaptation: %s",
+                checkpoint_path,
+                "; ".join(notes),
+            )
+        if self.topology_encoder is not None:
+            _maybe_load_module(self.topology_encoder, checkpoint, "topology_encoder", load=True)
         if self.value_head is not None:
             _maybe_load_module(self.value_head, checkpoint, "value_head", load=load_value_head)
         return checkpoint

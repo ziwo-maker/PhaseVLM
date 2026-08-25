@@ -7,12 +7,17 @@ from torch.utils.data import Subset
 
 
 def _sample_group_key(sample: Any) -> str:
+    """Return a chronological trajectory key for blocked validation.
+
+    GroupedTrafficActionDataset preserves input-file order, but records from
+    different intersections are interleaved.  A flow-level suffix therefore
+    cannot safely purge the sequence history of each intersection.
+    """
     traffic_file = str(getattr(sample, "traffic_file", "") or "").strip()
-    if traffic_file:
-        return traffic_file
     source_path = str(getattr(sample, "source_path", "") or "").strip()
-    if source_path:
-        return source_path
+    intersection_id = str(getattr(sample, "intersection_id", "") or "").strip()
+    if traffic_file or source_path or intersection_id:
+        return "\x1f".join((source_path, traffic_file, intersection_id))
     return "__default__"
 
 
@@ -24,6 +29,7 @@ def _sample_label(sample: Any, label_attr: str) -> str:
 def blocked_group_split(
     samples: Sequence[Any],
     val_ratio: float,
+    purge_samples: int = 0,
 ) -> Tuple[List[int], List[int]]:
     total = len(samples)
     if total == 0:
@@ -36,23 +42,36 @@ def blocked_group_split(
         grouped_indices.setdefault(_sample_group_key(sample), []).append(idx)
 
     val_indices: List[int] = []
+    purged_indices: set[int] = set()
+    purge_samples = max(0, int(purge_samples))
     for indices in grouped_indices.values():
         if len(indices) <= 1:
             continue
         val_count = max(1, int(len(indices) * val_ratio))
         val_count = min(val_count, len(indices) - 1)
-        val_indices.extend(indices[-val_count:])
+        val_start = len(indices) - val_count
+        purge_start = max(0, val_start - purge_samples)
+        val_indices.extend(indices[val_start:])
+        purged_indices.update(indices[purge_start:val_start])
 
     if not val_indices:
         val_count = max(1, int(total * val_ratio))
         val_count = min(val_count, total - 1)
-        val_indices = list(range(total - val_count, total))
+        val_start = total - val_count
+        purge_start = max(0, val_start - purge_samples)
+        val_indices = list(range(val_start, total))
+        purged_indices.update(range(purge_start, val_start))
 
     val_index_set = set(val_indices)
-    train_indices = [idx for idx in range(total) if idx not in val_index_set]
+    train_indices = [
+        idx for idx in range(total)
+        if idx not in val_index_set and idx not in purged_indices
+    ]
     if not train_indices:
-        train_indices = list(range(total - 1))
-        val_indices = [total - 1]
+        raise ValueError(
+            "Blocked validation leaves no training samples after the purge buffer; "
+            "reduce --validation_purge_samples or --val_ratio."
+        )
     return train_indices, sorted(val_indices)
 
 
@@ -98,9 +117,17 @@ def stratified_label_split(
     return train_indices, sorted(val_indices)
 
 
-def blocked_group_subset(dataset: Any, val_ratio: float) -> Tuple[Subset, Subset | None]:
+def blocked_group_subset(
+    dataset: Any,
+    val_ratio: float,
+    purge_samples: int = 0,
+) -> Tuple[Subset, Subset | None]:
     samples = list(getattr(dataset, "samples", []))
-    train_indices, val_indices = blocked_group_split(samples, val_ratio=val_ratio)
+    train_indices, val_indices = blocked_group_split(
+        samples,
+        val_ratio=val_ratio,
+        purge_samples=purge_samples,
+    )
     train_subset = Subset(dataset, train_indices)
     val_subset = Subset(dataset, val_indices) if val_indices else None
     return train_subset, val_subset

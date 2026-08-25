@@ -218,8 +218,21 @@ def _augment_record(
     augmented["prompt_context"] = context
     augmented["phase_queue"] = phase_queue
     augmented["phase_wait"] = phase_wait
+    phase_wait_p95 = _float_map(item.get("phase_wait_p95"))
+    if set(phase_wait_p95) == set(ACTION_LIST):
+        augmented["phase_wait_p95"] = phase_wait_p95
     augmented["candidate_action_waits"] = {
         phase: -float(phase_queue.get(phase, 0.0)) for phase in ACTION_LIST
+    }
+    augmented["candidate_action_metrics"] = {
+        phase: {
+            "att": 0.0,
+            "aql": -float(phase_queue.get(phase, 0.0)),
+            "awt": -float(phase_wait.get(phase, 0.0)),
+            "spillback": 0.0,
+            **({"tail_wait": -float(phase_wait_p95[phase])} if phase in phase_wait_p95 else {}),
+        }
+        for phase in ACTION_LIST
     }
     augmented["max_phase_override"] = diag
     augmented["distill_source"] = {
