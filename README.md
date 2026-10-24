@@ -52,6 +52,35 @@ TORCHRUN=/home/sysu/anaconda3/envs/hnr5090/bin/torchrun
 MODEL_PATH=/home/data/model/qwen-vl-8B
 ```
 
+To run the same Jinan3 targeted pipeline as a Qwen3.5-9B backbone ablation, keep
+the training/evaluation recipe fixed and only override the model path plus a
+clear run label:
+
+```bash
+cd /home/code/LLMSTSC
+
+MODEL_PATH=/mnt/data/Qwen3.5-9B \
+MODEL_LABEL=qwen35_9b \
+RUN_ROOT=/home/code/LLMSTSC/records/pipeline_runs/ablation_qwen35_9b_jinan3_qwshort_targeted_$(date +%Y%m%d_%H%M%S) \
+TRAIN_GPUS=0,1,2,3 \
+EVAL_GPU=0 \
+nohup scripts/reproduce_jinan3_qwshort_targeted_20260805_epoch15.sh \
+  > /tmp/ablation_qwen35_9b_jinan3_qwshort_targeted_launcher.log 2>&1 &
+
+echo $!
+```
+
+The launcher performs a lightweight Hugging Face preflight before training. It
+checks that the selected model exposes `vision_config`, loads
+`AutoProcessor`/`AutoTokenizer`, and chooses the compatible model class such as
+`Qwen3_5ForConditionalGeneration` for `/mnt/data/Qwen3.5-9B`.
+
+Do not evaluate an old `/home/data/model/qwen-vl-8B` Stage-2 checkpoint with
+`MODEL_PATH=/mnt/data/Qwen3.5-9B`; the action prefix projector is tied to the
+backbone text/vision dimensions. For a fair model-backbone ablation, run Stage 1
+and Stage 2 from scratch with the Qwen3.5 path, then evaluate the resulting
+`epoch_15.pt`.
+
 To start the main experiment on four GPUs, request approval with the complete
 command first, then run it detached and give every run a fresh `RUN_ROOT`:
 

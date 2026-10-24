@@ -11,7 +11,48 @@ PHASE_LANES: dict[str, tuple[str, str]] = {
     "ELWL": ("EL", "WL"),
     "NLSL": ("NL", "SL"),
 }
-PROMPT_MODES: tuple[str, ...] = ("raw", "image_only_short", "queue_wait_short")
+PROMPT_MODES: tuple[str, ...] = (
+    "raw", "image_only_short", "queue_wait_short", "matched_minimal", "matched_structured",
+    "information_matched",
+)
+
+
+def serialize_movement_history(sequence: Sequence[Sequence[float]], interval_s: int = 2) -> str:
+    """Losslessly serialize the exact oldest-to-newest 16x8 policy input."""
+    if len(sequence) != 16 or any(len(row) != len(MOVEMENT_KEYS) for row in sequence):
+        raise ValueError("History-Text requires exactly 16 rows and 8 movement counts")
+    if interval_s != 2:
+        raise ValueError("The matched representation protocol requires a 2 s interval")
+
+    def number(value: float) -> str:
+        value = float(value)
+        if not (value >= 0 and value < float("inf")):
+            raise ValueError("Movement counts must be finite and nonnegative")
+        return str(int(value)) if value.is_integer() else repr(value)
+
+    lines = ["History every 2 s, oldest to newest; columns: " + ",".join(MOVEMENT_KEYS)]
+    for index, row in enumerate(sequence):
+        offset = (15 - index) * interval_s
+        timestamp = f"t-{offset}s" if offset else "t"
+        lines.append(f"{timestamp}: " + ",".join(number(value) for value in row))
+    return "\n".join(lines)
+
+
+def serialize_compact_movement_history(sequence: Sequence[Sequence[float]], interval_s: int = 2) -> str:
+    if len(sequence) != 16 or any(len(row) != len(MOVEMENT_KEYS) for row in sequence):
+        raise ValueError("Information-matched history requires exactly 16x8 values")
+    if interval_s != 2:
+        raise ValueError("Information-matched history requires a 2 s interval")
+    rows = []
+    for row in sequence:
+        values = []
+        for value in row:
+            number = float(value)
+            if not (0 <= number < float("inf")):
+                raise ValueError("Movement counts must be finite and nonnegative")
+            values.append(str(int(number)) if number.is_integer() else repr(number))
+        rows.append(" ".join(values))
+    return "H(16x8,2s/row,oldest->newest; " + " ".join(MOVEMENT_KEYS) + "):\n" + "\n".join(rows)
 
 
 def _format_action_tags(action_tags: Sequence[str]) -> str:
@@ -118,6 +159,31 @@ def build_task_prompt(
         return str(raw_prompt or "").rstrip()
 
     allowed = _format_action_tags(action_tags)
+    if mode == "information_matched":
+        context = str(traffic_context or "").strip()
+        if not context:
+            raise ValueError("Information-matched prompt requires queue/wait context")
+        context = context.replace("Traffic q/w(s): lanes ", "Q/W(s): ").replace("; phases ", "; P: ")
+        return (
+            "Minimize near-term congestion; favor much larger queues; protect high-wait left turns.\n"
+            f"{context}\n"
+            "Tags: " + ",".join(action_tags) + ". Output <signal>TAG</signal>."
+        )
+    if mode in {"matched_minimal", "matched_structured"}:
+        instruction = (
+            "Control one four-phase traffic signal using the supplied recent movement history.\n"
+            "Choose the next phase to reduce near-term congestion.\n"
+        )
+        if mode == "matched_structured":
+            context = str(traffic_context or "").strip()
+            if not context:
+                raise ValueError("Matched structured prompt requires queue/wait context")
+            instruction += (
+                f"{context}\n"
+                "Rule: reduce near-term congestion; switch to a much larger-queue phase when needed; "
+                "avoid starving high-wait left turns.\n"
+            )
+        return instruction + f"Allowed: {allowed}. Return exactly one tag."
     if mode == "image_only_short":
         return (
             "You are controlling a four-phase traffic signal.\n"

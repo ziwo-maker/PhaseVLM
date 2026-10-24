@@ -83,33 +83,34 @@ nohup npm run dev > /tmp/project-dev.log 2>&1 & echo $!
 tail -n 200 /tmp/project-dev.log
 ```
 
-## Completion Notification
+## Feishu Notification Policy
 
-After every task for this project is completed, send the user a concise Feishu
-completion notification. Treat the notification as best effort: read
-`~/.claude/feishu.json`, honor its configured mode, never expose its secrets,
-and never delay or fail the task because Feishu is unavailable or unconfigured.
-Include the task outcome and any material verification result in the message.
+Only send Feishu notifications for experiments that are expected to run longer
+than 1 hour, or that are discovered during monitoring to have already run longer
+than 1 hour. Do not send Feishu notifications for ordinary tasks, code edits,
+short commands, short experiments, or completion of non-long-running work.
 
-## Experiment Progress Notifications
-
-For every running experiment, send a best-effort Feishu progress notification
-every 40 minutes when Feishu is configured for push notifications. Each update
-must include the current progress and the latest available result, such as the
-most recent or best validation metric. Keep the final completion notification.
+For qualifying long-running experiments, send a best-effort Feishu progress
+notification every 40 minutes when Feishu is configured for push notifications.
+Each update must include the current progress and the latest available result,
+such as the most recent or best validation metric. Send one final completion
+notification for the qualifying long-running experiment. Treat all Feishu
+notifications as best effort: read `~/.claude/feishu.json`, honor its configured
+mode, never expose its secrets, and never delay or fail the task because Feishu
+is unavailable or unconfigured.
 
 ## Startup Monitoring Window
 
 For every experiment, training job, or training-dataset generation launched by
-Codex, actively monitor the first 5 minutes before ending launch monitoring.
+Codex, actively monitor the first 2 minutes before ending launch monitoring.
 Use bounded snapshots only, not streaming commands. During this window, inspect
 the process tree, log tail, and relevant resource signal (for example GPU memory
 and utilization for GPU jobs) at launch, then poll exactly once every 60 seconds
-for the full 5-minute window. Treat an unexpected process exit, traceback,
+for the full 2-minute window. Treat an unexpected process exit, traceback,
 repeated retry, stalled progress, or absent resource allocation as a startup
 failure; investigate and report it rather than claiming the launch succeeded.
 End startup monitoring only after the job has remained healthy for the complete
-5-minute window, or after it completes successfully.
+2-minute window, or after it completes successfully.
 
 ## Online Test Parallelism
 
@@ -121,6 +122,52 @@ sequential execution when the tests share mutable state, GPU memory is
 insufficient, the user explicitly requests sequential runs, or parallelism would
 make the comparison invalid.
 
+## Online Test Default Protocol
+
+Online tests must be plural by default: run multiple online tests unless the
+user explicitly asks for a single run. Do not select or constrain a specific
+epoch based on `online_test_best_weights/`; use the requested or experiment
+protocol checkpoint selection instead.
+
+## Explicit Five-Flow Cross-Generalization Protocol
+
+For the requested Jinan-1 and Hangzhou-2 best-weight cross-generalization
+comparison, the experiment count is five distinct source-to-target flow pairs,
+not two model directions and not an automatically expanded seed matrix. Run
+each pair once with seed 2024 unless the user explicitly asks for additional
+seeds:
+
+1. Jinan-1 best `paper_main_table_near_jinan1.pt` on Hangzhou-1
+   `anon_4_4_hangzhou_real.json`.
+2. Jinan-1 best `paper_main_table_near_jinan1.pt` on Hangzhou-2
+   `anon_4_4_hangzhou_real_5816.json`.
+3. Hangzhou-2 best `epoch_9.pt` on Jinan-1 `anon_3_4_jinan_real.json`.
+4. Hangzhou-2 best `epoch_9.pt` on Jinan-2
+   `anon_3_4_jinan_real_2000.json`.
+5. Hangzhou-2 best `epoch_9.pt` on Jinan-3
+   `anon_3_4_jinan_real_2500.json`.
+
+The Jinan-1 checkpoint uses `/home/data/model/qwen-vl-8B`, hidden dimension
+64, 8 prefix tokens, and max length 64. The Hangzhou-2 checkpoint uses
+`/mnt/data/Qwen3-VL-8B-Instruct`, hidden dimension 256, 8 prefix tokens, and
+max length 512. Preserve each checkpoint's own model family and architecture;
+do not substitute the other checkpoint's settings. Use `run_counts=3600`, one
+round, queue/wait/short prompt mode, 16-step images at 224 pixels, minimum
+action time 30 seconds, traffic-series interval 2 seconds, bf16, and disabled
+phase overrides. Record the five pairs explicitly in the manifest and keep
+one result, status, and log per pair. Reuse already completed exact pair
+results rather than rerunning them solely to reach a count of five.
+
+## Experiment Launch Parallelism
+
+When launching experiments, use multi-GPU execution by default whenever multiple
+idle GPUs are available. Prefer assigning independent runs, seeds, folds, or
+configurations across GPUs with explicit `CUDA_VISIBLE_DEVICES` values and
+separate logs/results per worker. Use a single GPU or sequential execution only
+when GPU memory is insufficient, the experiment requires shared mutable state,
+the user explicitly requests sequential execution, or multi-GPU scheduling would
+invalidate the comparison.
+
 ## Default Traffic-Flow Evaluation Scope
 
 Unless the user explicitly requests generalization, robustness, cross-flow, or
@@ -128,6 +175,65 @@ multi-flow evaluation, test every trained traffic-control policy only on the
 same traffic flow used to collect or train its dataset. Do not add demand-shift
 or other extra traffic flows by default. Record the training and test flow in
 the experiment manifest so the same-flow protocol is auditable.
+
+## Online Test Best-Weight Archive
+
+When an online test on any traffic flow exceeds the current best result for
+that same flow, archive the winning weight files separately under
+`online_test_best_weights/<flow_name>/`. Create the flow-specific subdirectory
+if it does not already exist, copy the exact winning weights there, and keep
+the archive independent from transient experiment output directories.
+
+A completed single-seed online test is sufficient to select and archive a
+checkpoint; multi-seed validation is not an archive prerequisite. Record the
+exact seed and evaluation scope in the archive index. When the selection uses
+a run-local composite metric rather than an all-time flow record, state that
+scope explicitly and do not claim it supersedes historical records on metrics
+where it does not improve them.
+
+Maintain `online_test_best_weights/README.md` as the reproduction index. For
+each archived online test, record the flow name, metric that beat the previous
+best, previous best value, new best value, source checkpoint path, archived
+weight path, exact online-test command, environment assumptions, relevant seed
+or GPU settings, result artifact paths, and concise reproduction steps.
+
+## Online Test Best-Weights Reproduction Scope
+
+When asked to reproduce `online_test_best_weights/`, treat the archive as a
+directional reproduction recipe unless the user explicitly requests bit-exact
+checkpoint restoration. If an archived checkpoint is missing, do not block on
+recovering that exact file by default. Instead, use the archive entry's
+non-hardware parameters as the target protocol and rerun the pipeline from
+Stage 1 with the current available bestweights/data recipe.
+
+When reproducing `online_test_best_weights/`, prefer using all idle GPUs for
+Stage 1, Stage 2, and the multi-seed online tests. Assign one worker per GPU
+when the machine can support it, and only reduce GPU count when memory is
+insufficient, the run needs shared mutable state, or the user explicitly asks
+for fewer GPUs.
+
+Preserve the important experiment semantics from the archive entry where
+possible: dataset, traffic flow, prompt mode, sequence/image dimensions,
+projector dimensions, prefix settings, max length, run counts, min action time,
+override settings, model family/path preference, same-flow versus cross-flow
+scope, and evaluation seeds. Hardware-dependent parameters such as GPU ids,
+worker placement, DDP world size, batch size per GPU, gradient accumulation, and
+timeouts may be adjusted for the available machine, as long as the run manifest
+records the actual settings. This is a broad reproduction, not a strict
+bit-for-bit reproduction, unless the user says otherwise.
+
+## Newyork Checkpoint Interpretation
+
+For Newyork 28x7 wait-optimization work, do not describe epoch 15 as the best
+checkpoint by default. Treat epoch 15 only as a wait-oriented candidate until it
+beats the current baseline under multi-seed online evaluation and the configured
+selector constraints. Prefer statements such as "candidate", "reference", or
+"needs multi-seed validation" unless aggregate online results prove otherwise.
+
+## Default Model Path
+
+Use `/mnt/data/Qwen3-VL-8B-Instruct/` as the default model path unless the user
+explicitly requests a different model.
 <!-- ARIS-CODEX:BEGIN -->
 ## ARIS Codex Skill Scope
 ARIS Codex packages installed in this project: skills-codex

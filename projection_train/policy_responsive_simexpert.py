@@ -844,6 +844,30 @@ class PolicyResponsiveSimExpertRelabeler(SimExpertRelabeler):
                         f"{coverage['processed_snapshots']}/{coverage['total_snapshots']} snapshots",
                         flush=True,
                     )
+            except json.JSONDecodeError as exc:
+                # CityFlow can leave a truncated snapshot after a dump retry.
+                # Keep the remaining snapshots usable instead of aborting the
+                # entire counterfactual relabeling job.
+                coverage["skipped_snapshots"] += 1
+                coverage["skipped_records"] += len(indices)
+                for index in indices:
+                    records[index].update(
+                        {
+                            "relabel_method": f"policy_{self.neighbor_mode}_corrupt_snapshot",
+                            "candidate_action_metrics": {},
+                            "candidate_action_waits": {},
+                            "expert_action": records[index].get("policy_action", ACTION_LIST[0]),
+                            "expert_action_margin": 0.0,
+                            "base_action": records[index].get("policy_action", ACTION_LIST[0]),
+                            "pareto_feasible": {},
+                            "constraint_violations": {},
+                        }
+                    )
+                print(
+                    f"[PolicyResponsiveSimExpert] skipped corrupt snapshot {snapshot_path}: {exc}",
+                    flush=True,
+                )
+                continue
             except Exception:
                 coverage["skipped_snapshots"] += 1
                 raise

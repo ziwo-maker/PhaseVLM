@@ -20,6 +20,7 @@ import subprocess
 import sys
 import time
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
@@ -306,6 +307,7 @@ def run_one(
     traffic_file: str,
     horizon: int,
     weight: WeightSet,
+    cuda_visible_devices: str | None = None,
 ) -> RunRow:
     traffic_stem = Path(traffic_file).stem
     log_name = f"{args.dataset}.{traffic_stem}.h{horizon}.{weight.label}.log"
@@ -341,6 +343,8 @@ def run_one(
                 "WANDB_SILENT": "true",
             }
         )
+        if cuda_visible_devices is not None:
+            env["CUDA_VISIBLE_DEVICES"] = str(cuda_visible_devices)
         with log_path.open("w", encoding="utf-8") as handle:
             handle.write(f"# started_at={timestamp()}\n")
             handle.write("# command=" + shlex.join(cmd) + "\n")
@@ -750,6 +754,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--llm_path", default="/home/data/model/gemma-3-27B/")
     parser.add_argument("--tensor_parallel_size", type=int, default=0)
     parser.add_argument("--cuda_visible_devices", default=os.environ.get("CUDA_VISIBLE_DEVICES", "0"))
+    parser.add_argument(
+        "--max_workers",
+        type=int,
+        default=1,
+        help="Maximum independent CityFlow candidates to run concurrently.",
+    )
+    parser.add_argument(
+        "--worker_cuda_devices",
+        default="",
+        help="Comma-separated CUDA_VISIBLE_DEVICES values assigned round-robin to workers.",
+    )
     parser.add_argument("--python", default=sys.executable)
     parser.add_argument("--clean_seq_len", type=int, default=16)
     parser.add_argument("--skip_clean", action="store_true", default=True)
@@ -817,6 +832,8 @@ def main() -> int:
                     "AQL": args.selection_aql_weight,
                     "AWT": args.selection_awt_weight,
                 },
+                "max_workers": max(1, int(args.max_workers)),
+                "worker_cuda_devices": str(args.worker_cuda_devices or args.cuda_visible_devices),
                 "dry_run": args.dry_run,
             },
             handle,
@@ -824,19 +841,47 @@ def main() -> int:
             indent=2,
         )
 
+    jobs = list(itertools.product(horizons, weights, traffic_files))
     rows: list[RunRow] = []
-    total = len(traffic_files) * len(horizons) * len(weights)
-    current = 0
-    for horizon, weight, traffic_file in itertools.product(horizons, weights, traffic_files):
-        current += 1
+    total = len(jobs)
+    max_workers = max(1, min(int(args.max_workers), total))
+    worker_devices = [
+        token.strip()
+        for token in str(args.worker_cuda_devices or args.cuda_visible_devices).split(",")
+        if token.strip()
+    ] or [str(args.cuda_visible_devices)]
+
+    for current, (horizon, weight, traffic_file) in enumerate(jobs, start=1):
         print(
             f"[{current}/{total}] dataset={args.dataset} traffic_file={traffic_file} "
             f"horizon={horizon} weights={weight.label}",
             flush=True,
         )
-        row = run_one(args, run_id, output_dir, traffic_file, horizon, weight)
-        rows.append(row)
-        write_run_rows(output_dir / "run_results.csv", rows)
+
+    if max_workers == 1:
+        for horizon, weight, traffic_file in jobs:
+            row = run_one(args, run_id, output_dir, traffic_file, horizon, weight)
+            rows.append(row)
+            write_run_rows(output_dir / "run_results.csv", rows)
+    else:
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {
+                executor.submit(
+                    run_one,
+                    args,
+                    run_id,
+                    output_dir,
+                    traffic_file,
+                    horizon,
+                    weight,
+                    worker_devices[index % len(worker_devices)],
+                ): (horizon, weight, traffic_file)
+                for index, (horizon, weight, traffic_file) in enumerate(jobs)
+            }
+            for future in as_completed(futures):
+                row = future.result()
+                rows.append(row)
+                write_run_rows(output_dir / "run_results.csv", rows)
 
     summaries = summarize_rows(rows, selection_weights)
     write_summary(output_dir / "summary.csv", summaries)

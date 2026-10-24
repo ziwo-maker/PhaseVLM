@@ -16,6 +16,7 @@ class TrafficClipSample:
     caption: str
     intersection_id: str
     meta: Dict
+    expert_action: str = ""
     date: str = ""
     traffic_file: str = ""
     source_path: str = ""
@@ -113,6 +114,7 @@ class TrafficClipJsonlDataset(Dataset):
                             caption=str(clip_caption),
                             intersection_id=intersection_id,
                             meta=meta,
+                            expert_action=str(record.get("expert_action") or "").strip(),
                             date=date,
                             traffic_file=infer_traffic_file_from_snapshot_path(image_path),
                             source_path=str(path),
@@ -158,6 +160,7 @@ class TrafficClipJsonlDataset(Dataset):
             "caption": sample.caption,
             "intersection_id": sample.intersection_id,
             "meta": sample.meta,
+            "expert_action": sample.expert_action,
             "date": sample.date,
             "traffic_file": sample.traffic_file,
             "source_path": sample.source_path,
@@ -171,6 +174,7 @@ def traffic_clip_collate(batch):
     captions = [item["caption"] for item in batch]
     meta = [item.get("meta", {}) for item in batch]
     intersection_ids = [item.get("intersection_id", "") for item in batch]
+    expert_actions = [item.get("expert_action", "") for item in batch]
     dates = [item.get("date", "") for item in batch]
     traffic_files = [item.get("traffic_file", "") for item in batch]
     source_paths = [item.get("source_path", "") for item in batch]
@@ -181,6 +185,7 @@ def traffic_clip_collate(batch):
         "caption": captions,
         "meta": meta,
         "intersection_id": intersection_ids,
+        "expert_action": expert_actions,
         "date": dates,
         "traffic_file": traffic_files,
         "source_path": source_paths,

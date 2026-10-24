@@ -582,8 +582,10 @@ def _generate_captions(prompts: List[str], args, backend: str, model, tokenizer)
     if not prompts:
         return []
     if backend == "transformers":
+        # Qwen3-VL's AutoProcessor treats its first positional argument as
+        # image input. Caption backfill is text-only, so make that explicit.
         inputs = tokenizer(
-            prompts,
+            text=prompts,
             return_tensors="pt",
             padding=True,
             truncation=True,
@@ -600,13 +602,12 @@ def _generate_captions(prompts: List[str], args, backend: str, model, tokenizer)
         }
         with torch.no_grad():
             output_ids = model.generate(**inputs, **gen_kwargs)
-        decoded = tokenizer.batch_decode(output_ids, skip_special_tokens=True)
-        captions = []
-        for prompt, text in zip(prompts, decoded):
-            if text.startswith(prompt):
-                text = text[len(prompt) :]
-            captions.append(_clean_clip_caption(text))
-        return captions
+        prompt_length = inputs["input_ids"].shape[1]
+        continuation_ids = output_ids[:, prompt_length:]
+        return [
+            _clean_clip_caption(text)
+            for text in tokenizer.batch_decode(continuation_ids, skip_special_tokens=True)
+        ]
 
     sampling_params = SamplingParams(
         temperature=float(getattr(args, "temperature", DEFAULT_CAPTION_TEMPERATURE)),

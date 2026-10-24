@@ -401,9 +401,113 @@ def build_from_state_action_only(
     }
 
 
+def build_from_canonical_decision_states(
+    state_action_path: Path,
+    decision_states_path: Path,
+    output_path: Path,
+    label_source: str,
+    gap: float,
+    left_wait_protect: float,
+) -> dict[str, Any]:
+    state_action = _load_json(state_action_path)
+    if not isinstance(state_action, list):
+        raise ValueError(f"Expected state_action to be a list: {state_action_path}")
+
+    intersection_order: dict[str, int] = {}
+    step_by_intersection: defaultdict[str, int] = defaultdict(int)
+    action_counts: Counter[str] = Counter()
+    base_counts: Counter[str] = Counter()
+    rows = 0
+    overridden_rows = 0
+    missing_state_action_rows = 0
+    invalid_sequence_rows = 0
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    with decision_states_path.open("r", encoding="utf-8") as source, output_path.open(
+        "w", encoding="utf-8"
+    ) as handle:
+        for line in source:
+            if not line.strip():
+                continue
+            decision = json.loads(line)
+            intersection_id = str(decision.get("intersection_id") or "")
+            if not intersection_id:
+                raise ValueError(f"Missing intersection_id in {decision_states_path}")
+            if intersection_id not in intersection_order:
+                intersection_order[intersection_id] = len(intersection_order)
+            intersection_index = intersection_order[intersection_id]
+            step_index = step_by_intersection[intersection_id]
+            step_by_intersection[intersection_id] += 1
+
+            sequences = decision.get("sequences")
+            if not (
+                isinstance(sequences, list)
+                and len(sequences) == 16
+                and all(isinstance(row, list) and len(row) == len(MOVEMENT_KEYS) for row in sequences)
+            ):
+                invalid_sequence_rows += 1
+                continue
+            if intersection_index >= len(state_action) or not isinstance(
+                state_action[intersection_index], list
+            ) or step_index >= len(state_action[intersection_index]):
+                missing_state_action_rows += 1
+                continue
+
+            item = state_action[intersection_index][step_index]
+            if not isinstance(item, dict):
+                missing_state_action_rows += 1
+                continue
+
+            record = dict(decision)
+            record["sequence_source"] = "online_canonical"
+            record["canonical_intersection_index"] = intersection_index
+            record["canonical_step_index"] = step_index
+            augmented, overridden = _augment_record(
+                record,
+                item,
+                label_source=label_source,
+                gap=gap,
+                left_wait_protect=left_wait_protect,
+                source_path=state_action_path,
+            )
+            rows += 1
+            overridden_rows += int(overridden)
+            action_counts[str(augmented.get("expert_action") or "")] += 1
+            base_counts[str(augmented.get("base_action") or "")] += 1
+            handle.write(json.dumps(augmented, ensure_ascii=False) + "\n")
+
+    if invalid_sequence_rows or missing_state_action_rows:
+        raise ValueError(
+            "Canonical decision-state alignment failed: "
+            f"invalid_sequence_rows={invalid_sequence_rows} "
+            f"missing_state_action_rows={missing_state_action_rows}"
+        )
+    expected_rows = sum(len(items) for items in state_action if isinstance(items, list))
+    if rows != expected_rows:
+        raise ValueError(f"Canonical row count mismatch: rows={rows} expected={expected_rows}")
+
+    return {
+        "output_path": str(output_path),
+        "state_action_path": str(state_action_path),
+        "decision_states_path": str(decision_states_path),
+        "label_source": label_source,
+        "rule_gap": float(gap),
+        "left_wait_protect": float(left_wait_protect),
+        "terminal_rows": rows,
+        "overridden_rows": overridden_rows,
+        "invalid_sequence_rows": invalid_sequence_rows,
+        "missing_state_action_rows": missing_state_action_rows,
+        "intersection_count": len(intersection_order),
+        "action_counts": dict(action_counts),
+        "base_action_counts": dict(base_counts),
+        "sequence_source": "online_canonical",
+    }
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--state_action", required=True, type=Path)
+    parser.add_argument("--decision_states", type=Path, default=None)
     parser.add_argument("--prompt_series", type=Path, default=None)
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument(
@@ -420,7 +524,18 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    if args.prompt_series is not None:
+    if args.decision_states is not None:
+        if args.prompt_series is not None:
+            raise ValueError("--decision_states cannot be combined with --prompt_series")
+        summary = build_from_canonical_decision_states(
+            state_action_path=args.state_action,
+            decision_states_path=args.decision_states,
+            output_path=args.output,
+            label_source=args.label_source,
+            gap=args.rule_gap,
+            left_wait_protect=args.left_wait_protect,
+        )
+    elif args.prompt_series is not None:
         summary = build_from_prompt_series(
             state_action_path=args.state_action,
             prompt_series_path=args.prompt_series,

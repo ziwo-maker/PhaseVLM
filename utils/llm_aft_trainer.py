@@ -19,7 +19,11 @@ import utils.config as config
 from utils.aft_rank_loss_utils import *
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from peft import LoraConfig, get_peft_model
-from datasets import load_dataset
+try:
+    from datasets import load_dataset
+except ImportError:
+    # SimExpert simulator-only collection does not use datasets.
+    load_dataset = None
 from tqdm import tqdm
 import torch
 from copy import deepcopy
@@ -3228,6 +3232,8 @@ class LLM_CGPR_Trainer:
 
     def train(self):
         print("================ Start Training ================")
+        if load_dataset is None:
+            raise RuntimeError("datasets is required for CGPR dataset loading.")
         data = load_dataset("json", data_files=f"./data/cgpr/cgpr_{self.dic_agent_conf['CGPR_DATA_PATH']}")
 
         train_val = data["train"].train_test_split(test_size=0.1, shuffle=True, seed=2024)

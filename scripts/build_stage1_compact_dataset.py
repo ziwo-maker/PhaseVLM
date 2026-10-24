@@ -311,6 +311,7 @@ def _summary(groups: list[GroupSample]) -> dict[str, Any]:
         "groups": len(groups),
         "unique_sequences": len({g.sequence_signature for g in groups}),
         "unique_normalized_captions": len({g.normalized_caption for g in groups}),
+        "action_margin": _margin_summary([g.action_margin for g in groups]),
         "intersection_counts": dict(sorted(Counter(g.intersection_id for g in groups).items())),
         "dominance_counts": dict(sorted(Counter(g.dominance for g in groups).items())),
         "turn_balance_counts": dict(sorted(Counter(g.turn_balance for g in groups).items())),
@@ -318,6 +319,24 @@ def _summary(groups: list[GroupSample]) -> dict[str, Any]:
         "trend_bin_counts": dict(sorted(Counter(g.trend_bin for g in groups).items())),
         "action_counts": dict(sorted(Counter(g.expert_action for g in groups).items())),
         "top_caption_prefixes": Counter(" ".join(g.normalized_caption.split()[:6]) for g in groups).most_common(20),
+    }
+
+
+def _margin_summary(values: list[float]) -> dict[str, float | int]:
+    if not values:
+        return {"count": 0}
+    ordered = sorted(float(value) for value in values)
+    return {
+        "count": len(ordered),
+        "min": round(float(ordered[0]), 6),
+        "p25": round(float(_quantile(ordered, 0.25)), 6),
+        "median": round(float(_quantile(ordered, 0.5)), 6),
+        "p75": round(float(_quantile(ordered, 0.75)), 6),
+        "max": round(float(ordered[-1]), 6),
+        "mean": round(float(sum(ordered) / len(ordered)), 6),
+        "le_0": int(sum(value <= 0.0 for value in ordered)),
+        "le_0_5": int(sum(value <= 0.5 for value in ordered)),
+        "le_1": int(sum(value <= 1.0 for value in ordered)),
     }
 
 
@@ -330,12 +349,18 @@ def build_compact_dataset(
     per_caption_cap: int,
     per_bucket_cap: int,
     per_intersection_cap: int | None,
+    min_action_margin: float,
 ) -> dict[str, Any]:
     groups = _read_groups(input_path, seq_len=seq_len)
     if not groups:
         raise SystemExit(f"No terminal clip_caption groups found in {input_path}")
     _assign_bins(groups)
-    deduped = _dedup_by_sequence(groups)
+    filtered = [sample for sample in groups if sample.action_margin >= float(min_action_margin)]
+    if not filtered:
+        raise SystemExit(
+            f"No groups remain after applying --min_action_margin={min_action_margin} to {input_path}"
+        )
+    deduped = _dedup_by_sequence(filtered)
     intersection_count = len({g.intersection_id for g in deduped}) or 1
     resolved_intersection_cap = (
         int(per_intersection_cap)
@@ -363,8 +388,10 @@ def build_compact_dataset(
         "output": str(output_path),
         "seq_len": int(seq_len),
         "target_groups": int(target_groups),
+        "min_action_margin": float(min_action_margin),
         "per_intersection_cap": int(resolved_intersection_cap),
         "before": _summary(groups),
+        "after_margin_filter": _summary(filtered),
         "after_dedup_sequence": _summary(deduped),
         "after_selection": _summary(selected),
         "selected_lines": int(sum(len(sample.raw_lines) for sample in selected)),
@@ -384,6 +411,12 @@ def main() -> None:
     parser.add_argument("--per_caption_cap", type=int, default=3)
     parser.add_argument("--per_bucket_cap", type=int, default=18)
     parser.add_argument("--per_intersection_cap", type=int, default=0)
+    parser.add_argument(
+        "--min_action_margin",
+        type=float,
+        default=0.0,
+        help="Drop terminal groups whose expert_action_margin is below this value.",
+    )
     args = parser.parse_args()
 
     summary = build_compact_dataset(
@@ -395,6 +428,7 @@ def main() -> None:
         per_caption_cap=args.per_caption_cap,
         per_bucket_cap=args.per_bucket_cap,
         per_intersection_cap=args.per_intersection_cap,
+        min_action_margin=args.min_action_margin,
     )
     print(json.dumps(summary, ensure_ascii=False, indent=2))
 

@@ -34,7 +34,7 @@ except Exception:
     wandb = None
 
 from projection_train.action_space import ACTION_LIST, action_to_index, format_action_tag, index_to_action
-from projection_train.prompt_utils import build_phase_queue_wait_context, build_task_prompt
+from projection_train.prompt_utils import MOVEMENT_KEYS, build_phase_queue_wait_context, build_task_prompt, serialize_movement_history, serialize_compact_movement_history
 from utils import error
 from utils.cityflow_env import CityFlowEnv
 from utils.config import dic_traffic_env_conf
@@ -485,9 +485,18 @@ class ProjectionPolicyRunner:
         dump_cityflow_env_args: bool = True,
         max_phase_override_gap: float = 0.0,
         max_phase_override_left_wait_protect: float = 0.0,
+        max_phase_override_max_wait_protect: float = 0.0,
         max_phase_override_target_queue_floor: float = 0.0,
         max_phase_override_total_queue_floor: float = 0.0,
+        max_phase_override_queue_weight: float = 1.0,
+        max_phase_override_wait_weight: float = 0.0,
+        max_phase_override_p95_wait_weight: float = 0.0,
+        max_phase_override_wait_scale: float = 60.0,
+        max_phase_override_p95_wait_scale: float = 300.0,
         inference_batch_size: int = 0,
+        visual_ablation: str = "full",
+        representation_mode: str = "ts2i",
+        action_eval_chunk_size: int = 0,
         collect_states_output: str = "",
     ) -> None:
         self.dic_agent_conf = dic_agent_conf
@@ -507,9 +516,18 @@ class ProjectionPolicyRunner:
         self.dump_cityflow_env_args = bool(dump_cityflow_env_args)
         self.max_phase_override_gap = float(max_phase_override_gap or 0.0)
         self.max_phase_override_left_wait_protect = float(max_phase_override_left_wait_protect or 0.0)
+        self.max_phase_override_max_wait_protect = float(max_phase_override_max_wait_protect or 0.0)
         self.max_phase_override_target_queue_floor = float(max_phase_override_target_queue_floor or 0.0)
         self.max_phase_override_total_queue_floor = float(max_phase_override_total_queue_floor or 0.0)
+        self.max_phase_override_queue_weight = float(max_phase_override_queue_weight)
+        self.max_phase_override_wait_weight = float(max_phase_override_wait_weight or 0.0)
+        self.max_phase_override_p95_wait_weight = float(max_phase_override_p95_wait_weight or 0.0)
+        self.max_phase_override_wait_scale = max(1e-6, float(max_phase_override_wait_scale or 60.0))
+        self.max_phase_override_p95_wait_scale = max(1e-6, float(max_phase_override_p95_wait_scale or 300.0))
         self.inference_batch_size = max(0, int(inference_batch_size or 0))
+        self.visual_ablation = str(visual_ablation or "full").strip().lower()
+        self.representation_mode = str(representation_mode or "ts2i").strip().lower()
+        self.action_eval_chunk_size = max(0, int(action_eval_chunk_size))
         self.collect_states_output = str(collect_states_output or "")
         self._collect_states_fh = None
         self.env: Optional[CityFlowEnv] = None
@@ -611,6 +629,8 @@ class ProjectionPolicyRunner:
         states: Sequence[Dict[str, Any]],
         action_indices: Sequence[int],
         predicted_actions: Sequence[str],
+        phase_wait_p95s: Sequence[Dict[str, float]] | None = None,
+        phase_wait_maxes: Sequence[Dict[str, float]] | None = None,
     ) -> tuple[list[int], list[str], list[dict[str, Any]]]:
         final_indices = [int(index) for index in action_indices]
         final_actions = [str(action) for action in predicted_actions]
@@ -620,16 +640,45 @@ class ProjectionPolicyRunner:
 
         left_phases = {"ELWL", "NLSL"}
         through_phases = {"ETWT", "NTST"}
+        wait_aware_target = (
+            abs(self.max_phase_override_wait_weight) > 0.0
+            or abs(self.max_phase_override_p95_wait_weight) > 0.0
+        )
         for idx, state in enumerate(states):
             phase_queue, phase_wait = self._phase_queue_wait(state)
             if not phase_queue:
                 continue
-            target_phase = max(ACTION_LIST, key=lambda phase: phase_queue.get(phase, 0.0))
+            phase_wait_p95 = (
+                dict(phase_wait_p95s[idx])
+                if phase_wait_p95s is not None and idx < len(phase_wait_p95s)
+                else {}
+            )
+            phase_wait_max = (
+                dict(phase_wait_maxes[idx])
+                if phase_wait_maxes is not None and idx < len(phase_wait_maxes)
+                else {}
+            )
             original_action = final_actions[idx] if idx < len(final_actions) else index_to_action(final_indices[idx])
             original_queue = float(phase_queue.get(original_action, 0.0))
-            target_queue = float(phase_queue.get(target_phase, 0.0))
             total_queue = float(sum(phase_queue.values()))
-            gap = target_queue - original_queue
+            urgency_score: dict[str, float] = {}
+            if wait_aware_target:
+                for phase in ACTION_LIST:
+                    urgency_score[phase] = (
+                        self.max_phase_override_queue_weight * float(phase_queue.get(phase, 0.0))
+                        + self.max_phase_override_wait_weight
+                        * float(phase_wait.get(phase, 0.0))
+                        / self.max_phase_override_wait_scale
+                        + self.max_phase_override_p95_wait_weight
+                        * float(phase_wait_p95.get(phase, 0.0))
+                        / self.max_phase_override_p95_wait_scale
+                    )
+                target_phase = max(ACTION_LIST, key=lambda phase: urgency_score.get(phase, 0.0))
+                gap = float(urgency_score.get(target_phase, 0.0) - urgency_score.get(original_action, 0.0))
+            else:
+                target_phase = max(ACTION_LIST, key=lambda phase: phase_queue.get(phase, 0.0))
+                gap = float(phase_queue.get(target_phase, 0.0) - original_queue)
+            target_queue = float(phase_queue.get(target_phase, 0.0))
             should_override = target_phase != original_action and gap >= self.max_phase_override_gap
             protect_reason = ""
             if should_override and self.max_phase_override_target_queue_floor > 0.0:
@@ -645,6 +694,14 @@ class ProjectionPolicyRunner:
                     protect_reason = (
                         f"total_queue_floor:{total_queue:.3f}<"
                         f"{self.max_phase_override_total_queue_floor:.3f}"
+                    )
+            if should_override and self.max_phase_override_max_wait_protect > 0.0:
+                original_wait_max = float(phase_wait_max.get(original_action, 0.0))
+                if original_wait_max >= self.max_phase_override_max_wait_protect:
+                    should_override = False
+                    protect_reason = (
+                        f"max_wait_protect:{original_action}="
+                        f"{original_wait_max:.3f}>={self.max_phase_override_max_wait_protect:.3f}"
                     )
             if should_override and self.max_phase_override_left_wait_protect > 0.0:
                 if original_action in left_phases and target_phase in through_phases:
@@ -672,6 +729,16 @@ class ProjectionPolicyRunner:
                     "gap": float(gap),
                     "phase_queue": phase_queue,
                     "phase_wait": phase_wait,
+                    "phase_wait_p95": phase_wait_p95,
+                    "phase_wait_max": phase_wait_max,
+                    "urgency_score": urgency_score,
+                    "urgency_target_enabled": wait_aware_target,
+                    "queue_weight": self.max_phase_override_queue_weight,
+                    "wait_weight": self.max_phase_override_wait_weight,
+                    "p95_wait_weight": self.max_phase_override_p95_wait_weight,
+                    "wait_scale": self.max_phase_override_wait_scale,
+                    "p95_wait_scale": self.max_phase_override_p95_wait_scale,
+                    "max_wait_protect": self.max_phase_override_max_wait_protect,
                 }
             )
         return final_indices, final_actions, diagnostics
@@ -727,6 +794,9 @@ class ProjectionPolicyRunner:
             torch_dtype=self.torch_dtype,
             device=self.device,
             with_value_head=False,
+            visual_ablation=self.visual_ablation,
+            representation_mode=self.representation_mode,
+            action_eval_chunk_size=self.action_eval_chunk_size,
         )
         self.policy.load_checkpoint(self.projection_ckpt, load_value_head=False)
         self.policy.eval()
@@ -937,7 +1007,13 @@ class ProjectionPolicyRunner:
         # to a fresh path until we produce a complete, parseable JSON file so the
         # downstream relabel/train steps never read a corrupt snapshot.
         snapshot_path = None
-        for _attempt in range(5):
+        # Keep the historical default while allowing long counterfactual
+        # collection jobs to tolerate intermittent CityFlow archive truncation.
+        try:
+            snapshot_dump_retries = max(1, int(os.environ.get("CITYFLOW_SNAPSHOT_DUMP_RETRIES", "5")))
+        except ValueError:
+            snapshot_dump_retries = 5
+        for _attempt in range(snapshot_dump_retries):
             rand_tag = uuid.uuid4().hex[:8]
             candidate = os.path.join(
                 snapshot_dir,
@@ -1050,6 +1126,8 @@ class ProjectionPolicyRunner:
         current_time_s: float,
     ) -> Dict[str, Any]:
         _, movement_keys = self._resolve_series_movement_keys()
+        if self.prompt_mode in {"matched_minimal", "matched_structured", "information_matched"} and tuple(movement_keys) != MOVEMENT_KEYS:
+            raise ValueError(f"Matched representation requires movement order {MOVEMENT_KEYS}; got {movement_keys}")
         if not self._movement_keys_checked:
             if len(movement_keys) != self.runtime.input_dim:
                 raise ValueError(
@@ -1083,7 +1161,10 @@ class ProjectionPolicyRunner:
                 traffic_context=prompt_context,
             )
             history = self._build_traffic_series_history(self.env.list_intersection[idx].inter_name, current_time_s)
-            sequences.append(self._history_to_sequence(history, movement_keys))
+            sequence = self._history_to_sequence(history, movement_keys)
+            sequences.append(sequence)
+            if self.representation_mode == "history_text":
+                policy_prompt += "\n" + (serialize_compact_movement_history(sequence) if self.prompt_mode == "information_matched" else serialize_movement_history(sequence))
             raw_prompts.append(raw_prompt)
             policy_prompts.append(policy_prompt)
             prompt_contexts.append(prompt_context)
@@ -1172,18 +1253,20 @@ class ProjectionPolicyRunner:
             predicted_actions = prediction["predicted_actions"]
             policy_action_list = list(action_list)
             policy_predicted_actions = list(predicted_actions)
+            phase_wait_maxes = prediction.get("phase_wait_maxes", [])
+            phase_wait_p95s = prediction.get("phase_wait_p95s", [])
             action_list, predicted_actions, override_diagnostics = self._apply_max_phase_override(
                 current_states,
                 action_list,
                 predicted_actions,
+                phase_wait_p95s=phase_wait_p95s,
+                phase_wait_maxes=phase_wait_maxes,
             )
             policy_prompts = prediction["policy_prompts"]
             raw_prompts = prediction["raw_prompts"]
             prompt_contexts = prediction.get("prompt_contexts", [])
             phase_queues = prediction.get("phase_queues", [])
             phase_waits = prediction.get("phase_waits", [])
-            phase_wait_p95s = prediction.get("phase_wait_p95s", [])
-            phase_wait_maxes = prediction.get("phase_wait_maxes", [])
             sequences = prediction.get("sequences", [])
             logits_payload = prediction["logits"]
             probs_payload = prediction["probs"]
@@ -1337,14 +1420,15 @@ class ProjectionPolicyRunner:
             self.logger.info(
                 (
                     "Max-phase override summary: applied=%d checked=%d rate=%.4f "
-                    "gap=%.3f left_wait_protect=%.3f target_queue_floor=%.3f "
-                    "total_queue_floor=%.3f"
+                    "gap=%.3f left_wait_protect=%.3f max_wait_protect=%.3f "
+                    "target_queue_floor=%.3f total_queue_floor=%.3f"
                 ),
                 override_applied,
                 override_total,
                 (override_applied / override_total) if override_total else 0.0,
                 self.max_phase_override_gap,
                 self.max_phase_override_left_wait_protect,
+                self.max_phase_override_max_wait_protect,
                 self.max_phase_override_target_queue_floor,
                 self.max_phase_override_total_queue_floor,
             )
@@ -1397,6 +1481,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", type=str, default="auto")
     parser.add_argument("--seed", type=int, default=2024)
     parser.add_argument("--prompt_mode", type=str, default="")
+    parser.add_argument("--representation_mode", choices=("", "ts2i", "history_text"), default="")
     parser.add_argument("--seq_len", type=int, default=0)
     parser.add_argument("--image_size", type=int, default=0)
     parser.add_argument("--periodicity", type=int, default=0)
@@ -1416,6 +1501,13 @@ def parse_args() -> argparse.Namespace:
         default=0,
         help="Maximum intersections evaluated per model forward pass; 0 evaluates all at once.",
     )
+    parser.add_argument("--action_eval_chunk_size", type=int, default=0)
+    parser.add_argument(
+        "--visual_ablation",
+        choices=("full", "zero_prefix", "shuffled_image", "constant_image"),
+        default="full",
+        help="Inference-time visual intervention; all non-visual inputs remain unchanged.",
+    )
     parser.add_argument(
         "--max_phase_override_gap",
         type=float,
@@ -1429,6 +1521,12 @@ def parse_args() -> argparse.Namespace:
         help="When overriding from a left-turn action to a through action, keep the left action if its wait exceeds this value.",
     )
     parser.add_argument(
+        "--max_phase_override_max_wait_protect",
+        type=float,
+        default=0.0,
+        help="Keep the current phase when its observed vehicle max wait reaches this value.",
+    )
+    parser.add_argument(
         "--max_phase_override_target_queue_floor",
         type=float,
         default=0.0,
@@ -1439,6 +1537,36 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=0.0,
         help="If >0, only override when total phase queue at the intersection reaches this floor.",
+    )
+    parser.add_argument(
+        "--max_phase_override_queue_weight",
+        type=float,
+        default=1.0,
+        help="Queue weight for wait-aware override urgency scoring; default preserves max-queue behavior.",
+    )
+    parser.add_argument(
+        "--max_phase_override_wait_weight",
+        type=float,
+        default=0.0,
+        help="Average phase-wait weight for wait-aware override urgency scoring.",
+    )
+    parser.add_argument(
+        "--max_phase_override_p95_wait_weight",
+        type=float,
+        default=0.0,
+        help="Phase p95 wait weight for wait-aware override urgency scoring.",
+    )
+    parser.add_argument(
+        "--max_phase_override_wait_scale",
+        type=float,
+        default=60.0,
+        help="Seconds used to scale average phase wait in wait-aware urgency scoring.",
+    )
+    parser.add_argument(
+        "--max_phase_override_p95_wait_scale",
+        type=float,
+        default=300.0,
+        help="Seconds used to scale phase p95 wait in wait-aware urgency scoring.",
     )
     parser.add_argument("--bf16", action="store_true", default=False)
     parser.add_argument("--fp16", action="store_true", default=False)
@@ -1507,6 +1635,10 @@ def main(args: argparse.Namespace) -> Dict[str, Any]:
         raise error.flowFileException("Flow file does not exist.")
 
     runtime, prompt_mode = _resolve_projection_runtime(args)
+    checkpoint_args = _load_checkpoint_args(args.projection_ckpt)
+    representation_mode = str(args.representation_mode or checkpoint_args.get("representation_mode") or "ts2i")
+    if args.representation_mode and args.representation_mode != str(checkpoint_args.get("representation_mode") or "ts2i"):
+        raise ValueError("Online representation_mode must match the checkpoint")
 
     run_counts = int(args.run_counts or default_count)
     if "24h" in args.traffic_file:
@@ -1542,8 +1674,14 @@ def main(args: argparse.Namespace) -> Dict[str, Any]:
         "SAVE_CITYFLOW_ENV_ARGS": True,
         "MAX_PHASE_OVERRIDE_GAP": float(args.max_phase_override_gap or 0.0),
         "MAX_PHASE_OVERRIDE_LEFT_WAIT_PROTECT": float(args.max_phase_override_left_wait_protect or 0.0),
+        "MAX_PHASE_OVERRIDE_MAX_WAIT_PROTECT": float(args.max_phase_override_max_wait_protect or 0.0),
         "MAX_PHASE_OVERRIDE_TARGET_QUEUE_FLOOR": float(args.max_phase_override_target_queue_floor or 0.0),
         "MAX_PHASE_OVERRIDE_TOTAL_QUEUE_FLOOR": float(args.max_phase_override_total_queue_floor or 0.0),
+        "MAX_PHASE_OVERRIDE_QUEUE_WEIGHT": float(args.max_phase_override_queue_weight),
+        "MAX_PHASE_OVERRIDE_WAIT_WEIGHT": float(args.max_phase_override_wait_weight or 0.0),
+        "MAX_PHASE_OVERRIDE_P95_WAIT_WEIGHT": float(args.max_phase_override_p95_wait_weight or 0.0),
+        "MAX_PHASE_OVERRIDE_WAIT_SCALE": float(args.max_phase_override_wait_scale or 60.0),
+        "MAX_PHASE_OVERRIDE_P95_WAIT_SCALE": float(args.max_phase_override_p95_wait_scale or 300.0),
     }
 
     dic_traffic_env_conf_extra = {
@@ -1600,9 +1738,18 @@ def main(args: argparse.Namespace) -> Dict[str, Any]:
         use_wandb=args.use_wandb,
         max_phase_override_gap=args.max_phase_override_gap,
         max_phase_override_left_wait_protect=args.max_phase_override_left_wait_protect,
+        max_phase_override_max_wait_protect=args.max_phase_override_max_wait_protect,
         max_phase_override_target_queue_floor=args.max_phase_override_target_queue_floor,
         max_phase_override_total_queue_floor=args.max_phase_override_total_queue_floor,
+        max_phase_override_queue_weight=args.max_phase_override_queue_weight,
+        max_phase_override_wait_weight=args.max_phase_override_wait_weight,
+        max_phase_override_p95_wait_weight=args.max_phase_override_p95_wait_weight,
+        max_phase_override_wait_scale=args.max_phase_override_wait_scale,
+        max_phase_override_p95_wait_scale=args.max_phase_override_p95_wait_scale,
         inference_batch_size=args.inference_batch_size,
+        visual_ablation=args.visual_ablation,
+        representation_mode=representation_mode,
+        action_eval_chunk_size=args.action_eval_chunk_size,
         collect_states_output=args.collect_states_output,
         record_snapshots=not args.disable_snapshots,
     )
@@ -1632,6 +1779,9 @@ def main(args: argparse.Namespace) -> Dict[str, Any]:
         "artifact_hashes": {
             "projection_ckpt_sha256": sha256_file(args.projection_ckpt),
             "online_evaluator_sha256": sha256_file(__file__),
+            "prefix_action_policy_sha256": sha256_file(
+                os.path.join(os.path.dirname(__file__), "prefix_action_policy.py")
+            ),
         },
         "determinism": {
             "requested": bool(args.deterministic),
@@ -1642,6 +1792,7 @@ def main(args: argparse.Namespace) -> Dict[str, Any]:
         },
         "runtime": asdict(runtime),
         "prompt_mode": prompt_mode,
+        "representation_mode": representation_mode,
         "work_dir": runner.dic_path["PATH_TO_WORK_DIRECTORY"],
         "model_dir": runner.dic_path["PATH_TO_MODEL"],
         "data_dir": runner.dic_path["PATH_TO_DATA"],

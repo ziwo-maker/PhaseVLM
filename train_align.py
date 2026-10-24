@@ -14,6 +14,7 @@ from typing import Any, Optional, Tuple
 
 import torch
 import torch.distributed as dist
+import torch.nn.functional as F
 from torch.utils.data import DataLoader, Subset
 from torch.utils.data.distributed import DistributedSampler
 
@@ -22,6 +23,9 @@ from dataset import TrafficClipJsonlDataset, traffic_clip_collate
 from eval_retrieval import evaluate_retrieval
 from losses import clip_contrastive_loss
 from models import AlignmentModel
+
+ACTION_LIST: tuple[str, ...] = ("ETWT", "NTST", "ELWL", "NLSL")
+ACTION_TO_INDEX: dict[str, int] = {action: idx for idx, action in enumerate(ACTION_LIST)}
 
 
 def _configure_stdio() -> None:
@@ -59,6 +63,23 @@ def _append_jsonl(path: Path, payload: Any) -> None:
     with path.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(payload, ensure_ascii=False, sort_keys=True))
         handle.write("\n")
+
+
+def _truncate_jsonl(path: Path, max_epoch: int) -> None:
+    if not path.is_file():
+        return
+    kept = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if line.strip():
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                break
+            if int(record.get("epoch", 0)) <= max_epoch:
+                kept.append(json.dumps(record, ensure_ascii=False, sort_keys=True))
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text("\n".join(kept) + ("\n" if kept else ""), encoding="utf-8")
+    tmp.replace(path)
 
 
 def _log(rank: int, message: str) -> None:
@@ -103,6 +124,45 @@ def setup_seed(seed: int) -> None:
     random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
+
+
+def _action_labels(actions: list[str], device: torch.device) -> torch.Tensor:
+    labels = [ACTION_TO_INDEX.get(str(action or "").strip(), -100) for action in actions]
+    return torch.tensor(labels, dtype=torch.long, device=device)
+
+
+def _evaluate_action_aux(model, dataloader, device: torch.device) -> dict[str, float]:
+    base_model = model.module if hasattr(model, "module") else model
+    if getattr(base_model, "action_head", None) is None or dataloader is None:
+        return {}
+
+    base_model.eval()
+    stats = torch.zeros(3, dtype=torch.float64, device=device)
+    with torch.no_grad():
+        for batch in dataloader:
+            labels = _action_labels(batch.get("expert_action", []), device=device)
+            valid = labels.ne(-100)
+            if not bool(valid.any()):
+                continue
+            sequences = batch["sequence"].to(device)
+            image_vec = base_model.encode_image(sequences)
+            logits = base_model.action_logits_from_image_vec(image_vec).float()
+            loss = F.cross_entropy(logits[valid], labels[valid], reduction="sum")
+            preds = logits.argmax(dim=-1)
+            stats[0] += loss.detach().double()
+            stats[1] += preds[valid].eq(labels[valid]).sum().double()
+            stats[2] += valid.sum().double()
+
+    if dist.is_available() and dist.is_initialized():
+        dist.all_reduce(stats, op=dist.ReduceOp.SUM)
+
+    count = float(stats[2].item())
+    if count <= 0.0:
+        return {}
+    return {
+        "action_aux_loss": round(float(stats[0].item() / count), 6),
+        "action_aux_acc": round(float(stats[1].item() / count), 6),
+    }
 
 
 def init_distributed() -> Tuple[bool, int, int, torch.device]:
@@ -160,6 +220,9 @@ def _resolve_output_dir(base_dir: str, temperature_value: float, multi_run: bool
 def _mean_metric(metrics: dict[str, float]) -> float:
     if not metrics:
         return 0.0
+    recall_values = [float(value) for key, value in metrics.items() if str(key).startswith("R@")]
+    if recall_values:
+        return float(sum(recall_values) / len(recall_values))
     return float(sum(float(value) for value in metrics.values()) / max(1, len(metrics)))
 
 
@@ -187,15 +250,36 @@ def _run_training(
     best_checkpoint_path = output_path / "best.pt"
     last_checkpoint_path = output_path / "last.pt"
 
-    dataset = TrafficClipJsonlDataset(
-        path=args.data_path,
-        seq_len=args.seq_len,
-        movement_keys=None,
-        max_samples=args.max_samples,
-        shuffle_samples=False,
-        decision_only=args.decision_only,
-    )
-    train_set, val_set = split_dataset(dataset, args.val_ratio, args.seed)
+    dataset = None
+    if args.train_data_path:
+        train_set = TrafficClipJsonlDataset(
+            path=args.train_data_path,
+            seq_len=args.seq_len,
+            movement_keys=None,
+            max_samples=args.max_samples,
+            shuffle_samples=False,
+            decision_only=args.decision_only,
+        )
+        val_set = TrafficClipJsonlDataset(
+            path=args.val_data_path,
+            seq_len=args.seq_len,
+            movement_keys=None,
+            max_samples=args.max_samples,
+            shuffle_samples=False,
+            decision_only=args.decision_only,
+        )
+        dataset_size = len(train_set) + len(val_set)
+    else:
+        dataset = TrafficClipJsonlDataset(
+            path=args.data_path,
+            seq_len=args.seq_len,
+            movement_keys=None,
+            max_samples=args.max_samples,
+            shuffle_samples=False,
+            decision_only=args.decision_only,
+        )
+        train_set, val_set = split_dataset(dataset, args.val_ratio, args.seed)
+        dataset_size = len(dataset)
     eval_set, eval_size = _build_eval_subset(
         val_set,
         max_samples=args.eval_max_samples,
@@ -228,6 +312,7 @@ def _run_training(
             train_set,
             batch_size=args.batch_size,
             shuffle=True,
+            generator=torch.Generator().manual_seed(args.seed),
             num_workers=args.num_workers,
             collate_fn=traffic_clip_collate,
             pin_memory=True,
@@ -257,8 +342,10 @@ def _run_training(
         hidden_dim=args.hidden_dim,
         prefix_tokens=args.prefix_tokens,
         prefix_mode=args.prefix_mode,
+        max_length=args.max_length,
         init_temperature=temperature_value,
         learnable_logit_scale=args.learnable_logit_scale,
+        action_classes=len(ACTION_LIST) if args.action_aux_weight > 0 else 0,
         torch_dtype=amp_dtype or (torch.bfloat16 if device.type == "cuda" else torch.float32),
         device=device,
     )
@@ -282,6 +369,9 @@ def _run_training(
     warmup_steps = int(total_steps * args.warmup_ratio)
     min_lr_ratio = args.min_lr / args.lr if args.lr > 0 else 0.0
     global_step = 0
+    start_epoch = 0
+    current_epoch = 0
+    elapsed_before_resume = 0.0
     ddp_grad_scale = world_size if ddp else 1
     trainable_param_count = sum(int(p.numel()) for p in trainable_params)
     total_param_count = sum(int(p.numel()) for p in model.parameters())
@@ -303,10 +393,13 @@ def _run_training(
         "precision": _precision_mode(args),
         "temperature": float(temperature_value),
         "learnable_logit_scale": bool(args.learnable_logit_scale),
+        "action_aux_weight": float(args.action_aux_weight),
         "contrastive_mode": "distributed_global_batch" if ddp else "local_batch",
         "eval_mode": "distributed_sharded" if ddp else "single_process",
-        "data_path": list(args.data_path),
-        "dataset_size": len(dataset),
+        "data_path": list(args.data_path or []),
+        "train_data_path": list(args.train_data_path or []),
+        "val_data_path": list(args.val_data_path or []),
+        "dataset_size": dataset_size,
         "train_size": len(train_set),
         "val_size": len(val_set),
         "eval_size": int(eval_size),
@@ -335,7 +428,7 @@ def _run_training(
     }
     if rank == 0:
         output_path.mkdir(parents=True, exist_ok=True)
-        if metrics_path.exists():
+        if metrics_path.exists() and not args.resume_from:
             metrics_path.unlink()
         _write_json(run_config_path, run_context)
         _log_block(rank, "Align Run Config", run_context)
@@ -379,12 +472,25 @@ def _run_training(
         run_args = dict(vars(args))
         run_args["temperature"] = temperature_value
         run_args["output_dir"] = output_dir
-        return {
+        payload = {
             "ts_projector": base_model.ts_projector.state_dict(),
             "vision_projector": base_model.vision_projector.state_dict(),
             "logit_scale": base_model.logit_scale.detach().cpu(),
             "args": run_args,
+            "epoch": int(current_epoch),
+            "global_step": int(global_step),
+            "best_metric_value": float(best_metric_value),
+            "elapsed_seconds": float(elapsed_before_resume + perf_counter() - run_started_clock),
+            "optimizer": optimizer.state_dict(),
+            "rng_state": {
+                "python": random.getstate(),
+                "torch": torch.get_rng_state(),
+                "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else [],
+            },
         }
+        if getattr(base_model, "action_head", None) is not None:
+            payload["action_head"] = base_model.action_head.state_dict()
+        return payload
 
     def _remember_checkpoint(path: Path) -> None:
         path_text = str(path)
@@ -399,7 +505,52 @@ def _run_training(
         _remember_checkpoint(path)
         return checkpoint_duration_seconds
 
-    for epoch in range(args.epochs):
+    if args.resume_from:
+        resume_payload = torch.load(args.resume_from, map_location="cpu", weights_only=False)
+        base_model = model.module if hasattr(model, "module") else model
+        base_model.ts_projector.load_state_dict(resume_payload["ts_projector"])
+        base_model.vision_projector.load_state_dict(resume_payload["vision_projector"])
+        if "logit_scale" in resume_payload:
+            with torch.no_grad():
+                base_model.logit_scale.copy_(resume_payload["logit_scale"].to(base_model.logit_scale))
+        if "action_head" in resume_payload and base_model.action_head is not None:
+            base_model.action_head.load_state_dict(resume_payload["action_head"])
+        if "optimizer" in resume_payload:
+            optimizer.load_state_dict(resume_payload["optimizer"])
+        global_step = int(resume_payload.get("global_step", 0))
+        start_epoch = int(resume_payload.get("epoch", 0))
+        current_epoch = start_epoch
+        best_metric_value = float(resume_payload.get("best_metric_value", float("-inf")))
+        elapsed_before_resume = float(resume_payload.get("elapsed_seconds", 0.0))
+        rng_state = resume_payload.get("rng_state", {})
+        if rng_state.get("python") is not None:
+            random.setstate(rng_state["python"])
+        if rng_state.get("torch") is not None:
+            torch.set_rng_state(rng_state["torch"])
+        if torch.cuda.is_available() and rng_state.get("cuda"):
+            torch.cuda.set_rng_state_all(rng_state["cuda"])
+        if rank == 0:
+            _truncate_jsonl(metrics_path, start_epoch)
+            records = metrics_path.read_text(encoding="utf-8").splitlines() if metrics_path.exists() else []
+            for line in records:
+                if not line.strip():
+                    continue
+                record = json.loads(line)
+                eval_record = record.get("eval_metrics") or {}
+                metric_value = _mean_metric(eval_record)
+                if eval_record and (not best_epoch_record or metric_value >= float(best_epoch_record.get("metric_value", float("-inf")))):
+                    best_epoch_record = {
+                        "epoch": int(record.get("epoch", 0)),
+                        "metric_name": best_metric_name,
+                        "metric_value": round(float(metric_value), 6),
+                        "checkpoint_path": str(best_checkpoint_path),
+                        "eval_metrics": eval_record,
+                    }
+                last_epoch_record = record
+            _log(rank, f"[resume] restored epoch={start_epoch} global_step={global_step} from {args.resume_from}")
+
+    for epoch in range(start_epoch, args.epochs):
+        current_epoch = epoch + 1
         epoch_started_at = datetime.now()
         epoch_started_clock = perf_counter()
         if device.type == "cuda":
@@ -409,14 +560,21 @@ def _run_training(
                 pass
         if ddp:
             train_loader.sampler.set_epoch(epoch)
+        elif train_loader.generator is not None:
+            train_loader.generator.manual_seed(args.seed + epoch)
         model.train()
         optimizer.zero_grad()
         running_loss = 0.0
+        running_contrastive_loss = 0.0
+        running_action_aux_loss = 0.0
+        running_action_aux_correct = 0
+        running_action_aux_count = 0
         step_count = 0
 
         for step, batch in enumerate(train_loader):
             sequences = batch["sequence"].to(device)
             captions = batch["caption"]
+            action_labels = _action_labels(batch.get("expert_action", []), device=device)
             do_sync = ((step + 1) % args.grad_accum_steps == 0) or ((step + 1) == len(train_loader))
             sync_context = (
                 nullcontext()
@@ -425,14 +583,27 @@ def _run_training(
             )
             with sync_context:
                 with torch.cuda.amp.autocast(enabled=amp_dtype is not None, dtype=amp_dtype):
-                    image_vec, text_vec = model(sequences, captions)
+                    model_outputs = model(sequences, captions)
+                    image_vec, text_vec = model_outputs[0], model_outputs[1]
                     logit_scale = _get_logit_scale()
-                    loss = clip_contrastive_loss(
+                    contrastive_loss = clip_contrastive_loss(
                         image_vec,
                         text_vec,
                         temperature=temperature_value,
                         logit_scale=logit_scale,
                     )
+                    action_aux_loss = image_vec.new_tensor(0.0)
+                    if args.action_aux_weight > 0:
+                        if len(model_outputs) < 3:
+                            raise RuntimeError("action_aux_weight > 0 requires AlignmentModel action logits.")
+                        action_logits = model_outputs[2].float()
+                        valid_actions = action_labels.ne(-100)
+                        if bool(valid_actions.any()):
+                            action_aux_loss = F.cross_entropy(
+                                action_logits[valid_actions],
+                                action_labels[valid_actions],
+                            )
+                    loss = contrastive_loss + float(args.action_aux_weight) * action_aux_loss
                     loss_for_backward = (loss * ddp_grad_scale) / max(1, args.grad_accum_steps)
                 if args.fp16:
                     scaler.scale(loss_for_backward).backward()
@@ -452,10 +623,22 @@ def _run_training(
                 global_step += 1
 
             running_loss += loss.item()
+            running_contrastive_loss += contrastive_loss.item()
+            if args.action_aux_weight > 0:
+                valid_actions = action_labels.ne(-100)
+                valid_count = int(valid_actions.sum().item())
+                running_action_aux_loss += action_aux_loss.item()
+                if valid_count > 0 and len(model_outputs) >= 3:
+                    preds = model_outputs[2].detach().float().argmax(dim=-1)
+                    running_action_aux_correct += int(preds[valid_actions].eq(action_labels[valid_actions]).sum().item())
+                    running_action_aux_count += valid_count
             step_count += 1
 
             if rank == 0 and args.log_every_steps > 0 and (step + 1) % args.log_every_steps == 0:
                 avg_loss = running_loss / max(1, step_count)
+                avg_contrastive_loss = running_contrastive_loss / max(1, step_count)
+                avg_action_aux_loss = running_action_aux_loss / max(1, step_count)
+                action_aux_acc = running_action_aux_correct / max(1, running_action_aux_count)
                 temp_value, logit_scale_value = _current_temp_and_scale()
                 lr_value = _current_lr()
                 elapsed_seconds = perf_counter() - epoch_started_clock
@@ -466,6 +649,9 @@ def _run_training(
                     rank,
                     f"[epoch {epoch+1}/{args.epochs}] step {step+1}/{len(train_loader)} "
                     f"| loss={avg_loss:.4f} "
+                    f"clip_loss={avg_contrastive_loss:.4f} "
+                    f"action_aux_loss={avg_action_aux_loss:.4f} "
+                    f"action_aux_acc={action_aux_acc:.4f} "
                     f"temp={temp_value:.4f} logit_scale={logit_scale_value:.4f} "
                     f"lr={lr_value:.6g} "
                     f"elapsed={_format_duration(elapsed_seconds)} "
@@ -495,10 +681,14 @@ def _run_training(
                 ks=(1, 5, 10),
                 max_samples=args.eval_max_samples,
             )
+            eval_metrics.update(_evaluate_action_aux(model, val_loader, device=device))
             eval_duration_seconds = perf_counter() - eval_started_clock
 
         if rank == 0:
             avg_loss = running_loss / max(1, step_count)
+            avg_contrastive_loss = running_contrastive_loss / max(1, step_count)
+            avg_action_aux_loss = running_action_aux_loss / max(1, step_count)
+            action_aux_acc = running_action_aux_correct / max(1, running_action_aux_count)
             temp_value, logit_scale_value = _current_temp_and_scale()
             lr_value = _current_lr()
             epoch_duration_seconds = perf_counter() - epoch_started_clock
@@ -513,6 +703,9 @@ def _run_training(
             _log(
                 rank,
                 f"[epoch {epoch+1}/{args.epochs}] train_loss={avg_loss:.4f} "
+                f"clip_loss={avg_contrastive_loss:.4f} "
+                f"action_aux_loss={avg_action_aux_loss:.4f} "
+                f"action_aux_acc={action_aux_acc:.4f} "
                 f"temp={temp_value:.4f} logit_scale={logit_scale_value:.4f} "
                 f"lr={lr_value:.6g} "
                 f"epoch_time={_format_duration(epoch_duration_seconds)} "
@@ -572,6 +765,9 @@ def _run_training(
                 "total_elapsed_seconds": round(total_elapsed_seconds, 3),
                 "optimizer_step": global_step,
                 "train_loss": round(float(avg_loss), 6),
+                "train_contrastive_loss": round(float(avg_contrastive_loss), 6),
+                "train_action_aux_loss": round(float(avg_action_aux_loss), 6),
+                "train_action_aux_acc": round(float(action_aux_acc), 6),
                 "lr": round(float(lr_value), 10),
                 "temperature": round(float(temp_value), 6),
                 "logit_scale": round(float(logit_scale_value), 6),
@@ -591,6 +787,12 @@ def _run_training(
                 "peak_reserved_gb": memory_stats["peak_reserved_gb"],
             }
             _append_jsonl(metrics_path, last_epoch_record)
+            last_checkpoint_duration_seconds = _save_checkpoint(last_checkpoint_path)
+            _log(
+                rank,
+                f"[epoch {epoch+1}/{args.epochs}] resumable_checkpoint_saved={last_checkpoint_path} "
+                f"save_time={_format_duration(last_checkpoint_duration_seconds)}"
+            )
 
         if ddp:
             # Keep non-zero ranks parked here until rank 0 finishes optional
@@ -626,7 +828,7 @@ def _run_training(
         )
 
     ended_at = datetime.now()
-    duration_seconds = perf_counter() - run_started_clock
+    duration_seconds = elapsed_before_resume + perf_counter() - run_started_clock
     run_summary = {
         "status": "success",
         "started_at": _format_timestamp(run_started_at),
@@ -642,7 +844,7 @@ def _run_training(
         "temperature": float(temperature_value),
         "learnable_logit_scale": bool(args.learnable_logit_scale),
         "precision": _precision_mode(args),
-        "dataset_size": len(dataset),
+        "dataset_size": dataset_size,
         "train_size": len(train_set),
         "val_size": len(val_set),
         "saved_checkpoints": saved_checkpoints,
@@ -659,7 +861,10 @@ def _run_training(
 def main():
     _configure_stdio()
     parser = argparse.ArgumentParser()
-    parser.add_argument("--data_path", type=str, required=True, nargs="+")
+    parser.add_argument("--data_path", type=str, nargs="+", default=None)
+    parser.add_argument("--train_data_path", type=str, nargs="+", default=None)
+    parser.add_argument("--val_data_path", type=str, nargs="+", default=None)
+    parser.add_argument("--resume_from", type=str, default=None)
     parser.add_argument("--model_path", type=str, default="/home/data/model/qwen-vl-8B/")
     parser.add_argument("--output_dir", type=str, default="records/align")
     parser.add_argument("--seq_len", type=int, default=16)
@@ -669,9 +874,21 @@ def main():
     parser.add_argument("--hidden_dim", type=int, default=64)
     parser.add_argument("--prefix_tokens", type=int, default=8)
     parser.add_argument("--prefix_mode", type=str, default="prefix", choices=["single", "prefix"])
+    parser.add_argument(
+        "--max_length",
+        type=int,
+        default=128,
+        help="Maximum tokenizer sequence length for the frozen VLM backbone.",
+    )
     parser.add_argument("--temperature", type=float, default=0.07)
     parser.add_argument("--temperature_sweep", type=str, default=None)
     parser.add_argument("--learnable_logit_scale", action="store_true")
+    parser.add_argument(
+        "--action_aux_weight",
+        type=float,
+        default=0.0,
+        help="Optional Stage-1 expert-action auxiliary CE weight. 0 disables the auxiliary head.",
+    )
     parser.add_argument("--logit_scale_min", type=float, default=1e-3)
     parser.add_argument("--logit_scale_max", type=float, default=100.0)
     parser.add_argument("--batch_size", type=int, default=16, help="per-GPU batch size")
@@ -703,6 +920,12 @@ def main():
     parser.add_argument("--fp16", action="store_true")
     args = parser.parse_args()
 
+    if bool(args.data_path) == bool(args.train_data_path):
+        raise ValueError("Provide exactly one of --data_path or --train_data_path")
+    if args.train_data_path and not args.val_data_path:
+        raise ValueError("--train_data_path requires --val_data_path for explicit split training")
+    if args.val_data_path and not args.train_data_path:
+        raise ValueError("--val_data_path requires --train_data_path")
     if args.fp16 and args.bf16:
         raise ValueError("Choose only one of --fp16 or --bf16")
     if args.learnable_logit_scale and args.temperature_sweep:
@@ -719,6 +942,8 @@ def main():
         raise ValueError("--log_every_steps must be >= 0")
     if args.save_every_epochs <= 0:
         raise ValueError("--save_every_epochs must be > 0")
+    if args.action_aux_weight < 0:
+        raise ValueError("--action_aux_weight must be >= 0")
 
     ddp, rank, world_size, device = init_distributed()
     if device.type == "cuda":

@@ -12,6 +12,10 @@ try:
     from transformers import AutoModelForImageTextToText
 except Exception:
     AutoModelForImageTextToText = None
+try:
+    from transformers import Qwen3_5ForConditionalGeneration
+except Exception:
+    Qwen3_5ForConditionalGeneration = None
 ACTION_LIST = ["ETWT", "NTST", "ELWL", "NLSL"]
 ACTION_SET = set(ACTION_LIST)
 
@@ -144,6 +148,10 @@ class GemmaVLPolicy:
     @staticmethod
     def _select_model_class(config: AutoConfig):
         model_type = str(getattr(config, "model_type", "") or "").lower()
+        archs = [str(x).lower() for x in (getattr(config, "architectures", None) or [])]
+        hint = " ".join([model_type] + archs)
+        if "qwen3_5" in hint and Qwen3_5ForConditionalGeneration is not None:
+            return Qwen3_5ForConditionalGeneration
         class_name = config.__class__.__name__ if config is not None else ""
         is_vl = ("vl" in model_type) or ("vision" in model_type) or ("image" in model_type)
         if ("VL" in class_name) or ("Vision" in class_name):

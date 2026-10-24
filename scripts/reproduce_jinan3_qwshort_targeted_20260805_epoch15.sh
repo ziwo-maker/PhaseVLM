@@ -5,8 +5,12 @@ REPO_ROOT="${REPO_ROOT:-/home/code/LLMSTSC}"
 PYTHON="${PYTHON:-/home/sysu/anaconda3/envs/hnr5090/bin/python}"
 TORCHRUN="${TORCHRUN:-/home/sysu/anaconda3/envs/hnr5090/bin/torchrun}"
 MODEL_PATH="${MODEL_PATH:-/home/data/model/qwen-vl-8B}"
-RUN_ROOT="${RUN_ROOT:-$REPO_ROOT/records/pipeline_runs/repro_jinan3_qwshort_targeted_20260805_epoch15_$(date +%Y%m%d_%H%M%S)}"
-ONLINE_MEMO="${ONLINE_MEMO:-online_tests/repro_jinan3_qwshort_targeted_20260805_epoch15/epoch_15}"
+MODEL_LABEL_DEFAULT="${MODEL_PATH%/}"
+MODEL_LABEL_DEFAULT="${MODEL_LABEL_DEFAULT##*/}"
+MODEL_LABEL_DEFAULT="${MODEL_LABEL_DEFAULT//[^A-Za-z0-9_.-]/_}"
+MODEL_LABEL="${MODEL_LABEL:-${MODEL_LABEL_DEFAULT:-model}}"
+RUN_ROOT="${RUN_ROOT:-$REPO_ROOT/records/pipeline_runs/repro_jinan3_qwshort_targeted_20260805_epoch15_${MODEL_LABEL}_$(date +%Y%m%d_%H%M%S)}"
+ONLINE_MEMO="${ONLINE_MEMO:-online_tests/repro_jinan3_qwshort_targeted_20260805_epoch15/${MODEL_LABEL}/epoch_15}"
 TRAIN_GPUS="${TRAIN_GPUS:-0,1}"
 TRAIN_GPUS="${TRAIN_GPUS// /,}"
 IFS=',' read -r -a TRAIN_GPU_ARRAY <<< "$TRAIN_GPUS"
@@ -14,6 +18,29 @@ TRAIN_NPROC="${TRAIN_NPROC:-${#TRAIN_GPU_ARRAY[@]}}"
 EVAL_GPU="${EVAL_GPU:-0}"
 EVAL_SEED="${EVAL_SEED:-2024}"
 PROGRESS_INTERVAL_SECONDS="${PROGRESS_INTERVAL_SECONDS:-2400}"
+REUSE_STAGE1_CKPT="${REUSE_STAGE1_CKPT:-}"
+
+MODEL_PATH_HINT="${MODEL_PATH,,}"
+MODEL_FAMILY_HINT="other"
+if [[ "$MODEL_PATH_HINT" == *"qwen3.5"* || "$MODEL_PATH_HINT" == *"qwen3_5"* ]]; then
+  MODEL_FAMILY_HINT="qwen3_5"
+fi
+
+STAGE1_BATCH_SIZE="${STAGE1_BATCH_SIZE:-4}"
+STAGE1_GRAD_ACCUM_STEPS="${STAGE1_GRAD_ACCUM_STEPS:-2}"
+STAGE1_NUM_WORKERS="${STAGE1_NUM_WORKERS:-4}"
+STAGE2_BATCH_SIZE_DEFAULT=4
+STAGE2_GRAD_ACCUM_STEPS_DEFAULT=4
+STAGE2_ACTION_EVAL_CHUNK_SIZE_DEFAULT=0
+if [[ "$MODEL_FAMILY_HINT" == "qwen3_5" ]]; then
+  STAGE2_BATCH_SIZE_DEFAULT=1
+  STAGE2_GRAD_ACCUM_STEPS_DEFAULT=16
+  STAGE2_ACTION_EVAL_CHUNK_SIZE_DEFAULT=1
+fi
+STAGE2_BATCH_SIZE="${STAGE2_BATCH_SIZE:-$STAGE2_BATCH_SIZE_DEFAULT}"
+STAGE2_GRAD_ACCUM_STEPS="${STAGE2_GRAD_ACCUM_STEPS:-$STAGE2_GRAD_ACCUM_STEPS_DEFAULT}"
+STAGE2_ACTION_EVAL_CHUNK_SIZE="${STAGE2_ACTION_EVAL_CHUNK_SIZE:-$STAGE2_ACTION_EVAL_CHUNK_SIZE_DEFAULT}"
+STAGE2_NUM_WORKERS="${STAGE2_NUM_WORKERS:-4}"
 
 DATA_PATHS=(
   "$REPO_ROOT/data/processed/jinan_real_stage3_queue_wait_rule_gap2_p60_20260529.jsonl"
@@ -75,6 +102,57 @@ print(json.dumps({
 PY
 }
 
+preflight_model() {
+  "$PYTHON" - "$MODEL_PATH" <<'PY'
+import sys
+from transformers import AutoConfig, AutoProcessor, AutoTokenizer
+
+model_path = sys.argv[1]
+config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+processor = AutoProcessor.from_pretrained(model_path, trust_remote_code=True)
+tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+
+model_type = str(getattr(config, "model_type", "") or "").lower()
+architectures = [str(item) for item in (getattr(config, "architectures", None) or [])]
+hint = " ".join([model_type, *[item.lower() for item in architectures], model_path.lower()])
+
+model_cls = None
+if "qwen3_5" in hint or "qwen3.5" in hint:
+    try:
+        from transformers import Qwen3_5ForConditionalGeneration
+        model_cls = Qwen3_5ForConditionalGeneration
+    except Exception:
+        model_cls = None
+elif "qwen3_vl" in hint or "qwen3-vl" in hint or "qwen-vl" in hint:
+    try:
+        from transformers import Qwen3VLForConditionalGeneration
+        model_cls = Qwen3VLForConditionalGeneration
+    except Exception:
+        model_cls = None
+if model_cls is None:
+    try:
+        from transformers import AutoModelForImageTextToText as model_cls
+    except Exception:
+        from transformers import AutoModelForCausalLM as model_cls
+
+vision_config = getattr(config, "vision_config", None)
+if vision_config is None:
+    raise RuntimeError(f"{model_path} does not expose config.vision_config; a VLM backbone is required.")
+
+print(
+    "[model preflight] "
+    f"path={model_path} "
+    f"model_type={getattr(config, 'model_type', '')} "
+    f"architectures={architectures} "
+    f"processor={processor.__class__.__name__} "
+    f"tokenizer={tokenizer.__class__.__name__} "
+    f"selected_class={model_cls.__name__} "
+    f"vision_hidden={getattr(vision_config, 'hidden_size', '')} "
+    f"vision_out={getattr(vision_config, 'out_hidden_size', '')}"
+)
+PY
+}
+
 latest_status() {
   {
     printf 'Run: %s\n' "$RUN_ROOT"
@@ -125,6 +203,8 @@ for path in "$PYTHON" "$TORCHRUN" "$MODEL_PATH" "$REPO_ROOT/data/Jinan/3_4/$TRAF
   fi
 done
 
+preflight_model
+
 if [[ -e "$RUN_ROOT" ]]; then
   existing="$(find "$RUN_ROOT" -mindepth 1 -print -quit 2>/dev/null || true)"
   if [[ -n "$existing" ]]; then
@@ -141,6 +221,7 @@ export TOKENIZERS_PARALLELISM=false
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-4}"
 export TORCH_NCCL_ASYNC_ERROR_HANDLING=1
 export NCCL_ASYNC_ERROR_HANDLING=1
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 
 {
   printf 'run_root=%s\n' "$RUN_ROOT"
@@ -149,12 +230,23 @@ export NCCL_ASYNC_ERROR_HANDLING=1
   printf 'python=%s\n' "$PYTHON"
   printf 'torchrun=%s\n' "$TORCHRUN"
   printf 'model_path=%s\n' "$MODEL_PATH"
+  printf 'model_label=%s\n' "$MODEL_LABEL"
   printf 'data_paths=%s\n' "${DATA_PATHS[*]}"
   printf 'traffic_file=%s\n' "$TRAFFIC_FILE"
   printf 'train_gpus=%s\n' "$TRAIN_GPUS"
   printf 'train_nproc=%s\n' "$TRAIN_NPROC"
   printf 'eval_gpu=%s\n' "$EVAL_GPU"
   printf 'eval_seed=%s\n' "$EVAL_SEED"
+  printf 'reuse_stage1_ckpt=%s\n' "$REUSE_STAGE1_CKPT"
+  printf 'model_family_hint=%s\n' "$MODEL_FAMILY_HINT"
+  printf 'stage1_batch_size=%s\n' "$STAGE1_BATCH_SIZE"
+  printf 'stage1_grad_accum_steps=%s\n' "$STAGE1_GRAD_ACCUM_STEPS"
+  printf 'stage1_num_workers=%s\n' "$STAGE1_NUM_WORKERS"
+  printf 'stage2_batch_size=%s\n' "$STAGE2_BATCH_SIZE"
+  printf 'stage2_grad_accum_steps=%s\n' "$STAGE2_GRAD_ACCUM_STEPS"
+  printf 'stage2_action_eval_chunk_size=%s\n' "$STAGE2_ACTION_EVAL_CHUNK_SIZE"
+  printf 'stage2_num_workers=%s\n' "$STAGE2_NUM_WORKERS"
+  printf 'pytorch_cuda_alloc_conf=%s\n' "$PYTORCH_CUDA_ALLOC_CONF"
   printf 'stage1_config=pt8_hd64_temp0.05_epochs15_decision_only\n'
   printf 'stage2_config=pt8_hd64_queue_wait_short_epochs15_targeted_resample_fitted_to_20260805_archive\n'
 } | tee "$LOG_DIR/run.info"
@@ -162,7 +254,20 @@ export NCCL_ASYNC_ERROR_HANDLING=1
 monitor_progress &
 MONITOR_PID="$!"
 
-CUDA_VISIBLE_DEVICES="$TRAIN_GPUS" "$TORCHRUN" --standalone --nproc_per_node="$TRAIN_NPROC" train_align.py \
+if [[ -n "$REUSE_STAGE1_CKPT" ]]; then
+  if [[ ! -s "$REUSE_STAGE1_CKPT" ]]; then
+    echo "REUSE_STAGE1_CKPT is not a readable checkpoint: $REUSE_STAGE1_CKPT" >&2
+    exit 1
+  fi
+  cp -p "$REUSE_STAGE1_CKPT" "$STAGE1_DIR/best.pt"
+  {
+    printf 'status=reused\n'
+    printf 'source_checkpoint=%s\n' "$REUSE_STAGE1_CKPT"
+    printf 'copied_to=%s\n' "$STAGE1_DIR/best.pt"
+    printf 'copied_at=%s\n' "$(date --iso-8601=seconds)"
+  } > "$STAGE1_DIR/reused_stage1.info"
+else
+  CUDA_VISIBLE_DEVICES="$TRAIN_GPUS" "$TORCHRUN" --standalone --nproc_per_node="$TRAIN_NPROC" train_align.py \
   --data_path "${DATA_PATHS[@]}" \
   --model_path "$MODEL_PATH" \
   --output_dir "$STAGE1_DIR" \
@@ -170,12 +275,13 @@ CUDA_VISIBLE_DEVICES="$TRAIN_GPUS" "$TORCHRUN" --standalone --nproc_per_node="$T
   --seq_len 16 --image_size 224 --periodicity 16 --input_dim 8 --hidden_dim 64 \
   --prefix_tokens 8 --prefix_mode prefix \
   --temperature 0.05 \
-  --batch_size 4 --grad_accum_steps 2 \
+  --batch_size "$STAGE1_BATCH_SIZE" --grad_accum_steps "$STAGE1_GRAD_ACCUM_STEPS" \
   --lr 1e-4 --min_lr 1e-5 --warmup_ratio 0.1 --lr_schedule cosine \
-  --epochs 15 --num_workers 4 --val_ratio 0.1 \
+  --epochs 15 --num_workers "$STAGE1_NUM_WORKERS" --val_ratio 0.1 \
   --eval_max_samples 1000 --log_every_steps 20 --save_every_epochs 5 \
   --seed 2024 --bf16 \
   > "$LOG_DIR/stage1.log" 2>&1
+fi
 
 if [[ ! -s "$STAGE1_DIR/best.pt" ]]; then
   echo "Stage 1 completed without a valid checkpoint: $STAGE1_DIR/best.pt" >&2
@@ -189,10 +295,11 @@ CUDA_VISIBLE_DEVICES="$TRAIN_GPUS" "$TORCHRUN" --standalone --nproc_per_node="$T
   --seq_len 16 --image_size 224 --periodicity 16 --input_dim 8 --hidden_dim 64 \
   --prefix_tokens 8 --prefix_mode prefix --max_length 64 \
   --prompt_mode queue_wait_short \
-  --batch_size 4 --grad_accum_steps 4 \
+  --action_eval_chunk_size "$STAGE2_ACTION_EVAL_CHUNK_SIZE" \
+  --batch_size "$STAGE2_BATCH_SIZE" --grad_accum_steps "$STAGE2_GRAD_ACCUM_STEPS" \
   --epochs 15 --lr 1e-4 --min_lr 1e-5 --warmup_ratio 0.1 --lr_schedule cosine \
   --weight_decay 1e-4 --max_grad_norm 1.0 \
-  --val_ratio 0.1 --split_strategy stratified --num_workers 4 \
+  --val_ratio 0.1 --split_strategy stratified --num_workers "$STAGE2_NUM_WORKERS" \
   --target_mode mixed --soft_target_alpha 0.3 --soft_label_temperature 0.7 \
   --best_metric val_macro_f1 --best_mode max --best_min_delta 0.0 \
   --resample_mode targeted \

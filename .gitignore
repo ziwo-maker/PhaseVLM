@@ -35,3 +35,15 @@ record.zip
 *.safetensors
 *.bin
 nohup.out
+
+# Local tooling, generated experiment output, and machine-specific links.
+/.aris/
+/.claude/
+/.pi/
+/.github/agents/aris-reviewer-*.agent.md
+/_artifacts/
+/_external/
+/recordlocal/runs/
+/cityflow/build_py*/
+/records
+/online_test_best_weights/*/evaluation/

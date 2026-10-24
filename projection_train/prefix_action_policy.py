@@ -14,6 +14,30 @@ from models import Qwen3VLBackbone, TimeSeriesProjector, VisionPrefixProjector
 from projection_train.action_space import ACTION_LIST, action_to_index
 
 
+VISUAL_ABLATION_MODES = (
+    "full",
+    "zero_prefix",
+    "shuffled_image",
+    "constant_image",
+)
+
+
+def apply_visual_image_ablation(images: torch.Tensor, mode: str) -> torch.Tensor:
+    """Apply an inference-time visual intervention without changing tensor shape."""
+    resolved_mode = str(mode or "full").strip().lower()
+    if resolved_mode not in VISUAL_ABLATION_MODES:
+        raise ValueError(
+            f"Unsupported visual ablation mode {mode!r}; expected one of {VISUAL_ABLATION_MODES}."
+        )
+    if resolved_mode in {"full", "zero_prefix"}:
+        return images
+    if resolved_mode == "constant_image":
+        return torch.zeros_like(images)
+    if images.shape[0] < 2:
+        raise ValueError("shuffled_image requires an inference batch with at least two samples.")
+    return torch.roll(images, shifts=1, dims=0)
+
+
 def _resolve_device(device: Optional[torch.device | str]) -> torch.device:
     if isinstance(device, torch.device):
         return device
@@ -147,6 +171,8 @@ class PrefixActionPolicy(nn.Module):
         backbone_fsdp_enabled: bool = False,
         backbone_fsdp_sharding_strategy: str = "full_shard",
         action_eval_chunk_size: int = 0,
+        visual_ablation: str = "full",
+        representation_mode: str = "ts2i",
         enable_topology_adapter: bool = False,
         topology_roadnet_configs: Optional[Dict[str, Dict]] = None,
     ) -> None:
@@ -158,6 +184,15 @@ class PrefixActionPolicy(nn.Module):
         self.input_dim = int(input_dim)
         self.with_value_head = bool(with_value_head)
         self.action_eval_chunk_size = max(0, int(action_eval_chunk_size))
+        self.visual_ablation = str(visual_ablation or "full").strip().lower()
+        self.representation_mode = str(representation_mode or "ts2i").strip().lower()
+        if self.representation_mode not in {"ts2i", "history_text"}:
+            raise ValueError(f"Unsupported representation mode: {representation_mode!r}")
+        if self.visual_ablation not in VISUAL_ABLATION_MODES:
+            raise ValueError(
+                f"Unsupported visual ablation mode {visual_ablation!r}; "
+                f"expected one of {VISUAL_ABLATION_MODES}."
+            )
         self.backbone_gradient_checkpointing = False
         self._vision_feature_mode = "last_hidden_state"
 
@@ -201,6 +236,13 @@ class PrefixActionPolicy(nn.Module):
         projector_dtype = getattr(self.backbone.model, "dtype", torch_dtype)
         self.vision_projector.to(device=self.device, dtype=projector_dtype)
         self.ts_projector.to(self.device)
+        self.history_prefix = nn.Parameter(
+            torch.empty(prefix_tokens, self.backbone.text_dim, device=self.device, dtype=projector_dtype).normal_(0, 0.02),
+            requires_grad=self.representation_mode == "history_text",
+        )
+        if self.representation_mode == "history_text":
+            self.ts_projector.requires_grad_(False)
+            self.vision_projector.requires_grad_(False)
 
         # Topology-conditioned adapter for cross-network adaptation
         self.enable_topology_adapter = bool(enable_topology_adapter)
@@ -274,6 +316,7 @@ class PrefixActionPolicy(nn.Module):
         if sequences.device != self.device:
             sequences = sequences.to(self.device)
         images = self.ts_projector(sequences)
+        images = apply_visual_image_ablation(images, self.visual_ablation)
         if self.backbone_gradient_checkpointing and torch.is_grad_enabled():
             vision_tokens = activation_checkpoint(
                 lambda batch: self.backbone.encode_vision_tokens(
@@ -303,6 +346,9 @@ class PrefixActionPolicy(nn.Module):
         if self._vision_adapter is not None:
             vision_pooled = self._vision_adapter(vision_pooled)
         prefix_vec, prefix_tokens = self.vision_projector(vision_pooled)
+        if self.visual_ablation == "zero_prefix":
+            prefix_vec = torch.zeros_like(prefix_vec)
+            prefix_tokens = torch.zeros_like(prefix_tokens)
         prefix_tokens = prefix_tokens.to(device=self.device, dtype=self._model_dtype())
         return {
             "images": images,
@@ -318,10 +364,15 @@ class PrefixActionPolicy(nn.Module):
             formatted,
             return_tensors="pt",
             padding=True,
-            truncation=True,
+            truncation=self.representation_mode != "history_text",
             max_length=self.max_length,
             add_special_tokens=True,
         )
+        if self.representation_mode == "history_text" and encoding["input_ids"].shape[1] > self.max_length:
+            raise ValueError(
+                f"History-Text prompt has {encoding['input_ids'].shape[1]} tokens, "
+                f"exceeding max_length={self.max_length}; refusing to discard history"
+            )
         input_ids = encoding["input_ids"].to(self.device)
         attention_mask = encoding["attention_mask"].to(self.device)
         lengths = attention_mask.sum(dim=1).tolist()
@@ -343,11 +394,18 @@ class PrefixActionPolicy(nn.Module):
         intersection_ids: Optional[List[str]] = None,
         dataset_hints: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
-        seq_features = self._encode_sequences(
-            sequences,
-            intersection_ids=intersection_ids,
-            dataset_hints=dataset_hints,
-        )
+        if self.representation_mode == "history_text":
+            prefix_tokens = self.history_prefix.unsqueeze(0).expand(sequences.shape[0], -1, -1)
+            seq_features = {
+                "prefix_tokens": prefix_tokens,
+                "prefix_vec": prefix_tokens.mean(dim=1),
+            }
+        else:
+            seq_features = self._encode_sequences(
+                sequences,
+                intersection_ids=intersection_ids,
+                dataset_hints=dataset_hints,
+            )
         prompt_features = self._encode_prompts(prompts)
         prepared = {**seq_features, **prompt_features}
         if self.value_head is not None:
@@ -678,6 +736,8 @@ class PrefixActionPolicy(nn.Module):
         return dist.entropy()
 
     def trainable_parameters(self):
+        if self.representation_mode == "history_text":
+            return [self.history_prefix]
         params: List[nn.Parameter] = []
         params.extend(list(self.ts_projector.parameters()))
         params.extend(list(self.vision_projector.parameters()))
@@ -702,6 +762,16 @@ class PrefixActionPolicy(nn.Module):
         checkpoint = torch.load(checkpoint_path, map_location="cpu")
         if not isinstance(checkpoint, dict):
             raise RuntimeError(f"Unsupported checkpoint format: {checkpoint_path}")
+        saved_mode = str((checkpoint.get("args") or {}).get("representation_mode") or "ts2i")
+        if saved_mode != self.representation_mode:
+            raise ValueError(f"Checkpoint representation {saved_mode} != policy {self.representation_mode}")
+        if self.representation_mode == "history_text":
+            stored_prefix = checkpoint.get("history_prefix")
+            if stored_prefix is None or tuple(stored_prefix.shape) != tuple(self.history_prefix.shape):
+                raise ValueError("History-Text checkpoint is missing a compatible history_prefix")
+            with torch.no_grad():
+                self.history_prefix.copy_(stored_prefix.to(self.history_prefix))
+            return checkpoint
 
         # A Qwen3-VL API change exposed raw visual states (1152) as
         # ``last_hidden_state`` while historical checkpoints were trained on the

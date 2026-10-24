@@ -1,0 +1,427 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>PhaseVLM Stage 3 Idea Discovery</title>
+
+<meta name="generator" content="ARIS render-html (academic, v1)">
+<meta name="aris:source-path" content="idea-stage/IDEA_REPORT.md">
+<meta name="aris:source-sha256" content="e2b52fa18aa09a78d8d73d1c329b3e806c4ba1a28766e43fb38929cdb8d29fe6">
+<meta name="aris:generated-at" content="2026-08-18 05:48 UTC">
+
+<!-- MathJax 3 -->
+<script>
+window.MathJax = {
+  tex: { inlineMath: [['$', '$'], ['\\(', '\\)']], displayMath: [['$$', '$$'], ['\\[', '\\]']], processEscapes: true },
+  options: { skipHtmlTags: ['script', 'noscript', 'style', 'textarea', 'pre', 'code'] }
+};
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+
+<!-- highlight.js -->
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-light.min.css">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+<script>document.addEventListener('DOMContentLoaded', () => hljs.highlightAll());</script>
+
+
+<style>
+:root {
+  --bg: #fdfcf7;
+  --bg-soft: #f4f1ea;
+  --bg-code: #f8f5ec;
+  --ink: #1a1a1a;
+  --ink-soft: #4a4a4a;
+  --ink-muted: #6b6b6b;
+  --primary: #1a4a8c;
+  --primary-soft: #2d6cb8;
+  --accent: #b8390e;
+  --warn: #b45309;
+  --warn-bg: #fef3c7;
+  --info-bg: #dbeafe;
+  --good-bg: #d1fae5;
+  --good: #065f46;
+  --bad-bg: #fee2e2;
+  --bad: #991b1b;
+  --border: #d6d0c0;
+  --border-soft: #e8e3d5;
+}
+
+* { box-sizing: border-box; }
+html { scroll-behavior: smooth; }
+
+body {
+  font-family: "Source Serif Pro", "Source Serif 4", "Crimson Pro", "Georgia", "Songti SC", "STSong", serif;
+  line-height: 1.65;
+  color: var(--ink);
+  background: var(--bg);
+  margin: 0;
+  padding: 0;
+  font-size: 16px;
+}
+
+.layout {
+  max-width: 1280px;
+  margin: 0 auto;
+  display: grid;
+  grid-template-columns: 260px 1fr;
+  gap: 48px;
+  padding: 40px 32px;
+}
+
+nav.toc {
+  position: sticky;
+  top: 24px;
+  align-self: start;
+  font-size: 13px;
+  max-height: calc(100vh - 48px);
+  overflow-y: auto;
+  border-right: 1px solid var(--border-soft);
+  padding-right: 16px;
+}
+nav.toc h3 {
+  margin: 0 0 12px;
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--ink-muted);
+  font-weight: 600;
+}
+nav.toc ol { list-style: none; padding: 0; margin: 0; counter-reset: toc; }
+nav.toc ol li { margin: 5px 0; counter-increment: toc; }
+nav.toc ol li::before { content: counter(toc) ". "; color: var(--ink-muted); margin-right: 4px; }
+nav.toc a {
+  color: var(--ink-soft);
+  text-decoration: none;
+  border-bottom: 1px dotted transparent;
+}
+nav.toc a:hover { color: var(--primary); border-bottom-color: var(--primary); }
+nav.toc ul { list-style: none; padding-left: 14px; margin: 3px 0; font-size: 12px; }
+nav.toc ul li::before { content: "→ "; color: var(--border); }
+
+main { min-width: 0; }
+
+header.hero {
+  border-bottom: 3px double var(--primary);
+  padding-bottom: 24px;
+  margin-bottom: 32px;
+}
+header.hero .eyebrow {
+  color: var(--accent);
+  font-size: 13px;
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  font-weight: 600;
+  margin-bottom: 8px;
+}
+header.hero h1 {
+  font-size: 32px;
+  line-height: 1.2;
+  margin: 0 0 12px;
+  color: var(--ink);
+  font-weight: 700;
+  letter-spacing: -0.01em;
+}
+header.hero .subtitle {
+  font-size: 16px;
+  color: var(--ink-soft);
+  margin: 0 0 8px;
+  font-style: italic;
+}
+header.hero .byline {
+  font-size: 14px;
+  color: var(--ink-soft);
+  margin: 0 0 20px;
+}
+header.hero .byline strong {
+  color: var(--ink);
+  font-weight: 600;
+}
+header.hero .meta {
+  display: flex;
+  gap: 20px;
+  flex-wrap: wrap;
+  font-size: 12px;
+  color: var(--ink-muted);
+  border-top: 1px solid var(--border-soft);
+  padding-top: 14px;
+}
+header.hero .meta span strong { color: var(--ink-soft); }
+header.hero .meta code {
+  font-family: "JetBrains Mono", "SF Mono", "Menlo", "Consolas", monospace;
+  font-size: 11px;
+  background: var(--bg-soft);
+  padding: 1px 5px;
+  border-radius: 3px;
+  border: 1px solid var(--border-soft);
+}
+
+h2 {
+  font-size: 24px;
+  margin: 44px 0 14px;
+  padding-bottom: 8px;
+  border-bottom: 1px solid var(--border);
+  color: var(--ink);
+  font-weight: 700;
+}
+h2 .num { color: var(--primary); font-weight: 600; margin-right: 8px; }
+h3 { font-size: 19px; margin: 28px 0 10px; color: var(--primary); font-weight: 600; }
+h4 { font-size: 16px; margin: 20px 0 8px; color: var(--ink); font-weight: 600; }
+
+p { margin: 10px 0; }
+ul, ol { padding-left: 22px; margin: 10px 0; }
+ul li, ol li { margin: 4px 0; }
+ul li::marker { color: var(--primary); }
+
+strong { color: var(--accent); font-weight: 600; }
+em { color: var(--ink-soft); }
+
+a { color: var(--primary); }
+a:hover { color: var(--accent); }
+
+code:not(.hljs) {
+  font-family: "JetBrains Mono", "SF Mono", "Menlo", "Consolas", monospace;
+  font-size: 0.86em;
+  background: var(--bg-code);
+  padding: 1px 5px;
+  border-radius: 3px;
+  border: 1px solid var(--border-soft);
+  color: var(--accent);
+}
+
+pre {
+  background: #fafaf6;
+  border: 1px solid var(--border);
+  border-left: 4px solid var(--primary);
+  padding: 0;
+  overflow-x: auto;
+  border-radius: 4px;
+  margin: 14px 0;
+}
+pre code, pre code.hljs {
+  background: transparent !important;
+  display: block;
+  padding: 14px 18px !important;
+  font-size: 13px;
+  line-height: 1.55;
+  font-family: "JetBrains Mono", "SF Mono", "Menlo", monospace;
+  color: var(--ink);
+}
+pre.diagram {
+  background: #f9f6ed;
+  border-left: 4px solid var(--accent);
+  font-size: 12.5px;
+  line-height: 1.4;
+}
+
+.callout {
+  margin: 16px 0;
+  padding: 12px 16px;
+  border-radius: 4px;
+  border-left: 4px solid;
+  font-size: 15px;
+}
+.callout-title {
+  font-weight: 600;
+  margin-bottom: 6px;
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+.callout-info { background: var(--info-bg); border-left-color: var(--primary); }
+.callout-info .callout-title { color: var(--primary); }
+.callout-warn { background: var(--warn-bg); border-left-color: var(--warn); }
+.callout-warn .callout-title { color: var(--warn); }
+.callout-good { background: var(--good-bg); border-left-color: var(--good); }
+.callout-good .callout-title { color: var(--good); }
+.callout-bad { background: var(--bad-bg); border-left-color: var(--bad); }
+.callout-bad .callout-title { color: var(--bad); }
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 16px 0;
+  font-size: 14px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  overflow: hidden;
+}
+thead { background: var(--primary); color: white; }
+th, td {
+  text-align: left;
+  padding: 9px 12px;
+  border-bottom: 1px solid var(--border-soft);
+  vertical-align: top;
+}
+th { font-weight: 600; font-size: 13px; letter-spacing: 0.02em; }
+tr:last-child td { border-bottom: none; }
+tbody tr:nth-child(even) { background: var(--bg-soft); }
+
+details.qa, details {
+  background: white;
+  border: 1px solid var(--border-soft);
+  border-radius: 6px;
+  margin: 10px 0;
+  padding: 0;
+}
+details summary {
+  cursor: pointer;
+  padding: 10px 14px;
+  font-weight: 600;
+  font-size: 14px;
+  color: var(--primary);
+  list-style: none;
+  user-select: none;
+}
+details summary::-webkit-details-marker { display: none; }
+details summary::before {
+  content: "▸ ";
+  margin-right: 4px;
+  display: inline-block;
+  transition: transform 0.15s;
+}
+details[open] summary::before { transform: rotate(90deg); }
+details[open] summary { border-bottom: 1px solid var(--border-soft); }
+details > :not(summary) { padding: 10px 14px; }
+details p:first-of-type { margin-top: 8px; }
+
+mjx-container[display="true"] { margin: 12px 0 !important; }
+
+footer.aris-footer {
+  margin-top: 60px;
+  padding-top: 20px;
+  border-top: 1px solid var(--border);
+  font-size: 12px;
+  color: var(--ink-muted);
+}
+footer.aris-footer a { color: var(--ink-muted); border-bottom: 1px dotted var(--border); }
+
+@media (max-width: 900px) {
+  .layout { grid-template-columns: 1fr; gap: 20px; padding: 20px 16px; }
+  nav.toc {
+    position: static;
+    max-height: none;
+    border-right: none;
+    border-bottom: 1px solid var(--border-soft);
+    padding-right: 0;
+    padding-bottom: 14px;
+  }
+  header.hero h1 { font-size: 24px; }
+  h2 { font-size: 20px; }
+}
+@media print {
+  nav.toc { display: none; }
+  .layout { grid-template-columns: 1fr; padding: 0; }
+  body { background: white; }
+  header.hero { border-bottom-color: var(--ink); }
+}
+</style>
+</head>
+<body>
+<div class="layout">
+
+<nav class="toc">
+  <h3>Contents</h3>
+  <ol>
+<li><a href="#executive-summary">Executive Summary</a>
+</li>
+<li><a href="#literature-landscape">Literature Landscape</a>
+<ul>
+<li><a href="#retrieved-sources">Retrieved Sources</a></li>
+<li><a href="#structural-gap">Structural Gap</a></li>
+</ul>
+</li>
+<li><a href="#ranked-ideas">Ranked Ideas</a>
+<ul>
+<li><a href="#idea-1-policy-responsive-counterfactual-teacher-construction-prct---recommended">Idea 1: Policy-Responsive Counterfactual Teacher Construction (PRCT) - RECOMMENDED</a></li>
+<li><a href="#idea-2-prcat-conservative-distillation---conditional-module">Idea 2: PRCAT Conservative Distillation - CONDITIONAL MODULE</a></li>
+<li><a href="#idea-3-topology-conditioned-prefix-hypernetwork---deferred">Idea 3: Topology-Conditioned Prefix Hypernetwork - DEFERRED</a></li>
+</ul>
+</li>
+<li><a href="#eliminated-ideas">Eliminated Ideas</a>
+</li>
+<li><a href="#novelty-verification">Novelty Verification</a>
+</li>
+<li><a href="#external-critical-review">External Critical Review</a>
+<ul>
+<li><a href="#pilot-outcome">Pilot Outcome</a></li>
+</ul>
+</li>
+<li><a href="#refined-proposal">Refined Proposal</a>
+</li>
+<li><a href="#next-steps">Next Steps</a>
+</li>
+<li><a href="#evidence-gate">Evidence Gate</a>
+</li>
+</ol>
+</nav>
+
+<main>
+<header class="hero">
+  
+  <h1>PhaseVLM Stage 3 Idea Discovery</h1>
+  
+  
+  <div class="meta">
+    <span><strong>Source:</strong> <code>idea-stage/IDEA_REPORT.md</code></span>
+    <span><strong>SHA256:</strong> <code>e2b52fa18aa0</code></span>
+    <span><strong>Rendered:</strong> 2026-08-18 05:48 UTC</span>
+    
+  </div>
+</header>
+
+<h1 id="idea-discovery-report-phasevlm-stage-3-replacement">Idea Discovery Report: PhaseVLM Stage 3 Replacement</h1>
+<p><strong>Direction:</strong> Replace the invalidated OOD/selection-centered Stage-3 story with a falsifiable control mechanism for policy-responsive counterfactual distillation.</p>
+<p><strong>Date:</strong> 2026-08-18 <strong>Pipeline:</strong> research-lit -&gt; idea-creator -&gt; novelty-check -&gt; research-review -&gt; research-refine-pipeline <strong>Assurance:</strong> same-family critical review is complete but provisional; the Semantic Scholar search became rate-limited (HTTP 429), so a final pre- submission search remains required.</p>
+<h2 id="executive-summary">Executive Summary</h2>
+<p>The previous innovation claim should be replaced. OOD acquisition, diversity selection, frozen-neighbor long-horizon labels, and cross-horizon reliability gating have all failed in closed-loop evaluation. The strongest reproducible mechanism is that <strong>a counterfactual teacher must let non-target intersections respond with the deployed policy</strong>, otherwise long-horizon labels artificially favor through phases and cause coordination collapse.</p>
+<p>The recommended replacement is <strong>Policy-Responsive Counterfactual Teacher Construction (PRCT)</strong>: force a candidate phase at one intersection while all other intersections re-plan with the deployed source policy every 30 seconds over a 120-second CityFlow rollout. This replaces the invalid frozen-neighbor teacher and directly explains the observed action-collapse failure. <strong>PRCAT</strong> (advantage-weighted conservative distillation) is retained only as a conditional robustness module; its online benefit has not yet been established.</p>
+<h2 id="literature-landscape">Literature Landscape</h2>
+<h3 id="retrieved-sources">Retrieved Sources</h3>
+<p>Local paper libraries <code>papers/</code> and <code>literature/</code> were absent. Searches used arXiv, Semantic Scholar (until rate-limited), and OpenAlex. The latter two had weak relevance ranking for this specialized query; results are therefore used only for metadata and broad prior-art checks, not evidence of absence.</p>
+<table><thead><tr><th>Work</th><th>Relevance to PRCAT</th></tr></thead><tbody><tr><td>Foerster et al., COMA, AAAI 2018</td><td>Counterfactual baselines for multi-agent credit assignment; does not construct a simulator teacher by re-planning neighbors during a forced local action.</td></tr><tr><td>Balakrishna et al., <em>On-Policy Robot Imitation from a Converging Supervisor</em>, 2019</td><td>Relevant to learning from a policy-dependent/model-based supervisor, but not traffic coordination or per-action counterfactual costs.</td></tr><tr><td>A2PR, ICML 2024 (arXiv:2405.19909)</td><td>Advantage-guided conservative offline policy regularization; prevents novelty claims about generic advantage weighting.</td></tr><tr><td>Behaviour Preference Regression, AAAI 2025 (arXiv:2503.00930)</td><td>Preference-style policy fitting with behavior consistency; closest generic objective family.</td></tr><tr><td>Braun, <em>A Graph-Based Control Interface for Traffic Signals on Heterogeneous Road Networks</em>, arXiv:2607.21831</td><td>Topology-general TSC interface, not a counterfactual teacher/distillation method.</td></tr><tr><td>Li et al., <em>Large-scale Regional TSC Based on Single-Agent RL</em>, arXiv:2503.09252</td><td>Simulator-based regional TSC baseline; no policy-responsive teacher.</td></tr></tbody></table>
+<h3 id="structural-gap">Structural Gap</h3>
+<p>No retrieved work combined all of: (1) a frozen VLM traffic policy as the multi-intersection rollout policy, (2) a forced one-intersection candidate action, (3) neighbor re-planning during the counterfactual horizon, and (4) a source-relative trust rule that prevents low-value counterfactual labels from moving a strong deployed policy. The novelty is <strong>not</strong> advantage weighting; it is the closed-loop counterfactual evaluator and the measured coordination bias it corrects.</p>
+<h2 id="ranked-ideas">Ranked Ideas</h2>
+<h3 id="idea-1-policy-responsive-counterfactual-teacher-construction-prct---recommended">Idea 1: Policy-Responsive Counterfactual Teacher Construction (PRCT) - RECOMMENDED</h3>
+<p><strong>Method:</strong></p>
+<ol><li>From each source-policy state, force one candidate phase at one intersection.</li><li>Every other intersection executes the same source policy again at each  30-second decision point during a 120-second CityFlow rollout.</li><li>Use all four resulting global costs to produce the target distribution and  compare frozen versus policy-responsive teachers across horizons and label  budgets.</li></ol>
+<p><strong>Hypothesis:</strong> frozen-neighbor labels encode a coordination-inconsistent counterfactual. Re-planning non-target intersections with the source policy removes that bias, preserves phase diversity, and improves closed-loop traffic control when target-flow headroom exists.</p>
+<p><strong>Existing evidence:</strong> responsive H120 avoided the frozen long-horizon through-action collapse; it improved older Jinan-to-Hangzhou results and Jinan-real in-network AWT by 6.8% over nine seeds. Its held-out Jinan-2500 gain was indistinguishable from zero, motivating the conservative component.</p>
+<p><strong>Novelty:</strong> Medium-high (7/10, provisional). The forced-local-action, policy-responsive multi-intersection CityFlow teacher and its measured frozen-neighbor coordination bias are the defensible delta; generic counterfactual credit assignment and policy fitting are prior art.</p>
+<p><strong>Risk:</strong> Medium. It is a simulator-specific empirical contribution and must replicate across the original cross-network setting and held-out demand shift.</p>
+<h3 id="idea-2-prcat-conservative-distillation---conditional-module">Idea 2: PRCAT Conservative Distillation - CONDITIONAL MODULE</h3>
+<p>PRCAT weights the PRCT loss by source-relative counterfactual advantage and adds a source-action KL prior on low-advantage rows. Its valid <code>K=118</code>, training-seed-2024 pilot reached <code>AWT=42.48 +/- 0.22</code> across three CityFlow evaluation seeds. This improves on zero-shot (<code>43.98</code>) but is <code>3.04s</code> worse than the matched unweighted responsive-H120 training seed (<code>39.44</code>). Because AWR/A2PR/preference-style conservatism are prior art and the isolated pilot is negative against the teacher baseline, PRCAT is not a core contribution and is not being expanded to more training seeds.</p>
+<h3 id="idea-3-topology-conditioned-prefix-hypernetwork---deferred">Idea 3: Topology-Conditioned Prefix Hypernetwork - DEFERRED</h3>
+<p>Potentially high ceiling, but it needs six or more diverse training topologies and leave-one-topology-out tests. The current two-network evidence cannot support it; it is deferred rather than pursued with a weak evaluation.</p>
+<h2 id="eliminated-ideas">Eliminated Ideas</h2>
+<table><thead><tr><th>Idea</th><th>Evidence-based reason</th></tr></thead><tbody><tr><td>OOD/regret active query</td><td>OOD selection did not beat random on equal query budgets.</td></tr><tr><td>Diversity/core-set selection</td><td>No demonstrated closed-loop gain; selection cannot repair a biased teacher.</td></tr><tr><td>Frozen multi-horizon reliability gate (CRCD)</td><td>Reliability filtering amplified through-action imbalance and was negative online.</td></tr><tr><td>Hard/soft/ranking loss substitution</td><td>Did not remove high-K degradation under the frozen evaluator.</td></tr><tr><td>Differentiable SimExpert surrogate</td><td>Discrete-action semantics and exploitation risk remain unresolved.</td></tr><tr><td>Preference optimization as headline</td><td>Pairwise cost ranking already exists in this codebase; it would be rebranding.</td></tr></tbody></table>
+<h2 id="novelty-verification">Novelty Verification</h2>
+<p>The closest generic families are COMA, model-based/dual-policy imitation, advantage-weighted regression, A2PR, and behavior preference regression. PRCAT must not claim a new generic conservative offline RL objective. The defensible core delta is the policy-responsive, multi-intersection simulator oracle that evaluates a local phase deviation against the source policy's dynamic network response, together with causal evidence for the frozen-neighbor coordination bias. Recent Semantic Scholar search was incomplete due HTTP 429; rerun it before submission and search the final PRCT and PRCAT terminology explicitly.</p>
+<h2 id="external-critical-review">External Critical Review</h2>
+<p>A same-family adversarial reviewer judged the teacher mechanism as the only current paper-level contribution and rejected PRCAT as a proven replacement. Its minimum credible package is: Jinan-to-Hangzhou and Jinan-to-Jinan-2500 shifts; <code>K=118</code> with nine training seeds plus <code>K=32</code>; zero-shot, frozen C30, unweighted responsive H120, PRCAT weight-only, KL-only, and full PRCAT arms; AWT primary with ATT/AQL, p95/max movement wait, spillback, and action entropy/frequencies as safety outcomes. It also requires evidence that high PRCAT advantage predicts later benefit rather than merely encoding a local min-max ranking. Therefore PRCAT is a conditional module, there is no policy improvement guarantee, and a one-training-seed result is exploratory only.</p>
+<h3 id="pilot-outcome">Pilot Outcome</h3>
+<p>The PRCAT full-loss pilot completed without training or online-evaluation failures. It used one training seed (<code>2024</code>) and three independent evaluation seeds (<code>2024</code>, <code>42</code>, <code>123</code>) on Jinan real:</p>
+<table><thead><tr><th>Method</th><th style="text-align:right">Training seeds</th><th style="text-align:right">Eval seeds</th><th style="text-align:right">ATT</th><th style="text-align:right">AQL</th><th style="text-align:right">AWT</th></tr></thead><tbody><tr><td>zero-shot (existing)</td><td style="text-align:right">n/a</td><td style="text-align:right">3</td><td style="text-align:right">268.94</td><td style="text-align:right">157.88</td><td style="text-align:right">43.98</td></tr><tr><td>responsive H120 K=118 (existing)</td><td style="text-align:right">2024</td><td style="text-align:right">3</td><td style="text-align:right">n/a</td><td style="text-align:right">n/a</td><td style="text-align:right">39.44</td></tr><tr><td>responsive H120 K=118 (existing)</td><td style="text-align:right">9</td><td style="text-align:right">3 each</td><td style="text-align:right">269.98 +/- 0.68</td><td style="text-align:right">159.27 +/- 1.10</td><td style="text-align:right">40.97 +/- 0.84</td></tr><tr><td>PRCAT full K=118</td><td style="text-align:right">1</td><td style="text-align:right">3</td><td style="text-align:right">270.78 +/- 0.17</td><td style="text-align:right">161.30 +/- 0.34</td><td style="text-align:right">42.48 +/- 0.22</td></tr></tbody></table>
+<p>The pilot clears the zero-shot baseline but fails the relevant matched teacher comparison. It is recorded as a negative module result, not evidence for a new method. Reproducible JSON and logs are under <code>records/pipeline_runs/prcat_pilot_20260818/prcat/k118/tr2024/evaluation/</code>.</p>
+<h2 id="refined-proposal">Refined Proposal</h2>
+<ul><li>Proposal: <code>refine-logs/FINAL_PROPOSAL.md</code></li><li>Experiment plan: <code>refine-logs/PRCAT_EXPERIMENT_PLAN.md</code></li><li>Active contract: <code>idea-stage/docs/research_contract.md</code></li></ul>
+<h2 id="next-steps">Next Steps</h2>
+<ol><li>Use PRCT, not PRCAT, as the Stage-3 replacement claim.</li><li>Run the frozen-teacher versus PRCT causal matrix on the two required shifts,  adding starvation/safety metrics.</li><li>Leave PRCAT frozen as a negative pilot unless a materially different,  preregistered robustness hypothesis is proposed.</li><li>Update novelty search after Semantic Scholar rate limit resets.</li></ol>
+<p>&lt;!-- ARIS_IDEA_DISCOVERY_EVIDENCE_GATE:START --&gt;</p>
+<h2 id="evidence-gate">Evidence Gate</h2>
+<p><strong>Status:</strong> PASS</p>
+<p>All required stage records, artifacts, and report sections are present. &lt;!-- ARIS_IDEA_DISCOVERY_EVIDENCE_GATE:END --&gt;</p>
+
+<footer class="aris-footer">
+  Generated by <a href="https://github.com/wanshuiyin/Auto-claude-code-research-in-sleep/blob/main/skills/render-html/SKILL.md">ARIS <code>/render-html</code></a> ·
+  source path <code>idea-stage/IDEA_REPORT.md</code> ·
+  SHA256 <code>e2b52fa18aa0</code> ·
+  generated at 2026-08-18 05:48 UTC.
+  This is a generated view — edit the source Markdown, then re-render.
+</footer>
+</main>
+
+</div>
+</body>
+</html>

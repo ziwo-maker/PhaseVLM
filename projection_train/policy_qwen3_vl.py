@@ -16,6 +16,11 @@ except Exception:  # pragma: no cover - optional dependency
     Qwen3VLForConditionalGeneration = None
 
 try:
+    from transformers import Qwen3_5ForConditionalGeneration
+except Exception:  # pragma: no cover - optional dependency
+    Qwen3_5ForConditionalGeneration = None
+
+try:
     from transformers import Gemma3ForConditionalGeneration
 except Exception:  # pragma: no cover - optional dependency
     Gemma3ForConditionalGeneration = None
@@ -212,6 +217,8 @@ class Qwen3VLPolicy:
         archs = [str(x).lower() for x in (getattr(config, "architectures", None) or [])]
         hint = " ".join([model_type] + archs + [text])
 
+        if "qwen3_5" in hint:
+            return "qwen3_5"
         if "qwen3_vl" in hint or "qwen3-vl" in hint or "qwen-vl" in hint:
             return "qwen3_vl"
         if "gemma3" in hint and ("vision" in hint or "conditionalgeneration" in hint or "vl" in hint):
@@ -226,6 +233,12 @@ class Qwen3VLPolicy:
         if model_family == "qwen3_vl":
             if Qwen3VLForConditionalGeneration is not None:
                 return Qwen3VLForConditionalGeneration
+            if AutoModelForImageTextToText is not None:
+                return AutoModelForImageTextToText
+            return AutoModelForCausalLM
+        if model_family == "qwen3_5":
+            if Qwen3_5ForConditionalGeneration is not None:
+                return Qwen3_5ForConditionalGeneration
             if AutoModelForImageTextToText is not None:
                 return AutoModelForImageTextToText
             return AutoModelForCausalLM

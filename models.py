@@ -14,6 +14,11 @@ except Exception:  # pragma: no cover - optional dependency
     Qwen3VLForConditionalGeneration = None
 
 try:
+    from transformers import Qwen3_5ForConditionalGeneration
+except Exception:  # pragma: no cover - optional dependency
+    Qwen3_5ForConditionalGeneration = None
+
+try:
     from transformers import AutoModelForImageTextToText
 except Exception:  # pragma: no cover - optional dependency
     AutoModelForImageTextToText = None
@@ -129,7 +134,7 @@ class Qwen3VLBackbone(nn.Module):
         self.model_family = self._infer_model_family(model_path, config)
         model_cls = self._select_model_class(self.model_family)
         if model_cls is None:
-            raise RuntimeError("No compatible model class found for Qwen3-VL.")
+            raise RuntimeError("No compatible model class found for the requested VLM.")
         print(
             f"[Qwen3VLBackbone] loading model family={self.model_family} with {model_cls.__name__}",
             flush=True,
@@ -175,14 +180,16 @@ class Qwen3VLBackbone(nn.Module):
         model_type = str(getattr(config, "model_type", "") or "").lower()
         archs = [str(item).lower() for item in (getattr(config, "architectures", None) or [])]
         hint = " ".join([model_type, *archs, text])
-        if "qwen3_vl" in hint or "qwen3-vl" in hint or "qwen-vl" in hint:
-            return "qwen3_vl"
         if "qwen3_5" in hint or "qwen3.5" in hint:
             return "qwen3_5"
+        if "qwen3_vl" in hint or "qwen3-vl" in hint or "qwen-vl" in hint:
+            return "qwen3_vl"
         return "auto"
 
     @staticmethod
     def _select_model_class(model_family: str):
+        if model_family == "qwen3_5" and Qwen3_5ForConditionalGeneration is not None:
+            return Qwen3_5ForConditionalGeneration
         if model_family == "qwen3_vl" and Qwen3VLForConditionalGeneration is not None:
             return Qwen3VLForConditionalGeneration
         if AutoModelForImageTextToText is not None:
@@ -665,8 +672,10 @@ class AlignmentModel(nn.Module):
         hidden_dim: int = 64,
         prefix_tokens: int = 8,
         prefix_mode: str = "prefix",
+        max_length: int = 128,
         init_temperature: float = 0.07,
         learnable_logit_scale: bool = False,
+        action_classes: int = 0,
         torch_dtype: torch.dtype = torch.bfloat16,
         device: Optional[torch.device] = None,
     ) -> None:
@@ -681,6 +690,7 @@ class AlignmentModel(nn.Module):
             model_path=model_path,
             torch_dtype=torch_dtype,
             device=self.device,
+            max_length=max_length,
         )
         self.ts_projector = TimeSeriesProjector(
             seq_len=seq_len,
@@ -712,8 +722,16 @@ class AlignmentModel(nn.Module):
             mode=prefix_mode,
         )
         projector_dtype = getattr(self.backbone.model, "dtype", torch_dtype)
+        self.action_head: Optional[nn.Module] = None
+        if int(action_classes) > 0:
+            self.action_head = nn.Sequential(
+                nn.LayerNorm(self.backbone.text_dim),
+                nn.Linear(self.backbone.text_dim, int(action_classes)),
+            )
         self.ts_projector.to(self.device)
         self.vision_projector.to(device=self.device, dtype=projector_dtype)
+        if self.action_head is not None:
+            self.action_head.to(device=self.device, dtype=projector_dtype)
 
     def encode_image(self, sequences: torch.Tensor) -> torch.Tensor:
         images = self.ts_projector(sequences)
@@ -730,7 +748,14 @@ class AlignmentModel(nn.Module):
         text_vec = F.normalize(text_vec, dim=-1)
         return text_vec
 
-    def forward(self, sequences: torch.Tensor, captions: list[str]) -> Tuple[torch.Tensor, torch.Tensor]:
+    def action_logits_from_image_vec(self, image_vec: torch.Tensor) -> torch.Tensor:
+        if self.action_head is None:
+            raise RuntimeError("action_head is disabled; set action_classes > 0 to use action logits.")
+        return self.action_head(image_vec)
+
+    def forward(self, sequences: torch.Tensor, captions: list[str]) -> Tuple[torch.Tensor, ...]:
         image_vec = self.encode_image(sequences)
         text_vec = self.encode_text(captions)
+        if self.action_head is not None:
+            return image_vec, text_vec, self.action_logits_from_image_vec(image_vec)
         return image_vec, text_vec
